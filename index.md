@@ -40,8 +40,9 @@ A dedicated and creative software developer who loves solving complex problems. 
 ### Awards
 *Merit Scholarships:* For the first and second semesters in the Bachelor's program, 
 as well as for the third and fourth semester in the Master's program Information Technology and Systems Management, 
-I received a merit scholarship from the Federal Ministry of Science, Research and Economics (AT).  <br/>
-*Science Award:* of the master thesis with the science prize of AK Salzburg.         <br/>
+I received a merit scholarship from the Federal Ministry of Science, Research and Economics (AT).
+
+*Science Award:* of the master thesis with the science prize of AK Salzburg.
 
 ### Programming Languages
 * Python
@@ -50,6 +51,6 @@ I received a merit scholarship from the Federal Ministry of Science, Research an
 * Java
 
 ### Interests and Leisure Activities
-*Sport*	Hiking and skiing in the Eastern Alps. <br/>
-*Free Time*	Cooking, especially from the Asian kitchen. <br/>
-*Interests*	Exploring places and cultures, I have never been to. <br/>
+*Sport:* Hiking and skiing in the Eastern Alps. <br/>
+*Free Time:* Cooking, especially from the Asian kitchen. <br/>
+*Interests:* Exploring places and cultures, I have never been to. <br/>
