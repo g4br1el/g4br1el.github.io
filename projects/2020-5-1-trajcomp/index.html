@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Trajectory Similarity using Compression – Gabriel Dax – PhD Student at TUM</title>
+    <!-- Begin Jekyll SEO tag v2.8.0 -->
+<meta name="generator" content="Jekyll v4.2.2" />
+<meta property="og:title" content="Trajectory Similarity using Compression" />
+<meta name="author" content="Gabriel Dax" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="In this project, we created a novel approach for trajectory similarity based on Kolmogorov complexity approximated by a lossy compression of the original trajectory data using selected features compressed into a concise memory representation by means of a Bloom filter." />
+<meta property="og:description" content="In this project, we created a novel approach for trajectory similarity based on Kolmogorov complexity approximated by a lossy compression of the original trajectory data using selected features compressed into a concise memory representation by means of a Bloom filter." />
+<link rel="canonical" href="http://localhost:4000/projects/2020-5-1-trajcomp/" />
+<meta property="og:url" content="http://localhost:4000/projects/2020-5-1-trajcomp/" />
+<meta property="og:site_name" content="Gabriel Dax" />
+<meta property="og:image" content="http://localhost:4000/images/Traj-Prague50min.png" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2020-05-01T00:00:00+02:00" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta property="twitter:image" content="http://localhost:4000/images/Traj-Prague50min.png" />
+<meta property="twitter:title" content="Trajectory Similarity using Compression" />
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"BlogPosting","author":{"@type":"Person","name":"Gabriel Dax"},"dateModified":"2020-05-01T00:00:00+02:00","datePublished":"2020-05-01T00:00:00+02:00","description":"In this project, we created a novel approach for trajectory similarity based on Kolmogorov complexity approximated by a lossy compression of the original trajectory data using selected features compressed into a concise memory representation by means of a Bloom filter.","headline":"Trajectory Similarity using Compression","image":"http://localhost:4000/images/Traj-Prague50min.png","mainEntityOfPage":{"@type":"WebPage","@id":"http://localhost:4000/projects/2020-5-1-trajcomp/"},"url":"http://localhost:4000/projects/2020-5-1-trajcomp/"}</script>
+<!-- End Jekyll SEO tag -->
+
+    <meta content='text/html; charset=utf-8' http-equiv='Content-Type'>
+<meta http-equiv='X-UA-Compatible' content='IE=edge'>
+<meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0'>
+
+
+<meta property="og:description" content="In this project, we created a novel approach for trajectory similarity based on Kolmogorov complexity approximated by a lossy compression of the original trajectory data using selected features compressed into a concise memory representation by means of a Bloom filter." />
+
+<meta name="author" content="Gabriel Dax" />
+
+
+<meta property="og:title" content="Trajectory Similarity using Compression" />
+<meta property="twitter:title" content="Trajectory Similarity using Compression" />
+
+
+
+<meta property="og:image" content="http://localhost:4000/images/Traj-Prague50min.png"/>
+<meta property="twitter:image" content="http://localhost:4000/images/Traj-Prague50min.png"/>
+
+
+
+    <link rel="stylesheet" type="text/css" href="/assets/style.css" />
+    <link rel="alternate" type="application/rss+xml" title="Gabriel Dax - PhD Student at TUM" href="/feed.xml" />
+    <link rel="canonical" href="http://localhost:4000/projects/2020-5-1-trajcomp/" />
+
+    <meta name="theme-color" content="#000000">
+    <link rel="icon" type="image/png" sizes="32x32" href="/images/ai.png">
+    
+
+  </head>
+
+  <body>
+    <div id="bar"></div>
+    <div class="wrapper-container">
+      <div class="wrapper-masthead">
+        <div class="container">
+          <header class="masthead clearfix">
+
+
+            <a href="/" class="site-avatar"><img src="/images/ai.png" alt="" /></a>
+
+
+            <div class="site-info">
+              <h1 class="site-name"><a href="/">Gabriel Dax</a></h1>
+              <p class="site-description">PhD Student at TUM</p>
+            </div>
+
+            <nav>
+              <a href="/">About Me</a>
+<!--              <a href="/getting-started">About Me</a>-->
+              <a href="/archive">Teaching</a>
+              <a href="/search">Publications</a>
+              <a href="/projects">Projects</a>
+              <a href="/about">Datasets</a>
+
+            </nav>
+          </header>
+        </div>
+      </div>
+
+      <div class="wrapper-main">
+        <div id="main" role="main" class="container">
+          <article class="post detailed">
+  <h1>Trajectory Similarity using Compression</h1>
+
+  <div>
+<!--    <p class="author_title">Gabriel Dax  ·  May  1, 2020</p> -->
+    
+
+    
+    <div class="post-tags">
+      
+      
+        <a href="/categories/#C/C++">C/C++</a>
+        &nbsp;
+      
+        <a href="/categories/#Python">Python</a>
+        
+      
+    </div>
+  </div>
+    
+  <div class="entry">
+    <p><img src="/images/Traj-Prague50min.png" alt="My helpful screenshot" /></p>
+
+<p><em>Visualization of a sample dataset, which has been used in this project. The figure shows labeled trajectories 
+of the dataset Prague Ego-Shooter.</em></p>
+
+<p>In this project, we created a novel approach for trajectory similarity based on Kolmogorov complexity approximated by a 
+lossy compression of the original trajectory data using selected features compressed into a concise memory 
+representation by means of a Bloom filter. Given the importance of trajectory data, a linear-time distance measure 
+with all theoretical guarantees implied by a proper metric is very powerful if it is capturing enough detail for 
+important trajectory mining tasks. This stack of feature extraction combined with feature embedding in a Bloom filter 
+constitutes a lossy compression for trajectory data which can easily be extended with other discrete data like travel 
+mode. In addition, this compression has the needed properties for efficient calculation of a normalized compression 
+distance (NCD) which approximates Kolmogorov complexity. We evaluate this novel trajectory distance measurement using 
+very simple features and k-nearest-neighbor classification on selected realworld datasets with remarkable 
+classification accuracies. Furthermore, we argue that the distance measure is very suited to geospatial big data 
+applications as each trajectory is first transformed into few bits using the lossy compression stack. At time of 
+comparison, the original trajectory geometry is not needed, instead, the sketches suffice. Despite very compressible 
+parameters (equal or less than 1024 bit per trajectory) and very simple features, we already reach classification 
+accuracies for real-world trajectory classification tasks of more than 80% across various datasets.</p>
+
+<p><img src="/images/Bloom.png" alt="My helpful screenshot" /></p>
+
+<p><em>Schematic  description  of  the  Bloom  filter  and  how  to  embed  data,like trajectory features.</em></p>
+
+<p><strong>Published</strong>: G. Dax and M. Werner, “Trajectory Similarity using Compression,” 2021 22nd IEEE International Conference on Mobile Data Management (MDM), 2021, pp. 169-174, doi: <a href="https://doi.org/10.1109/MDM52706.2021.00035">10.1109/MDM52706.2021.00035</a>.</p>
+
+  </div>
+
+  <!--
+  <div>
+    <p><span class="share-box">Share:</span> <a href="http://twitter.com/share?text=Trajectory Similarity using Compression&url=http://localhost:4000/projects/2020-5-1-trajcomp/" target="_blank">Twitter</a>, <a href="https://www.facebook.com/sharer.php?u=http://localhost:4000/projects/2020-5-1-trajcomp/" target="_blank">Facebook</a></p>
+  </div>
+  -->
+  <!--<div class="date">
+    Written on May  1, 2020
+  </div>-->
+
+  
+</article>
+
+        </div>
+      </div>
+
+      <div class="wrapper-footer">
+        <div class="container">
+          <footer class="footer">
+            
+<a href="mailto:gabriel.dax@tum.de"><i class="svg-icon email"></i></a>
+
+
+<a href="https://github.com/g4br1el"><i class="svg-icon github"></i></a>
+
+<a href="https://www.linkedin.com/in/gadax"><i class="svg-icon linkedin"></i></a>
+
+
+
+
+
+
+
+
+
+
+
+            <p class="copyright">(c) 2022 Gabriel Dax | <a href="/imprint">Imprint</a> | Icon made by <a href=https://www.flaticon.com/authors/good-ware">Good Ware</a> from <a href="www.flaticon.com">www.flaticon.com</a></p>
+          </footer>
+        </div>
+      </div>
+    </div>
+
+    
+
+  </body>
+</html>

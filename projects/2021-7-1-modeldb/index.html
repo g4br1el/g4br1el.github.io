@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Deep Learning Model Library – Gabriel Dax – PhD Student at TUM</title>
+    <!-- Begin Jekyll SEO tag v2.8.0 -->
+<meta name="generator" content="Jekyll v4.2.2" />
+<meta property="og:title" content="Deep Learning Model Library" />
+<meta name="author" content="Gabriel Dax" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="Deep learning can be deployed to a wide range of hardware products, such as CPUs or GPUs using libraries like TensorFlow. In order to deploy convolutional neural network to FPGAs, it is important that the framework of the fpga does support all used layers." />
+<meta property="og:description" content="Deep learning can be deployed to a wide range of hardware products, such as CPUs or GPUs using libraries like TensorFlow. In order to deploy convolutional neural network to FPGAs, it is important that the framework of the fpga does support all used layers." />
+<link rel="canonical" href="http://localhost:4000/projects/2021-7-1-modeldb/" />
+<meta property="og:url" content="http://localhost:4000/projects/2021-7-1-modeldb/" />
+<meta property="og:site_name" content="Gabriel Dax" />
+<meta property="og:image" content="http://localhost:4000/images/cnn.svg" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2021-07-01T00:00:00+02:00" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta property="twitter:image" content="http://localhost:4000/images/cnn.svg" />
+<meta property="twitter:title" content="Deep Learning Model Library" />
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"BlogPosting","author":{"@type":"Person","name":"Gabriel Dax"},"dateModified":"2021-07-01T00:00:00+02:00","datePublished":"2021-07-01T00:00:00+02:00","description":"Deep learning can be deployed to a wide range of hardware products, such as CPUs or GPUs using libraries like TensorFlow. In order to deploy convolutional neural network to FPGAs, it is important that the framework of the fpga does support all used layers.","headline":"Deep Learning Model Library","image":"http://localhost:4000/images/cnn.svg","mainEntityOfPage":{"@type":"WebPage","@id":"http://localhost:4000/projects/2021-7-1-modeldb/"},"url":"http://localhost:4000/projects/2021-7-1-modeldb/"}</script>
+<!-- End Jekyll SEO tag -->
+
+    <meta content='text/html; charset=utf-8' http-equiv='Content-Type'>
+<meta http-equiv='X-UA-Compatible' content='IE=edge'>
+<meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0'>
+
+
+<meta property="og:description" content="Deep learning can be deployed to a wide range of hardware products, such as CPUs or GPUs using libraries like TensorFlow. In order to deploy convolutional neural network to FPGAs, it is important that the framework of the fpga does support all used layers." />
+
+<meta name="author" content="Gabriel Dax" />
+
+
+<meta property="og:title" content="Deep Learning Model Library" />
+<meta property="twitter:title" content="Deep Learning Model Library" />
+
+
+
+<meta property="og:image" content="http://localhost:4000/images/cnn.svg"/>
+<meta property="twitter:image" content="http://localhost:4000/images/cnn.svg"/>
+
+
+
+    <link rel="stylesheet" type="text/css" href="/assets/style.css" />
+    <link rel="alternate" type="application/rss+xml" title="Gabriel Dax - PhD Student at TUM" href="/feed.xml" />
+    <link rel="canonical" href="http://localhost:4000/projects/2021-7-1-modeldb/" />
+
+    <meta name="theme-color" content="#000000">
+    <link rel="icon" type="image/png" sizes="32x32" href="/images/ai.png">
+    
+
+  </head>
+
+  <body>
+    <div id="bar"></div>
+    <div class="wrapper-container">
+      <div class="wrapper-masthead">
+        <div class="container">
+          <header class="masthead clearfix">
+
+
+            <a href="/" class="site-avatar"><img src="/images/ai.png" alt="" /></a>
+
+
+            <div class="site-info">
+              <h1 class="site-name"><a href="/">Gabriel Dax</a></h1>
+              <p class="site-description">PhD Student at TUM</p>
+            </div>
+
+            <nav>
+              <a href="/">About Me</a>
+<!--              <a href="/getting-started">About Me</a>-->
+              <a href="/archive">Teaching</a>
+              <a href="/search">Publications</a>
+              <a href="/projects">Projects</a>
+              <a href="/about">Datasets</a>
+
+            </nav>
+          </header>
+        </div>
+      </div>
+
+      <div class="wrapper-main">
+        <div id="main" role="main" class="container">
+          <article class="post detailed">
+  <h1>Deep Learning Model Library</h1>
+
+  <div>
+<!--    <p class="author_title">Gabriel Dax  ·  July  1, 2021</p> -->
+    
+
+    
+    <div class="post-tags">
+      
+      
+        <a href="/categories/#FPGA">FPGA</a>
+        &nbsp;
+      
+        <a href="/categories/#Python">Python</a>
+        &nbsp;
+      
+        <a href="/categories/#TensorFlow">TensorFlow</a>
+        
+      
+    </div>
+  </div>
+    
+  <div class="entry">
+    <p><img src="/images/vgg16.png" alt="My helpful screenshot" /></p>
+
+<p><em>This figure visualizes the architecture of the convolutional neural network VGG16.</em></p>
+
+<p>Deep learning can be deployed to a wide range of hardware products, such as CPUs or GPUs using libraries like TensorFlow.
+In order to deploy convolutional neural network like VGG16 to custom hardware, such as FPGAs (e.g. Xilinx ZCU102), it is
+important that the framework of the fpga does support all used layers. Currently, the use out of the box models from TensorFlow on
+Xilinx FPGAs using Vitis AI is not directly supported.</p>
+
+<p>In this project, we are reimplementing all frequently used convolutional neural network using TensorFlow. The created models
+are able to be deployed on an FPGA with the framework Vitis AI.</p>
+
+<p>The following networks are currently implemented:</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Model List</th>
+      <th>Weights</th>
+      <th>ImageNet Accuracy [%]</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>VGG16</td>
+      <td>ImageNet</td>
+      <td>71.3</td>
+    </tr>
+    <tr>
+      <td>VGG19</td>
+      <td>ImageNet</td>
+      <td>71.3</td>
+    </tr>
+    <tr>
+      <td>MobileNet</td>
+      <td>ImageNet</td>
+      <td>70.6</td>
+    </tr>
+    <tr>
+      <td>ResNet34</td>
+      <td> </td>
+      <td> </td>
+    </tr>
+    <tr>
+      <td>ResNet50</td>
+      <td>ImageNet</td>
+      <td>74.9</td>
+    </tr>
+    <tr>
+      <td>ResNet101</td>
+      <td>ImageNet</td>
+      <td>76.4</td>
+    </tr>
+    <tr>
+      <td>ResNet152</td>
+      <td>ImageNet</td>
+      <td>76.6</td>
+    </tr>
+    <tr>
+      <td>DenseNet121</td>
+      <td>ImageNet</td>
+      <td>75.0</td>
+    </tr>
+    <tr>
+      <td>DenseNet161</td>
+      <td> </td>
+      <td> </td>
+    </tr>
+    <tr>
+      <td>DenseNet169</td>
+      <td>ImageNet</td>
+      <td>76.2</td>
+    </tr>
+    <tr>
+      <td>DenseNet201</td>
+      <td>ImageNet</td>
+      <td>77.3</td>
+    </tr>
+    <tr>
+      <td>InceptionV3</td>
+      <td>ImageNet</td>
+      <td>77.9</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>The following steps are currently under development:</p>
+<ul>
+  <li>Implementation of the missing networks (which are listed in the TensorFlow API)</li>
+  <li>U-Net support of the models (pix2pix)</li>
+</ul>
+
+<p><strong>Published</strong>: Currently, in progress.</p>
+
+  </div>
+
+  <!--
+  <div>
+    <p><span class="share-box">Share:</span> <a href="http://twitter.com/share?text=Deep Learning Model Library&url=http://localhost:4000/projects/2021-7-1-modeldb/" target="_blank">Twitter</a>, <a href="https://www.facebook.com/sharer.php?u=http://localhost:4000/projects/2021-7-1-modeldb/" target="_blank">Facebook</a></p>
+  </div>
+  -->
+  <!--<div class="date">
+    Written on July  1, 2021
+  </div>-->
+
+  
+</article>
+
+        </div>
+      </div>
+
+      <div class="wrapper-footer">
+        <div class="container">
+          <footer class="footer">
+            
+<a href="mailto:gabriel.dax@tum.de"><i class="svg-icon email"></i></a>
+
+
+<a href="https://github.com/g4br1el"><i class="svg-icon github"></i></a>
+
+<a href="https://www.linkedin.com/in/gadax"><i class="svg-icon linkedin"></i></a>
+
+
+
+
+
+
+
+
+
+
+
+            <p class="copyright">(c) 2022 Gabriel Dax | <a href="/imprint">Imprint</a> | Icon made by <a href=https://www.flaticon.com/authors/good-ware">Good Ware</a> from <a href="www.flaticon.com">www.flaticon.com</a></p>
+          </footer>
+        </div>
+      </div>
+    </div>
+
+    
+
+  </body>
+</html>
