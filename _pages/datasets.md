@@ -1,7 +1,7 @@
 ---
 layout: page
 title: Remote Sensing Datasets
-permalink: /about/
+permalink: /datasets/
 ---
 
 This page lists various remote sensing datasets.
