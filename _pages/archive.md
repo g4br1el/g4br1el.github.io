@@ -31,7 +31,8 @@ This page gives an overview about my current and past teaching duties.
 * [*Selected Topics in Big Geospaial Data*](https://campus.tum.de/tumonline/pl/ui/$ctx/WBMODHB.wbShowMHBReadOnly?pKnotenNr=2654853&pOrgNr=51837){:class="module_tum"}, Seminar, Technical University of Munich
 
 ## Spring Term 2020
-* UNIBW
+* *Grundzüge der Geoinformatik* (Principles of Geoinformatics), Exercise, Bundeswehr University Munich
 
 ## Winter Term 2020
-* UNIBW
+* Big Geospatial Data, Exercise, Bundeswehr University Munich
+* Spatial Data Science and Moving Objects, Exercise, Bundeswehr University Munich
