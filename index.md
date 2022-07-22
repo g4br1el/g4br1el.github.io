@@ -44,6 +44,8 @@ I received a merit scholarship from the Federal Ministry of Science, Research an
 
 *Science Award:* of the master thesis with the science prize of AK Salzburg.
 
+*Hackathon:* With team "42", three fellow students, and I won the IRIS 2016 Openlaws Hackathon in Salzburg. In two days they created a fully functional platform for extracting technical terms in a PDF.
+
 ### Programming Languages
 * Python
 * C/C++
