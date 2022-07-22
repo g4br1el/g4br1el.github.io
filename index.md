@@ -8,7 +8,7 @@ tagline: Supporting tagline
 ![image-title-here](images/self.png){:class="img_responsive"}
 
 # About Me
-The study programs are characterized by a t-shaped course program, which teaches me basic knowledge in a wide range of information technology concepts. I put my focus on the software engineering specializations. While I wrote my master thesis at the German Aerospace Center (DLR), I am currently doing my doctoral studies at the Technical University of Munich in the Professorship of Big Geospatial Data Management.  
+The study programs are characterized by a t-shaped course program, which teaches me basic knowledge in a wide range of information technology concepts. I put my focus on the software engineering specializations. While I wrote my master thesis at the German Aerospace Center (DLR), I am currently doing my doctoral studies at the Technical University of Munich at the Professorship of Big Geospatial Data Management.  
 
 While my undergraduate and graduate studies have been in the engineering domain, my current doctoral study is located in the theoretical research field. Throughout my career path and education, I am able to combine the two worlds, engineering, and research. 
 Software engineering and research are like rock climbing; first, we must understand the problem before we are able to do something. Furthermore, plans aren’t solid always be prepared for the unexpected.
