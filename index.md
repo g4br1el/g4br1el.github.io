@@ -8,9 +8,13 @@ tagline: Supporting tagline
 ![image-title-here](images/self.png){:class="img_responsive"}
 
 # About Me
-Software Engineering is like Rock Climbing, first we must understand the problem before we are able to do something. Furthermore, plans aren’t solid always be prepared for the unexpected.
+The study programs are characterized by a t-shaped course program, which teaches me basic knowledge in a wide range of information technology concepts. I put my focus on the software engineering specializations. While I wrote my master thesis at the German Aerospace Center (DLR), I am currently doing my doctoral studies at the technical university of Munich in the Professorship of Big Geospatial Data Management.  
 
-A dedicated and creative software developer who loves solving complex problems. My fields of interest are software engineering, machine learning and distributed systems. I was writing my master thesis at the German Aerospace Center (DLR) and is about unsupervised parameter-free feature-free methods in data mining.
+While my undergraduate and graduate studies have been in the engineering domain, my current doctoral study is located in the theoretical research field. Throughout my career path and education, I am able to combine the two worlds, engineering, and research. 
+Software engineering and research are like rock climbing; first, we must understand the problem before we are able to do something. Furthermore, plans aren’t solid always be prepared for the unexpected.
+
+
+
 # Research Interests
 * (Spatial) Deep Learning
 * Machine Learning and Data Mining
