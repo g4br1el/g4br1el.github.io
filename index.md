@@ -8,7 +8,7 @@ tagline: Supporting tagline
 ![image-title-here](images/self.png){:class="img_responsive"}
 
 # About Me
-My name is Gabriel Dax and I have studied for my bachelor’s and master’s in Information Technology and Systems Management at the FH Salzburg. The study programs are characterized by a t-shaped course program, which teaches me basic knowledge in a wide range of information technology concepts. I put my focus on the software engineering specializations. While I wrote my master thesis at the German Aerospace Center (DLR), I am currently doing my doctoral studies at the technical university of Munich in the Professorship of Big Geospatial Data Management.  
+I started my career with an apprenticeship as a toolmaker, after I have caught up on the high-school diploma I graduated from the FH Salzburg with a bachelor's and master's degree in Information Technology and Systems Management. The study programs are characterized by a t-shaped course program, which teaches me basic knowledge in a wide range of information technology concepts. I put my focus on the software engineering specializations. After writing my master thesis at the German Aerospace Center (DLR), I started my doctoral studies at the technical university of Munich in the Professorship of Big Geospatial Data Management.  
 
 While my undergraduate and graduate studies have been in the engineering domain, my current doctoral study is located in the theoretical research field. Throughout my career path and education, I am able to combine the two worlds, engineering, and research. 
 
@@ -32,14 +32,15 @@ While my undergraduate and graduate studies have been in the engineering domain,
 02/2019 - 07/2019 **German Aerospace Center (DLR)**, Student Research Assistant  <br/>
 02/2017 - 07/2017 **Fraunhofer Institute for Integrated Circuits (IIS)**, Internship <br/>
 07/2016 - 08/2016 **GMS Hutter**, Internship <br/>
-12/2012 - 09/2014 **Optiplan**, Technical Staff <br/>
-12/2007 - 08/2012 **Arvai Plasics**, Tool Maker <br/>
+09/2012 - 09/2014 **Optiplan**, Technical Staff <br/>
+09/2007 - 07/2012 **Arvai Plasics**, Tool Maker
 
 ### Education
 12/2019 - Now     **Technical University of Munich**, Doctoral Studies (Dr. rer. nat.) <br/>
 09/2017 - 11/2019 **FH Salzburg**, Information Technology and Systems Management (M.Sc.) <br/>
 09/2014 - 07/2017 **FH Salzburg**, Information Technology and Systems Management (B.Sc.) <br/>
-09/2012 - 07/2013 **FH Joanneum**, Qualification Course for University Entrance <br/> 
+09/2012 - 07/2013 **FH Joanneum**, Qualification Course for University Entrance <br/>
+09/2007 - 02/2011 **Arvai Plasics**, Apprenticeship as Tool Maker
 
 ### Awards
 *Merit Scholarships:* For the first and second semesters in the Bachelor's program, 
