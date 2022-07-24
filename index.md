@@ -8,7 +8,7 @@ tagline: Supporting tagline
 ![image-title-here](images/self.png){:class="img_responsive"}
 
 # About Me
-I started my career with an apprenticeship as a toolmaker. Afterwards I have caught up on the high-school diploma and graduated from the FH Salzburg with a bachelor's and master's degree in Information Technology and Systems Management. The study programs are characterized by a t-shaped course program, which teaches me basic knowledge in a wide range of information technology concepts. For my specializations I chose the software engineering ones. After writing my master thesis at the German Aerospace Center (DLR), I started my doctoral studies at the Technical University of Munich in the Professorship of Big Geospatial Data Management.  
+I started my career with an apprenticeship as a toolmaker. Afterwards I have made the high-school diploma and graduated from the FH Salzburg with a bachelor's and master's degree in Information Technology and Systems Management. The study programs are characterized by a t-shaped course program, which taught me basic knowledge in a wide range of information technology concepts. For my specializations I chose the software engineering ones. After writing my master thesis at the German Aerospace Center (DLR), I started my doctoral studies at the Technical University of Munich in the Professorship of Big Geospatial Data Management.  
 
 While my undergraduate and graduate studies have been in the engineering domain, my current doctoral study is located in the theoretical research field. Because of my career path and education, I am able to combine the two worlds, engineering, and research. 
 
@@ -24,7 +24,7 @@ While my undergraduate and graduate studies have been in the engineering domain,
 * Geospatial Data
 
 # Resume
-<a id="basic_button" href="{% link /files/cv_gabriel_dax.pdf %}">Download Resume</a>
+<a id="basic_button" href="{% link /files/Resume_Gabriel_Dax.pdf %}">Download Resume</a>
 
 ### Work Experience
 10/2020 - Now     **Technical University of Munich**, Research Assistant <br/>
