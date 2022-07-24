@@ -107,6 +107,7 @@ h1, h2, h3, h4, h5, h6 {
   margin: 0px;
   font-size: 15px;
   color: #666666;
+  text-align: center;
 }
 
 .copyright a {
@@ -418,11 +419,13 @@ p > img {
   margin: -5px 0 0 0;
   color: #666;
   font-size: 16px;
+  text-align: left;
 }
 
 @media screen and (max-width: 640px) {
   .site-description {
     margin: 3px 0;
+    text-align: center;
   }
 }
 
