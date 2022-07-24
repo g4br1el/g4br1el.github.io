@@ -366,6 +366,7 @@ p > img {
   margin: -5px 0 0 0;
   color: $gray;
   font-size: 16px;
+  text-align: center;
 
   @include mobile {
     margin: 3px 0;
