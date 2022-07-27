@@ -5,7 +5,7 @@
 {% if link %}[<a href="{{link}}">PDF</a>]{% endif %}
 {% if entry.online %}[<a href="{{entry.online}}">Online</a>]{% endif %}
 {% if entry.url %}[<a href="{{entry.url}}">Online</a>]{% endif %}
-{% if entry.doi %}[<a href="{{entry.doi}}">doi</a>]{% endif %}
+{% if entry.doi %}[<a href="https://doi.org/{{entry.doi}}">doi</a>]{% endif %}
 [<a data-toggle="collapse" onClick="toggleBibtex{{key}}(); return false;">BibTeX</a>]
 <div id="a{{key}}" style="display: none;">
     <pre>{{entry.bibtex}}</pre>
