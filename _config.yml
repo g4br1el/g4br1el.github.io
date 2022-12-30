@@ -105,6 +105,12 @@ collections:
   projects:
     output: true
 
+
+mathjax: true
+# REMINDER:
+# Inline:  \\( C_x \\)
+# Block: \\[ ... \\]
+
 # Exclude these files from your production _site
 exclude:
   - Gemfile
