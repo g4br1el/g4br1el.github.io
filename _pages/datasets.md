@@ -48,7 +48,7 @@ This page lists public datasets in remote sensing.
 
 
 # Computer Vision Datasets
-This page lists public datasets in remote sensing.
+This page lists public datasets in computer vision.
 
 | Name            | Resolution | Channels  | No. Images | Classes | Task\* | Ref.                                                                                                                                                                          |
 |-----------------|------------|-----------|------------|---------|--------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
