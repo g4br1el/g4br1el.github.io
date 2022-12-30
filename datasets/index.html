@@ -3,7 +3,7 @@
   <head>
     <title>Remote Sensing Datasets – Gabriel Dax – PhD Student at TUM</title>
     <!-- Begin Jekyll SEO tag v2.8.0 -->
-<meta name="generator" content="Jekyll v4.3.1" />
+<meta name="generator" content="Jekyll v4.2.2" />
 <meta property="og:title" content="Remote Sensing Datasets" />
 <meta name="author" content="Gabriel Dax" />
 <meta property="og:locale" content="en_US" />
@@ -39,7 +39,7 @@
 <meta property="twitter:image" content="http://localhost:4000/images/ai.png"/>
 
 
-
+    <script type="text/javascript" src="http://cdn.mathjax.org/mathjax/latest/MathJax.js?config=TeX-AMS-MML_HTMLorMML"></script>
     <link rel="stylesheet" type="text/css" href="/assets/style.css" />
     <link rel="alternate" type="application/rss+xml" title="Gabriel Dax - PhD Student at TUM" href="/feed.xml" />
     <link rel="canonical" href="http://localhost:4000/datasets/" />
@@ -86,147 +86,289 @@
   <h1>Remote Sensing Datasets</h1>
 
   <div class="entry">
-    <p>This page lists various remote sensing datasets.</p>
+    <p>This page lists public datasets in remote sensing and computer vision.</p>
 
-<h2 id="bigearthnet">BigEarthNet</h2>
-<p>The BigEarthNet dataset is composed of largely cloud-free Sentinel-2 image patches (L2A) from 2018 labeled from the CORINE 2018 dataset.</p>
+<table>
+  <thead>
+    <tr>
+      <th>Name</th>
+      <th>Resolution</th>
+      <th>Channels</th>
+      <th>#Images</th>
+      <th>#Classes</th>
+      <th>Task*</th>
+      <th>Ref.</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>EuroSAT</td>
+      <td>256x256</td>
+      <td>Sen-2</td>
+      <td>27,000</td>
+      <td>10</td>
+      <td>C</td>
+      <td><a href="https://github.com/phelber/eurosat">Source</a>, <a href="https://doi.org/10.1109/JSTARS.2019.2918242">P1</a>, <a href="https://doi.org/10.1109/IGARSS.2018.8519248">P2</a></td>
+    </tr>
+    <tr>
+      <td>AID</td>
+      <td>600x600</td>
+      <td>RGB</td>
+      <td>10,00</td>
+      <td>30</td>
+      <td>C</td>
+      <td><a href="https://captain-whu.github.io/AID/">Source</a>, <a href="https://doi.org/10.1109/TGRS.2017.2685945">P1</a></td>
+    </tr>
+    <tr>
+      <td>BigEarthNet</td>
+      <td>multi-resolution</td>
+      <td>Sen-2</td>
+      <td>590,326</td>
+      <td>19** /43**</td>
+      <td>C</td>
+      <td><a href="http://bigearth.net/">Source</a>, <a href="https://doi.org/10.1109/IGARSS.2019.8900532">P1</a>, <a href="https://doi.org/10.1109/MGRS.2021.3089174">P2</a></td>
+    </tr>
+    <tr>
+      <td>UC-Merced</td>
+      <td>256x256</td>
+      <td>RGB</td>
+      <td>2,100</td>
+      <td>21</td>
+      <td>C</td>
+      <td><a href="http://weegee.vision.ucmerced.edu/datasets/landuse.html">Source</a>, <a href="https://doi.org/10.1145/1869790.1869829">P1</a></td>
+    </tr>
+    <tr>
+      <td>SAT-4</td>
+      <td>28x28</td>
+      <td> </td>
+      <td>500,000</td>
+      <td>4</td>
+      <td>C</td>
+      <td><a href="https://csc.lsu.edu/~saikat/deepsat/">Source</a>, <a href="https://doi.org/10.1145/2820783.2820816">P1</a></td>
+    </tr>
+    <tr>
+      <td>SAT-6</td>
+      <td>28x28</td>
+      <td> </td>
+      <td>405,000</td>
+      <td>6</td>
+      <td>C</td>
+      <td><a href="https://csc.lsu.edu/~saikat/deepsat/">Source</a>, <a href="https://doi.org/10.1145/2820783.2820816">P1</a></td>
+    </tr>
+    <tr>
+      <td>Resisc45</td>
+      <td>256x256</td>
+      <td>RGB</td>
+      <td>31,500</td>
+      <td>45</td>
+      <td>C</td>
+      <td><a href="https://doi.org/10.1109/JPROC.2017.2675998">P1</a></td>
+    </tr>
+    <tr>
+      <td>RSI-CB256</td>
+      <td>256x256</td>
+      <td>RGB</td>
+      <td>24,000</td>
+      <td>35</td>
+      <td>C</td>
+      <td><a href="https://github.com/lehaifeng/RSI-CB">Source</a>, <a href="https://doi.org/10.3390/s20061594">P1</a></td>
+    </tr>
+    <tr>
+      <td>RSI-CB128</td>
+      <td>128x128</td>
+      <td>RGB</td>
+      <td>36,000</td>
+      <td>45</td>
+      <td>C</td>
+      <td><a href="https://github.com/lehaifeng/RSI-CB">Source</a>, <a href="https://doi.org/10.3390/s20061594">P1</a></td>
+    </tr>
+    <tr>
+      <td>Data Fusion`18</td>
+      <td> </td>
+      <td> </td>
+      <td> </td>
+      <td>21</td>
+      <td> </td>
+      <td><a href="https://ieee-dataport.org/open-access/2018-ieee-grss-data-fusion-challenge-%E2%80%93-fusion-multispectral-lidar-and-hyperspectral-data">Source</a></td>
+    </tr>
+    <tr>
+      <td>ONERA</td>
+      <td>Sen-2</td>
+      <td>Sen-2</td>
+      <td>24</td>
+      <td>-</td>
+      <td>CD</td>
+      <td><a href="https://rcdaudt.github.io/oscd/">Source</a>, <a href="https://doi.org/10.1109/IGARSS.2018.8518015">P1</a></td>
+    </tr>
+    <tr>
+      <td>PatternNet</td>
+      <td>256x256</td>
+      <td> </td>
+      <td>30,400</td>
+      <td>38</td>
+      <td>C</td>
+      <td><a href="https://ui.adsabs.harvard.edu/link_gateway/2018JPRS..145..197Z/doi:10.1016/j.isprsjprs.2018.01.004">P1</a></td>
+    </tr>
+    <tr>
+      <td>WHU-RS19</td>
+      <td>600x600</td>
+      <td>RGB</td>
+      <td>1,005</td>
+      <td>19</td>
+      <td>C</td>
+      <td><a href="https://captain-whu.github.io/BED4RS/">Source</a>, <a href="https://www.isprs.org/proceedings/xxxviii/part7/a/pdf/298_XXXVIII-part7A.pdf">P1</a>, <a href="https://ieeexplore.ieee.org/document/5545358">P2</a></td>
+    </tr>
+  </tbody>
+</table>
 
-<p><em>Key Features:</em></p>
-<ul>
-  <li>Number of images:  590.326</li>
-  <li>Number of classes: 19 (new) / 43 (old)</li>
-  <li>Label type: multi label</li>
-  <li>geo-referenced: Yes</li>
-  <li>Image resolution:
-    <ul>
-      <li>120 × 120 pixels for 10m bands</li>
-      <li>60 × 60 pixels for 20m bands</li>
-      <li>20 × 20 pixels for 60m bands</li>
-    </ul>
-  </li>
-</ul>
+<p>* C - Classification, S - Segmentation, CD - Change Detection <br />
+** Multi-label</p>
 
-<p><em>License:</em>
-The BigEarthNet Archive is licensed under the Community Data License Agreement – Permissive, Version 1.0.</p>
+<h1 id="computer-vision-datasets">Computer Vision Datasets</h1>
 
-<p><a href="http://bigearth.net/">Source</a>, <a href="https://doi.org/10.1109/IGARSS.2019.8900532">Paper no. 1</a>, <a href="https://doi.org/10.1109/MGRS.2021.3089174">Paper no. 2</a></p>
+<table>
+  <thead>
+    <tr>
+      <th>Name</th>
+      <th>Resolution</th>
+      <th>Channels</th>
+      <th>No. Images</th>
+      <th>Classes</th>
+      <th>Task*</th>
+      <th>Ref.</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>CAT</td>
+      <td>Multiple</td>
+      <td>RGB</td>
+      <td>&gt;9,000</td>
+      <td> </td>
+      <td>S</td>
+      <td><a href="https://www.kaggle.com/crawford/cat-dataset">Source</a>, <a href="">P1</a></td>
+    </tr>
+    <tr>
+      <td>Cifar10</td>
+      <td>32x32</td>
+      <td>RGB</td>
+      <td>60,000</td>
+      <td>10</td>
+      <td>C</td>
+      <td><a href="https://www.cs.toronto.edu/~kriz/cifar.html">Source</a>, <a href="https://www.cs.toronto.edu/~kriz/learning-features-2009-TR.pdf">P1</a></td>
+    </tr>
+    <tr>
+      <td>Cifar100</td>
+      <td>32x32</td>
+      <td>RGB</td>
+      <td>60,000</td>
+      <td>100</td>
+      <td>C</td>
+      <td><a href="https://www.cs.toronto.edu/~kriz/cifar.html">Source</a>, <a href="https://www.cs.toronto.edu/~kriz/learning-features-2009-TR.pdf">P1</a></td>
+    </tr>
+    <tr>
+      <td>CityScapes</td>
+      <td> </td>
+      <td> </td>
+      <td> </td>
+      <td> </td>
+      <td> </td>
+      <td><a href="">Source</a>, <a href="">P1</a></td>
+    </tr>
+    <tr>
+      <td>Coco (2014)</td>
+      <td>Multiple</td>
+      <td>RGB</td>
+      <td>245,496</td>
+      <td> </td>
+      <td>S</td>
+      <td><a href="https://cocodataset.org/#home">Source</a>, <a href="https://link.springer.com/chapter/10.1007/978-3-319-10602-1_48">P1</a></td>
+    </tr>
+    <tr>
+      <td>Fashion Mnist</td>
+      <td>28x28</td>
+      <td>Grayscale</td>
+      <td>70,000</td>
+      <td>10</td>
+      <td>C</td>
+      <td><a href="https://github.com/zalandoresearch/fashion-mnist">Source</a>, <a href="https://arxiv.org/abs/1708.07747">P1</a></td>
+    </tr>
+    <tr>
+      <td>ImageNet (2012)</td>
+      <td>Multiple</td>
+      <td>RGB</td>
+      <td>1,261,406</td>
+      <td>1000</td>
+      <td>C</td>
+      <td><a href="https://www.image-net.org/">Source</a>, <a href="https://doi.org/10.1007/s11263-015-0816-y">P1</a></td>
+    </tr>
+    <tr>
+      <td>LabelMe-12-50k</td>
+      <td>256x256</td>
+      <td>RGB</td>
+      <td>50,000</td>
+      <td>12</td>
+      <td>C</td>
+      <td><a href="https://www.ais.uni-bonn.de/download/datasets.html">Source</a>, <a href="https://doi.org/10.1109/ICICISYS.2009.5357786">P1</a></td>
+    </tr>
+    <tr>
+      <td>LFWFace</td>
+      <td>250x250</td>
+      <td>RGB</td>
+      <td>13,233</td>
+      <td> </td>
+      <td>S</td>
+      <td><a href="http://vis-www.cs.umass.edu/lfw/">Source</a>, <a href="https://doi.org/10.1007/978-3-319-25958-1">P1</a>, <a href="http://vis-www.cs.umass.edu/lfw/lfw.pdf">P2</a></td>
+    </tr>
+    <tr>
+      <td>MNIST</td>
+      <td>28x28</td>
+      <td>Grayscale</td>
+      <td>70,000</td>
+      <td>10</td>
+      <td>C</td>
+      <td> </td>
+    </tr>
+    <tr>
+      <td>MpiiHumanPose</td>
+      <td> </td>
+      <td>RGB</td>
+      <td>24,920</td>
+      <td> </td>
+      <td>S</td>
+      <td><a href="http://human-pose.mpi-inf.mpg.de/">Source</a>, <a href="https://doi.org/10.1109/CVPR.2014.471">P1</a></td>
+    </tr>
+    <tr>
+      <td>OpenImagesV6</td>
+      <td> </td>
+      <td>RGB</td>
+      <td> </td>
+      <td> </td>
+      <td>S</td>
+      <td><a href="https://storage.googleapis.com/openimages/web/factsfigures_v6.html">Source</a>, <a href="https://doi.org/10.1007/s11263-020-01316-z">P1</a>, <a href="https://doi.org/10.1109/CVPR.2019.01197">P2</a></td>
+    </tr>
+    <tr>
+      <td>StanfordCars</td>
+      <td> </td>
+      <td>RGB</td>
+      <td>16,185</td>
+      <td>196</td>
+      <td>C</td>
+      <td><a href="http://ai.stanford.edu/~jkrause/cars/car_dataset.html">Source</a>, <a href="http://ai.stanford.edu/~jkrause/papers/3drr13.pdf">P1</a></td>
+    </tr>
+    <tr>
+      <td>StanfordDog</td>
+      <td>200x200</td>
+      <td>RGB</td>
+      <td>20,580</td>
+      <td>120</td>
+      <td>C</td>
+      <td><a href="http://vision.stanford.edu/aditya86/ImageNetDogs/">Source</a>, <a href="http://people.csail.mit.edu/khosla/papers/fgvc2011.pdf">P1</a></td>
+    </tr>
+  </tbody>
+</table>
 
-<h2 id="eurosat">EuroSAT</h2>
-<p>The EuroSAT dataset is composed of aerial image tiles showing varying land-use classes in RGB colors as well as with multispectral bands.</p>
-
-<p><em>Key Features:</em></p>
-<ul>
-  <li>Number of images: 27.000</li>
-  <li>Number of classes: 10</li>
-  <li>Label type: single label</li>
-  <li>geo-referenced: Yes</li>
-  <li>Image resolution: 256x256 pixels</li>
-</ul>
-
-<p><a href="https://github.com/phelber/eurosat">Source</a>, <a href="https://doi.org/10.1109/JSTARS.2019.2918242">Paper no. 1</a>, <a href="https://doi.org/10.1109/IGARSS.2018.8519248">Paper no. 2</a></p>
-
-<h2 id="uc-merced-land-use-dataset">UC-Merced Land Use Dataset</h2>
-<p>The UC-Merced Land Use Dataset is composed of aerial image tiles showing varying land-use classes.</p>
-
-<p><em>Key Features:</em></p>
-<ul>
-  <li>Number of images: 2100</li>
-  <li>Number of classes: 21</li>
-  <li>Label type: single label</li>
-  <li>geo-referenced: No</li>
-  <li>Image resolution: 256x256 pixels</li>
-</ul>
-
-<p><a href="http://weegee.vision.ucmerced.edu/datasets/landuse.html">Source</a>, <a href="https://doi.org/10.1145/1869790.1869829">Paper</a></p>
-
-<h2 id="aid">AID</h2>
-<p>The AID (Aerial Scene Classification) Dataset is composed of aerial image tiles showing varying land-use classes.</p>
-
-<p><em>Key Features:</em></p>
-<ul>
-  <li>Number of images: 10.000</li>
-  <li>Number of classes: 30</li>
-  <li>Label type: single label</li>
-  <li>geo-referenced: TBD</li>
-  <li>Image resolution: 600x600 pixels</li>
-</ul>
-
-<p><a href="https://captain-whu.github.io/AID/">Source</a>, <a href="https://doi.org/10.1109/TGRS.2017.2685945">Paper</a></p>
-
-<h2 id="sat-4-and-sat-6">SAT-4 and SAT-6</h2>
-<p>SAT-4 and SAT-6 are two datasets which composes of aerial image tiles showing varying land-use classes in two different resolutions.</p>
-
-<p><em>Key Features:</em></p>
-<ul>
-  <li>Number of images: 500.000 (SAT-4), 405.000 (SAT-6)</li>
-  <li>Number of classes: 4 (SAT-4), 6 (SAT-6)</li>
-  <li>Label type: single label</li>
-  <li>geo-referenced: TBD</li>
-  <li>Image resolution:28x28 pixels</li>
-</ul>
-
-<p><a href="https://csc.lsu.edu/~saikat/deepsat/">Source</a>, <a href="https://doi.org/10.1145/2820783.2820816">Paper</a></p>
-
-<h2 id="2018-ieee-grss-data-fusion-challenge">2018 IEEE GRSS Data Fusion Challenge</h2>
-<p>This datasets was creaded for the 2018 IEEE GRSS data fusion challenge and composes of aerial image tiles showing varying land-use classes.</p>
-
-<p><em>Key Features:</em></p>
-<ul>
-  <li>Number of images: TBD</li>
-  <li>Number of classes: 21</li>
-  <li>Label type: single label</li>
-  <li>geo-referenced: TBD</li>
-  <li>Image resolution: TBD</li>
-</ul>
-
-<p><a href="https://ieee-dataport.org/open-access/2018-ieee-grss-data-fusion-challenge-%E2%80%93-fusion-multispectral-lidar-and-hyperspectral-data">Source</a></p>
-
-<h2 id="onera-satellite-change-detection">ONERA Satellite Change Detection</h2>
-<p>The Onera Satellite Change Detection dataset addresses the issue of detecting changes between satellite images from different dates.</p>
-
-<p><em>Key Features:</em></p>
-<ul>
-  <li>Number of images: 24</li>
-  <li>Number of classes: None</li>
-  <li>Label type: None</li>
-  <li>geo-referenced: TBD</li>
-  <li>Image resolution: Sentinel-2</li>
-</ul>
-
-<p><a href="https://rcdaudt.github.io/oscd/">Source</a>, <a href="https://doi.org/10.1109/IGARSS.2018.8518015">Paper</a></p>
-
-<h2 id="resisc45">Resisc45</h2>
-<p>The Resisc45 Dataset is composed of aerial image tiles showing varying land-use classes.</p>
-
-<p>Website is currently down. - 19.7.2022</p>
-
-<p><em>Key Features:</em></p>
-<ul>
-  <li>Number of images: 31.500</li>
-  <li>Number of classes: 45</li>
-  <li>Label type: single label</li>
-  <li>geo-referenced: No</li>
-  <li>Image resolution: 256x256 pixels</li>
-</ul>
-
-<p><a href="https://doi.org/10.1109/JPROC.2017.2675998">Paper</a></p>
-
-<h2 id="rsi-cb256">RSI-CB256</h2>
-<p>The RSI-CB256 Dataset is composed of aerial image tiles showing varying land-use classes.</p>
-
-<p>Info: This dataset does also exist with the resolution 128 x 128 pixels (RSI-CB128).</p>
-
-<p><em>Key Features:</em></p>
-<ul>
-  <li>Number of images: 24.000</li>
-  <li>Number of classes: 35</li>
-  <li>Label type: single label</li>
-  <li>geo-referenced: No</li>
-  <li>Image resolution: 256x256 pixels</li>
-</ul>
-
-<p><a href="https://github.com/lehaifeng/RSI-CB">Source</a>, <a href="https://doi.org/10.3390/s20061594">Paper</a></p>
-
+<p>* C - Classification, S - Segmentation <br /></p>
 
   </div>
 </article>
