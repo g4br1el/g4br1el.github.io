@@ -1,9 +1,32 @@
 title: Gabriel — ML Research
-description: Personal site
+name: Gabriel Dax
+description: ML Research Engineer
 baseurl: ""
 url: "https://g4br1el.github.io"
+avatar: /images/ai.png
 
 markdown: kramdown
+
+include:
+  - _pages
+
+collections:
+  projects:
+    output: true
+    permalink: /projects/:title/
+
+defaults:
+  - scope:
+      path: "_pages"
+      type: pages
+    values:
+      layout: page
+  - scope:
+      path: "_projects"
+      type: projects
+    values:
+      layout: projects
+
 plugins:
   - jekyll-feed
   - jekyll-seo-tag
@@ -11,7 +34,9 @@ plugins:
 
 exclude:
   - Makefile
+  - makefile
   - Gemfile
   - Gemfile.lock
   - README.md
   - vendor
+  - LICENSE
