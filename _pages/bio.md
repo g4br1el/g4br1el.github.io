@@ -64,15 +64,15 @@ deploying ML at the edge.*
 
 ## Education
 
-#### Doctor of Natural Sciences in Aerospace and Geodesy @ [Technical University of Munich]() (Oct. 2020 - May 2024)
+#### Doctor of Natural Sciences in Aerospace and Geodesy @ [Technical University of Munich](https://www.bgd.ed.tum.de/en/) (Oct. 2020 - May 2024)
 - Thesis: Aspects of Algorithmic Information Theory in Spatial Machine Learning
 - Focus: Optimization of data-driven pipelines using compression to increase performance and scalability.
 
-#### Diplom-Ingenieur @ [Salzburg University of Applied Sciences]() (Sep. 2017 - Oct 2019)
+#### Diplom-Ingenieur @ [Salzburg University of Applied Sciences](https://www.fh-salzburg.ac.at/en/) (Sep. 2017 - Oct 2019)
 - Program: Information Technology & Systems Management
 - Thesis: Supervised and Unsupervised Data Mining Methods in Remote Sensing
 
-#### Bachelor of Science @ [Salzburg University of Applied Sciences]() (Sep. 2014 - Jul 2017)
+#### Bachelor of Science @ [Salzburg University of Applied Sciences](https://www.fh-salzburg.ac.at/en/) (Sep. 2014 - Jul 2017)
 - Program: Information Technology & Systems Management
 - Thesis: Performance Data Collection in a Distributed System for Rendering Cinema Movies
 
@@ -93,12 +93,14 @@ deploying ML at the edge.*
 
 ## Certifications
 
-| Course | Provider | Year |
-|--------|----------|------|
-| Fundamentals of Accelerated Computing with CUDA C/C++ | **NVIDIA** | 2025 |
-| Node-Level Performance Engineering (NUMA, SIMD) | LRZ | 2025 |
-| GPU Programming (OpenACC, Nsight Profiling) | LRZ | 2025 |
-| Parallel Programming of HPC Systems (OpenMP, MPI) | LRZ | 2023 |
+| Course                                                 | Provider | Year |
+|--------------------------------------------------------|---------|------|
+| Introduction to Parallel Programming with MPI          | NHR@FAU | 2025 |
+| Node-Level Performance Engineering (NUMA, SIMD)        | LRZ     | 2025 |
+| Fundamentals of Accelerated Computing with CUDA C/C++  | NVIDIA  | 2025 |
+| Fundamentals of Accelerated Computing with CUDA Python | NVIDIA  | 2025 |
+| GPU Programming Workshop (OpenACC, Nsight Profiling)   | LRZ     | 2025 |
+| Parallel Programming of HPC Systems (OpenMP, MPI)      | LRZ     | 2023 |
 
 ---
 
