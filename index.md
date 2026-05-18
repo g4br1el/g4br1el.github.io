@@ -25,7 +25,7 @@ layout: default
       <span class="skill-tag">CLIP / SAM</span>
     </div>
     <div style="margin-top: 20px;">
-      <a href="{{ site.baseurl }}/files/Resume_Gabriel_Dax.pdf" class="btn btn-primary">Download CV</a>
+      <a href="{{ site.baseurl }}/files/CV-Gabriel_Dax.pdf" class="btn btn-primary">Download CV</a>
       <a href="{{ site.baseurl }}/projects" class="btn btn-outline">View Projects</a>
     </div>
   </div>

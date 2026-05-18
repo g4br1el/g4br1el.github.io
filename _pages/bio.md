@@ -8,7 +8,7 @@ Deep Learning Research Engineer with a path from precision manufacturing
 through software engineering to ML systems research. I bring hardware intuition,
 systems thinking, and research rigor to everything I build.
 
-<a href="/files/Resume_Gabriel_Dax.pdf" class="btn btn-primary">Download Full CV (PDF)</a>
+<a href="/files/CV-Gabriel_Dax.pdf" class="btn btn-primary">Download Full CV (PDF)</a>
 
 ---
 
