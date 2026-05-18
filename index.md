@@ -5,7 +5,7 @@ layout: default
 <div class="hero">
   <div class="hero-text">
     <h1>Gabriel Dax</h1>
-    <p class="subtitle">Deep Learning Systems Engineer — CUDA · TensorRT · Distributed Training</p>
+    <p class="subtitle">Machine Learning Research Engineer — CUDA · TensorRT · Distributed Training</p>
     <p class="bio-brief">
       I build and optimize deep learning systems end-to-end: from custom CUDA kernels 
       and multi-node distributed training (32 GPUs / DDP / NCCL) to production inference 
