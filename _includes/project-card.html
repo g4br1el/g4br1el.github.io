@@ -1,0 +1,45 @@
+{% assign project = include.project %}
+<div class="project-card {% if project.image %}project-card--has-image{% endif %}">
+    {% if project.image %}
+    <div class="project-card-image">
+        <img src="{{ site.baseurl }}{{ project.image }}" alt="{{ project.title }}">
+    </div>
+    {% endif %}
+    <div class="project-card-body">
+        <div class="project-card-header">
+            <h3>
+                {% if project.url %}
+                <a href="{{ site.baseurl }}{{ project.url }}">{{ project.title }}</a>
+                {% else %}
+                {{ project.title }}
+                {% endif %}
+            </h3>
+            <span class="year">{{ project.date | date: "%Y" }}</span>
+        </div>
+
+        {% if project.context %}
+        <div class="project-card-context">{{ project.context }}</div>
+        {% endif %}
+
+        {% if project.tags.size > 0 %}
+        <div class="project-card-tags">
+            {% for tag in project.tags %}
+            <span class="tag">{{ tag }}</span>
+            {% endfor %}
+        </div>
+        {% endif %}
+
+        <p class="project-card-description">{{ project.description }}</p>
+
+        {% if project.metrics.size > 0 %}
+        <div class="project-card-metrics">
+            {% for m in project.metrics %}
+            <div class="metric">
+                <span class="metric-value">{{ m.value }}</span>
+                <span class="metric-label">{{ m.label }}</span>
+            </div>
+            {% endfor %}
+        </div>
+        {% endif %}
+    </div>
+</div>

@@ -4,6 +4,18 @@
 //
 
 // Colors
+$primary: #1a1a2e;
+$accent: #0f9d58;       // green accent (subtle NVIDIA nod without being on-the-nose)
+$accent-hover: #0b7a43;
+$text: #1a1a1a;
+$text-light: #6b7280;
+$text-muted: #9ca3af;
+$border: #e5e7eb;
+$bg: #ffffff;
+$bg-alt: #f9fafb;
+$bg-dark: #111827;
+$card-shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 1px 2px rgba(0, 0, 0, 0.06);
+$card-shadow-hover: 0 4px 12px rgba(0, 0, 0, 0.1);
 $blue: #4183C4;
 
 // Grays
@@ -14,14 +26,18 @@ $gray: #666;
 $lightGray: #eee;
 $white: #fff;
 
-// Font stacks
-$helvetica: Helvetica, Arial, sans-serif;
-$helveticaNeue: "Helvetica Neue", Helvetica, Arial, sans-serif;
-$georgia: Georgia, serif;
 
-// Mobile breakpoints
+// Typography
+$font-sans: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+$font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+
+
+$max-width: 960px;
+$breakpoint-mobile: 768px;
+// Mixins
 @mixin mobile {
-  @media screen and (max-width: 640px) {
+  @media screen and (max-width: $breakpoint-mobile) {
     @content;
   }
 }
+

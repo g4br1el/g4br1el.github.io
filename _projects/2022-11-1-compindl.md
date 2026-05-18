@@ -1,10 +1,23 @@
 ---
 layout: post
-title: Compression Supports Spatial Deep Learning
-categories: [FPGA, Python, TensorFlow]
-excerpt: Satellites provide huge amounts of images, the number of datasets increases and the domain became more and more data-driven. Image quantization and embedding into file formats do support convolutional neural networks to estimate the labels of images, by strengthening the features.
+title: "Compression Supports Spatial Deep Learning"
+date: 2022-11-01
+context: "TU Munich — PhD Research (IEEE JSTARS)"
+tags: [Image Compression, CNNs, VitisAI, Remote Sensing]
+description: >
+  Aggressive image quantization and lossy compression as preprocessing 
+  for CNNs — reducing storage and training time with minimal accuracy loss.
+metrics:
+  - value: "19.9%"
+    label: "Training Speedup"
+  - value: "<1%"
+    label: "Accuracy Loss"
+  - value: "3"
+    label: "CNN Architectures"
+  - value: "2"
+    label: "Satellite Datasets"
+permalink: /projects/compindl
 image: /images/pipeline.png
-date: 2022-11-1
 ---
 
 ![My helpful screenshot]({{ site.baseurl }}/images/pipeline.png)

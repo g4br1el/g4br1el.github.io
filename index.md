@@ -1,63 +1,35 @@
 ---
 layout: default
-title: Home
-tagline: Supporting tagline
 ---
 
-
-![image-title-here](images/self.png){:class="img_responsive"}
-
-# About Me
-I started my career with an apprenticeship as a toolmaker. Afterwards I have made the high-school diploma and graduated from the FH Salzburg with a bachelor's and master's degree in Information Technology and Systems Management. The study programs are characterized by a t-shaped course program, which taught me basic knowledge in a wide range of information technology concepts. For my specializations I chose the software engineering ones. After writing my master thesis at the German Aerospace Center (DLR), I started my doctoral studies at the Technical University of Munich in the Professorship of Big Geospatial Data Management.  
-
-While my undergraduate and graduate studies have been in the engineering domain, my current doctoral study is located in the theoretical research field. Because of my career path and education, I am able to combine the two worlds, engineering, and research. 
-
-*Software engineering and research are like rock climbing; first, we must understand the problem before we are able to do something. Furthermore, plans aren’t solid always be prepared for the unexpected.*
-
-
-# Research Interests
-* (Spatial) Deep Learning
-* Machine Learning and Data Mining
-* Deep Learning on Custom Hardware
-* Probabilistic Data Structures
-* Data Compression
-* Geospatial Data
-
-# Resume
-<a id="basic_button" href="{% link /files/Resume_Gabriel_Dax.pdf %}">Download Resume</a>
-
-### Work Experience
-10/2020 - Now     **Technical University of Munich**, Research Assistant <br/>
-12/2019 - 09/2020 **Bundeswehr University Munich**, Research Assistant  <br/>
-02/2019 - 07/2019 **German Aerospace Center (DLR)**, Student Research Assistant  <br/>
-02/2017 - 07/2017 **Fraunhofer Institute for Integrated Circuits (IIS)**, Internship <br/>
-07/2016 - 08/2016 **GMS Hutter**, Internship <br/>
-09/2012 - 09/2014 **Optiplan**, Technical Staff <br/>
-09/2007 - 07/2012 **Arvai Plasics**, Tool Maker
-
-### Education
-12/2019 - Now     **Technical University of Munich**, Doctoral Studies (Dr. rer. nat.) <br/>
-09/2017 - 11/2019 **FH Salzburg**, Information Technology and Systems Management (M.Sc.) <br/>
-09/2014 - 07/2017 **FH Salzburg**, Information Technology and Systems Management (B.Sc.) <br/>
-09/2012 - 07/2013 **FH Joanneum**, Qualification Course for University Entrance <br/>
-09/2007 - 02/2011 **Arvai Plasics**, Apprenticeship as Tool Maker
-
-### Awards
-*Merit Scholarships:* For the first and second semesters in the Bachelor's program, 
-as well as for the third and fourth semester in the Master's program Information Technology and Systems Management, 
-I received a merit scholarship from the Federal Ministry of Science, Research and Economics (AT).
-
-*Science Award:* of the master thesis with the science prize of AK Salzburg.
-
-*Hackathon:* With team "42", three fellow students, and I won the IRIS 2016 Openlaws Hackathon in Salzburg. In two days they created a fully functional platform for extracting technical terms in a PDF.
-
-### Programming Languages
-* Python
-* C/C++
-* MATLAB
-* Java
-
-### Interests and Leisure Activities
-*Sport:* Hiking and skiing in the Eastern Alps. <br/>
-*Free Time:* Cooking, especially from the Asian kitchen. <br/>
-*Interests:* Exploring places and cultures, I have never been to. <br/>
+<div class="hero">
+  <div class="hero-text">
+    <h1>Gabriel Dax</h1>
+    <p class="subtitle">Deep Learning Systems Engineer — CUDA · TensorRT · Distributed Training</p>
+    <p class="bio-brief">
+      I build and optimize deep learning systems end-to-end: from custom CUDA kernels 
+      and multi-node distributed training (32 GPUs / DDP / NCCL) to production inference 
+      with TensorRT. Currently at <strong>Fraunhofer IIS</strong> (Munich), working on 
+      industrial defect detection, model compression, and vision-language models.
+      PhD from TU Munich — Algorithmic Information Theory in Spatial ML.
+    </p>
+    <div class="skills-strip">
+      <span class="skill-tag">CUDA</span>
+      <span class="skill-tag">C++20</span>
+      <span class="skill-tag">PyTorch DDP</span>
+      <span class="skill-tag">TensorRT</span>
+      <span class="skill-tag">NCCL</span>
+      <span class="skill-tag">NVIDIA DALI</span>
+      <span class="skill-tag">Slurm HPC</span>
+      <span class="skill-tag">Model Compression</span>
+      <span class="skill-tag">CLIP / SAM</span>
+    </div>
+    <div style="margin-top: 20px;">
+      <a href="{{ site.baseurl }}/files/Resume_Gabriel_Dax.pdf" class="btn btn-primary">Download CV</a>
+      <a href="{{ site.baseurl }}/projects" class="btn btn-outline">View Projects</a>
+    </div>
+  </div>
+  <div class="hero-photo">
+    <img src="{{ site.baseurl }}/images/self.png" alt="Gabriel Dax">
+  </div>
+</div>

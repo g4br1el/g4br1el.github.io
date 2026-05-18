@@ -3,7 +3,7 @@ name: Gabriel Dax
 description: ML Research Engineer
 baseurl: ""
 url: "https://g4br1el.github.io"
-avatar: /images/ai.png
+avatar: /images/self.png
 
 markdown: kramdown
 
@@ -25,12 +25,34 @@ defaults:
       path: "_projects"
       type: projects
     values:
-      layout: projects
+      layout: post
 
 plugins:
   - jekyll-feed
   - jekyll-seo-tag
   - jekyll-sitemap
+  - jekyll-scholar
+
+footer-links:
+  github: g4br1el
+  linkedin: gadax
+  email: gabriel.dax@iis.fraunhofer.de
+  scholar: UfJMwAQAAAAJ
+
+
+scholar:
+  style: ieee-with-url
+  locale: en
+  sort_by: year
+  order: ascending
+  source: ./_bibliography
+  bibliography: references.bib
+  bibliography_template: bib2
+  replace_strings: true
+  details_dir: bibliography
+  details_layout: bibtex.html
+  details_link: Details
+  query: "@*"
 
 exclude:
   - Makefile

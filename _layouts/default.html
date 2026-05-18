@@ -1,67 +1,54 @@
 <!DOCTYPE html>
-<html>
-  <head>
-    <title>{% if page.title %}{{ page.title }} – {% endif %}{{ site.name }} – {{ site.description }}</title>
-    {% seo title=false %}
-    {% include meta.html %}
-    <script type="text/javascript" src="http://cdn.mathjax.org/mathjax/latest/MathJax.js?config=TeX-AMS-MML_HTMLorMML"></script>
-    <link rel="stylesheet" type="text/css" href="{{ site.baseurl }}/assets/style.css" />
-    <link rel="alternate" type="application/rss+xml" title="{{ site.name }} - {{ site.description }}" href="{{ site.baseurl }}/feed.xml" />
-    <link rel="canonical" href="{{ site.url }}{{ page.url }}" />
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% if page.title %}{{ page.title }} — {% endif %}{{ site.name }}</title>
+  {% seo title=false %}
+  {% include meta.html %}
+  <link rel="stylesheet" href="{{ site.baseurl }}/assets/style.css">
+  <link rel="icon" type="image/png" sizes="32x32" href="{{ site.baseurl }}/images/favicon.jpg">
+  <link rel="canonical" href="{{ site.url }}{{ page.url }}">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  {% include analytics_head.html %}
+</head>
+<body>
 
-    <meta name="theme-color" content="#000000">
-    <link rel="icon" type="image/png" sizes="32x32" href="{{ site.baseurl }}/images/favicon-32x32.png">
-    {% include analytics_head.html %}
-  </head>
-
-  <body>
-    <div id="bar"></div>
-    <div class="wrapper-container">
-      <div class="wrapper-masthead">
-        <div class="container">
-          <header class="masthead clearfix">
-
-
-            <a href="{{ site.baseurl }}/" class="site-avatar"><img src="{{ site.baseurl }}{{ site.avatar }}" alt="{{ site.title }}" /></a>
-
-
-            <div class="site-info">
-              <h1 class="site-name"><a href="{{ site.baseurl }}/">{{ site.name }}</a></h1>
-              <p class="site-description">{{ site.description }}</p>
-            </div>
-
-            <nav>
-              <a href="{{ site.baseurl }}/">About Me</a>
-<!--              <a href="{{ site.baseurl }}/getting-started">About Me</a>-->
-              <a href="{{ site.baseurl }}/teaching">Teaching</a>
-              <a href="{{ site.baseurl }}/publications">Publications</a>
-              <a href="{{ site.baseurl }}/projects">Projects</a>
-              <a href="{{ site.baseurl }}/datasets">Datasets</a>
-
-            </nav>
-          </header>
-        </div>
-      </div>
-
-      <div class="wrapper-main">
-        <div id="main" role="main" class="container">
-          {{ content }}
-        </div>
-      </div>
-
-      <div class="wrapper-footer">
-        <div class="container">
-          <footer class="footer">
-            {% include svg-icons.html %}
-
-
-
-            <p class="copyright">(c) {{ 'now' | date: "%Y" }} Gabriel Dax | <a href="{{ site.baseurl }}/imprint">Imprint</a> | Icon made by <a href="https://www.flaticon.com/authors/good-ware">Good Ware</a> from <a href="https://www.flaticon.com">www.flaticon.com</a></p>
-          </footer>
-        </div>
-      </div>
+<header class="site-header">
+  <div class="container header-inner">
+    <div>
+      <a href="{{ site.baseurl }}/" class="site-name">{{ site.name }}</a>
+      <span class="site-tagline">{{ site.description }}</span>
     </div>
+    <nav>
+      <a href="{{ site.baseurl }}/" {% if page.url == "/" %}class="active"{% endif %}>Home</a>
+      <a href="{{ site.baseurl }}/projects" {% if page.url contains "project" %}class="active"{% endif %}>Projects</a>
+      <a href="{{ site.baseurl }}/publications" {% if page.url contains "publication" %}class="active"{% endif %}>Publications</a>
+      <a href="{{ site.baseurl }}/bio" {% if page.url contains "bio" %}class="active"{% endif %}>CV</a>
+    </nav>
+  </div>
+</header>
 
-    {% include analytics.html %}
-  </body>
+<main class="main-content">
+  <div class="container">
+    {{ content }}
+  </div>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <div class="footer-links">
+      {% if site.footer-links.github %}<a href="https://github.com/{{ site.footer-links.github }}">GitHub</a>{% endif %}
+      {% if site.footer-links.linkedin %}<a href="https://www.linkedin.com/in/{{ site.footer-links.linkedin }}">LinkedIn</a>{% endif %}
+      {% if site.footer-links.email %}<a href="mailto:{{ site.footer-links.email }}">Email</a>{% endif %}
+      <a href="{{ site.baseurl }}/files/Resume_Gabriel_Dax.pdf">Resume ↓</a>
+    </div>
+    <p class="footer-copyright">© {{ 'now' | date: "%Y" }} Gabriel Dax</p>
+  </div>
+</footer>
+
+{% include analytics.html %}
+</body>
 </html>

@@ -1,10 +1,24 @@
 ---
 layout: post
-title:  Trajectory Similarity using Compression
-categories: [C/C++,Python]
-excerpt: In this project, we created a novel approach for trajectory similarity based on Kolmogorov complexity approximated by a lossy compression of the original trajectory data using selected features compressed into a concise memory representation by means of a Bloom filter.
+title: "Trajectory Similarity via Compression"
+date: 2020-05-01
+context: "Bundeswehr University / TU Munich — Research"
+tags: [C++, Python, pybind11, Kolmogorov Complexity, Bloom Filters]
+description: >
+  Novel trajectory distance metric based on Normalized Compression Distance. 
+  Bloom filter embeddings compress trajectories to ≤1024 bits with >80% 
+  k-NN classification accuracy across real-world datasets.
+metrics:
+  - value: "≤1024"
+    label: "Bits/Trajectory"
+  - value: ">80%"
+    label: "Classification"
+  - value: "O(n)"
+    label: "Time Complexity"
+  - value: "8.9%"
+    label: "vs. Baselines"
+permalink: /projects/trajcomp
 image: /images/Traj-Prague50min.png
-date: 2020-5-1
 ---
 
 ![My helpful screenshot]({{ site.baseurl }}/images/Traj-Prague50min.png)

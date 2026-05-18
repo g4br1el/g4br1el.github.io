@@ -1,12 +1,22 @@
 ---
 layout: post
-title:  Deep Learning Model Library
-categories: [FPGA, Python, TensorFlow]
-excerpt: Deep learning can be deployed to a wide range of hardware products, such as CPUs or GPUs using libraries like TensorFlow. In order to deploy convolutional neural network to FPGAs, it is important that the framework of the fpga does support all used layers.
+title: "FPGA-Deployable CNN Model Library"
+date: 2021-07-01
+context: "TU Munich — ESA Project"
+tags: [TensorFlow, VitisAI, FPGA, Model Zoo]
+description: >
+  Reimplemented 12 CNN architectures in TensorFlow with full VitisAI 
+  compatibility for FPGA deployment. ImageNet-pretrained weights included.
+metrics:
+  - value: "12"
+    label: "Models"
+  - value: "77.9%"
+    label: "Top Accuracy"
+  - value: "ZCU102"
+    label: "Target HW"
+permalink: /projects/modeldb
 image: /images/cnn.svg
-date: 2021-7-1
 ---
-
 ![My helpful screenshot]({{ site.baseurl }}/images/vgg16.png)
 
 *This figure visualizes the architecture of the convolutional neural network VGG16.*
