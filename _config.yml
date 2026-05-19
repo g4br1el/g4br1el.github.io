@@ -2,7 +2,7 @@ title: Gabriel — ML Research
 name: Gabriel Dax
 description: ML Research Engineer
 baseurl: ""
-url: "https://g4br1el.github.io"
+url: "https://www.gabrieldax.de"
 avatar: /images/self.png
 
 markdown: kramdown
@@ -36,7 +36,7 @@ plugins:
 footer-links:
   github: g4br1el
   linkedin: gadax
-  email: gabriel.dax@iis.fraunhofer.de
+  email: gdax.science@gmail.com
   scholar: UfJMwAQAAAAJ
 
 
