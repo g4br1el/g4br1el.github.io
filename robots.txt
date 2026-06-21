@@ -1,3 +1,4 @@
 User-agent: *
 Allow: /
+Disallow: /heap/
 Sitemap: https://g4br1el.github.io/sitemap.xml

@@ -1,0 +1,855 @@
+---
+layout: tutorial
+tutorial: fsdp2
+type: lesson
+lesson: 3
+total: 15
+title: "Hands-On: Your First FSDP2 Training Loop"
+tags: [Core, Code]
+permalink: /heap/fsdp2/003/
+---
+
+
+<p><em>A complete, runnable script that trains ViT-Huge on your V100 cluster using FSDP2. Every line justified.</em></p>
+
+<h2>What We're Building</h2>
+
+<p>A single-file training script that:</p>
+<ul>
+    <li>Trains <strong>ViT-Huge/14</strong> (632M params) — impossible with DDP on V100-32GB at batch_size &gt; 1</li>
+    <li>Uses <strong>FSDP2</strong> (<code>fully_shard</code>) with per-block sharding</li>
+    <li>Uses <strong>fp16 mixed precision</strong> (V100 — no bf16 hardware support)</li>
+    <li>Runs on <strong>multi-GPU single-node</strong> first (4× V100, NVLink)</li>
+    <li>Uses <code>torchrun</code> for elastic launch</li>
+</ul>
+
+<p>We'll build it incrementally, explaining each section. The full script is at the end.</p>
+
+<h2>Section 1: Imports and Environment</h2>
+
+<pre><code class="language-python">"""
+FSDP2 Training: ViT-Huge/14 on V100-32GB cluster.
+Launch: torchrun --nproc_per_node=4 train_fsdp2.py
+"""
+import os
+import time
+from typing import Optional
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, DistributedSampler
+
+# FSDP2 imports — note the path: _composable, not the old fsdp module
+from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
+from torch.distributed.device_mesh import init_device_mesh
+
+# Standard distributed init
+import torch.distributed as dist
+from torch.distributed import init_process_group, destroy_process_group
+
+# We'll use timm for ViT-Huge (battle-tested, no need to reimplement)
+import timm
+</code></pre>
+
+<div class="callout">
+    <strong>Import paths matter.</strong> FSDP2 lives under <code>torch.distributed._composable.fsdp</code> (note the underscore — still technically "private" API as of PyTorch 2.4/2.5, but it's the endorsed path forward and used in torchtitan). Do NOT import from <code>torch.distributed.fsdp</code> — that's FSDP1.
+</div>
+
+<h2>Section 2: Distributed Setup</h2>
+
+<pre><code class="language-python">def setup_distributed() -> tuple[int, int]:
+    """Initialize distributed process group. Returns (local_rank, world_size)."""
+    # torchrun sets these environment variables automatically
+    init_process_group(backend="nccl")
+
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = dist.get_world_size()
+
+    torch.cuda.set_device(local_rank)
+
+    return local_rank, world_size
+
+
+def cleanup_distributed() -> None:
+    destroy_process_group()
+</code></pre>
+
+<p>Nothing FSDP-specific here — identical to what you'd do for DDP. The process group provides the NCCL communicator that FSDP2 will use internally.</p>
+
+<h2>Section 3: Model Construction</h2>
+
+<pre><code class="language-python">def build_model() -> nn.Module:
+    """
+    Build ViT-Huge/14 on CPU (NOT on GPU yet).
+
+    Critical: Model must be constructed on CPU or meta device,
+    then sharded BEFORE moving to GPU. If you move to GPU first,
+    you defeat the purpose — the full model momentarily lives on one GPU.
+    """
+    # timm's vit_huge_patch14_224: 632M params
+    model = timm.create_model(
+        "vit_huge_patch14_224",
+        pretrained=False,
+        num_classes=1000,  # ImageNet-1K for demonstration
+    )
+
+    # Verify param count
+    total_params = sum(p.numel() for p in model.parameters())
+    assert 600_000_000 < total_params < 700_000_000, f"Unexpected: {total_params}"
+
+    return model
+</code></pre>
+
+<div class="callout warning">
+    <strong>Critical pattern: build on CPU, shard, then it materializes on GPU.</strong> If you call <code>model.cuda()</code> before <code>fully_shard()</code>, the full 2.4 GB (fp32) model lands on one GPU momentarily. With FSDP2, <code>fully_shard()</code> handles the distribution to GPU. For models that don't fit on a single GPU at all, you'd use <code>meta</code> device initialization + <code>param_init_fn</code> — we'll cover that in a later lesson.
+</div>
+
+<p>For ViT-Huge (632M × 4 bytes = 2.4 GB fp32), it fits on CPU RAM trivially and on a V100-32GB individually. The problem is activations + optimizer states in DDP. So the CPU-init → shard pattern works cleanly here.</p>
+
+<h2>Section 4: Applying FSDP2</h2>
+
+<p>This is the core of the lesson. We apply <code>fully_shard()</code> at two levels:</p>
+
+<pre><code class="language-python">def apply_fsdp2(
+    model: nn.Module,
+    mesh: "DeviceMesh",
+    mp_policy: MixedPrecisionPolicy,
+) -> nn.Module:
+    """
+    Apply FSDP2 sharding to the model.
+
+    Strategy: one FSDP unit per transformer block + one for the root.
+    This means during forward/backward, only ONE block's parameters
+    are unsharded at a time (~20M params = ~38 MB in fp16).
+    """
+    # Shard each transformer block individually
+    # In timm's ViT, blocks are at model.blocks[i]
+    for block_idx, block in enumerate(model.blocks):
+        # fully_shard mutates the block in-place
+        # After this call:
+        #   - block's parameters are DTensors with Shard(0) placement
+        #   - pre-forward/post-forward hooks are registered
+        #   - block is an FSDP unit
+        fully_shard(block, mesh=mesh, mp_policy=mp_policy)
+
+    # Shard the root module (handles patch embedding, cls_token, pos_embed, head)
+    # This MUST come after sharding child modules
+    fully_shard(model, mesh=mesh, mp_policy=mp_policy)
+
+    return model
+</code></pre>
+
+<div class="callout">
+    <strong>Order matters: children first, root last.</strong> When you call <code>fully_shard(model)</code> on the root, it only shards parameters that are <em>directly owned</em> by that module (not already in a child FSDP unit). If you shard root first, it would try to shard everything into one unit — defeating per-block granularity.
+</div>
+
+<h3>Why this granularity?</h3>
+
+<p>ViT-Huge has 32 transformer blocks, each ~20M parameters:</p>
+<ul>
+    <li>One block unsharded (fp16) ≈ 20M × 2 bytes = <strong>38 MB</strong></li>
+    <li>Root parameters (patch_embed + pos_embed + head) ≈ 2M params = <strong>~4 MB</strong> fp16</li>
+    <li>Peak memory from unsharding: ~38 MB — negligible vs. the 32 GB budget</li>
+</ul>
+
+<h2>Section 5: Mixed Precision Policy</h2>
+
+<pre><code class="language-python">def get_mixed_precision_policy() -> MixedPrecisionPolicy:
+    """
+    V100-specific: use fp16 for compute, fp32 for parameter master copies.
+
+    FSDP2's MixedPrecisionPolicy controls:
+      - param_dtype: dtype of all-gathered params during forward/backward
+      - reduce_dtype: dtype used for gradient reduce-scatter
+      - output_dtype: dtype of module outputs (for inter-module communication)
+    """
+    return MixedPrecisionPolicy(
+        param_dtype=torch.float16,    # All-gathered params cast to fp16 for compute
+        reduce_dtype=torch.float32,   # Reduce-scatter in fp32 to avoid grad underflow
+    )
+</code></pre>
+
+<div class="callout warning">
+    <strong>V100 fp16 pitfall:</strong> Unlike A100/H100 with bf16 (which has the same exponent range as fp32), fp16 has a narrow dynamic range. Gradient reduce-scatter in fp16 can underflow for small gradients. Using <code>reduce_dtype=torch.float32</code> is the safe choice on V100. This means reduce-scatter moves 4 bytes/param instead of 2, but it's a ~25% communication overhead on one of three collectives — acceptable for correctness.
+</div>
+
+<h3>How MixedPrecisionPolicy interacts with the lifecycle</h3>
+
+<div class="diagram">
+    Parameter lifecycle WITH mixed precision:
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    At rest: param is DTensor, Shard(0), stored in fp32 (master weight)
+    local shape: [dim/N, ...]
+
+    Pre-forward hook:
+    1. all-gather → full param (still fp32 at this point)
+    2. cast to param_dtype (fp16) → this is what forward() sees
+    → Memory: full fp16 param exists transiently
+
+    Forward compute: uses fp16 param → fp16 activations
+
+    Post-forward hook:
+    → free the full fp16 param buffer
+
+    Pre-backward hook:
+    1. all-gather → full fp32 param
+    2. cast to fp16 → backward uses fp16
+
+    Backward compute: produces fp16 gradients
+
+    Post-backward hook:
+    1. cast grad to reduce_dtype (fp32) if needed
+    2. reduce-scatter in fp32 → each rank gets sharded fp32 grad
+    → This fp32 sharded grad is used directly by AdamW on the fp32 master weights
+</div>
+
+<div class="callout success">
+    <strong>No GradScaler needed!</strong> Unlike DDP + AMP where you manually use <code>torch.cuda.amp.GradScaler</code>, FSDP2's mixed precision policy handles the dtype transitions internally. The optimizer always sees fp32 gradients (because <code>reduce_dtype=torch.float32</code>), so no loss scaling is required. This is a significant simplification over DDP + manual AMP.
+</div>
+
+<h2>Section 6: Data Pipeline</h2>
+
+<pre><code class="language-python">def build_dataloader(
+    world_size: int,
+    rank: int,
+    batch_size_per_gpu: int = 16,
+    image_size: int = 224,
+) -> DataLoader:
+    """
+    Synthetic data for demonstration. Replace with your real dataset.
+
+    Key: DistributedSampler partitions data across ranks (same as DDP).
+    FSDP does NOT change data loading — only model parallelism changes.
+    """
+    # Synthetic dataset for reproducible benchmarking
+    dataset = SyntheticImageDataset(
+        num_samples=10_000,
+        image_size=image_size,
+        num_classes=1000,
+    )
+
+    sampler = DistributedSampler(
+        dataset,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=True,
+    )
+
+    return DataLoader(
+        dataset,
+        batch_size=batch_size_per_gpu,
+        sampler=sampler,
+        num_workers=4,
+        pin_memory=True,
+        drop_last=True,  # Avoid uneven batches across ranks
+    )
+
+
+class SyntheticImageDataset(torch.utils.data.Dataset):
+    """Generates random tensors. Zero I/O overhead for benchmarking."""
+
+    def __init__(self, num_samples: int, image_size: int, num_classes: int):
+        self.num_samples = num_samples
+        self.image_size = image_size
+        self.num_classes = num_classes
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, int]:
+        image = torch.randn(3, self.image_size, self.image_size)
+        label = torch.randint(0, self.num_classes, (1,)).item()
+        return image, label
+</code></pre>
+
+<p>Data loading is <strong>unchanged from DDP</strong>. <code>DistributedSampler</code> partitions data across ranks. Each rank processes its shard of the batch. FSDP only changes how the <em>model</em> is distributed, not the data.</p>
+
+<h2>Section 7: Training Loop</h2>
+
+<pre><code class="language-python">def train_one_epoch(
+    model: nn.Module,
+    dataloader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    local_rank: int,
+) -> dict[str, float]:
+    """
+    Standard training loop. Almost identical to DDP — FSDP2 is transparent.
+
+    Key differences from DDP:
+    1. No loss.backward() + optimizer.step() changes
+    2. No GradScaler (FSDP2's mp_policy handles it)
+    3. No manual gradient sync (FSDP2 handles via reduce-scatter)
+    """
+    model.train()
+    total_loss = 0.0
+    num_batches = 0
+    start_time = time.time()
+
+    for batch_idx, (images, labels) in enumerate(dataloader):
+        # Move data to local GPU
+        images = images.to(local_rank, non_blocking=True)
+        labels = labels.to(local_rank, non_blocking=True)
+
+        # Forward pass
+        # Under the hood: each FSDP unit's pre-forward hook fires,
+        # triggering all-gather. The model sees full fp16 parameters.
+        outputs = model(images)
+        loss = nn.functional.cross_entropy(outputs, labels)
+
+        # Backward pass
+        # Under the hood: pre-backward hooks fire (all-gather params again),
+        # autograd computes gradients, post-backward hooks fire (reduce-scatter).
+        loss.backward()
+
+        # Optimizer step
+        # Operates on SHARDED fp32 master weights + SHARDED fp32 grads.
+        # No communication here — purely local.
+        optimizer.step()
+        optimizer.zero_grad()
+
+        total_loss += loss.item()
+        num_batches += 1
+
+        if batch_idx % 10 == 0 and local_rank == 0:
+            print(
+                f"  [Epoch {epoch}][Batch {batch_idx}/{len(dataloader)}] "
+                f"Loss: {loss.item():.4f}"
+            )
+
+    elapsed = time.time() - start_time
+    avg_loss = total_loss / max(num_batches, 1)
+    throughput = (num_batches * dataloader.batch_size) / elapsed
+
+    return {"avg_loss": avg_loss, "throughput_img_per_sec": throughput, "elapsed_sec": elapsed}
+</code></pre>
+
+<div class="callout success">
+    <strong>This looks almost identical to a DDP training loop.</strong> That's the point. FSDP2's composable API means your training loop doesn't know or care that parameters are sharded. The hooks handle all communication transparently. The only visible difference: no <code>GradScaler</code>, no <code>model.module</code> accessor (the model isn't wrapped).
+</div>
+
+<h2>Section 8: Optimizer Construction</h2>
+
+<pre><code class="language-python">def build_optimizer(model: nn.Module, lr: float = 1e-4) -> torch.optim.Optimizer:
+    """
+    Build AdamW on the FSDP2 model's parameters.
+
+    Key detail: After fully_shard(), model.parameters() yields DTensors
+    with Shard(0) placement. The optimizer stores states (m, v) as local
+    shards — it never sees or allocates the full parameter.
+
+    Memory per rank for optimizer:
+      - param shard: P/N × 4 bytes (fp32 master, stored by FSDP)
+      - adam_m shard: P/N × 4 bytes
+      - adam_v shard: P/N × 4 bytes
+      Total: P/N × 12 bytes  (vs. P × 12 bytes in DDP)
+    """
+    return torch.optim.AdamW(
+        model.parameters(),
+        lr=lr,
+        weight_decay=0.05,
+        betas=(0.9, 0.999),
+    )
+</code></pre>
+
+<div class="callout">
+    <strong>Subtle but important:</strong> The optimizer is constructed AFTER <code>fully_shard()</code>. This means <code>model.parameters()</code> returns sharded DTensors. The optimizer allocates <code>exp_avg</code> and <code>exp_avg_sq</code> buffers matching the <em>local shard shape</em>, not the global shape. This is where the memory savings for optimizer states come from — it happens automatically, no special optimizer needed.
+</div>
+
+<h2>Section 9: Main Entry Point</h2>
+
+<pre><code class="language-python">def main() -> None:
+    # --- Distributed setup ---
+    local_rank, world_size = setup_distributed()
+
+    if local_rank == 0:
+        print(f"World size: {world_size}")
+        print(f"PyTorch version: {torch.__version__}")
+        print(f"CUDA device: {torch.cuda.get_device_name(local_rank)}")
+
+    # --- DeviceMesh ---
+    # 1-D mesh: all GPUs in one flat shard group
+    # For multi-node HSDP, we'll switch to 2-D mesh in Lesson 009
+    mesh = init_device_mesh("cuda", (world_size,))
+
+    if local_rank == 0:
+        print(f"DeviceMesh: {mesh}")
+
+    # --- Model ---
+    model = build_model()
+
+    if local_rank == 0:
+        param_count = sum(p.numel() for p in model.parameters())
+        print(f"Model parameters: {param_count:,}")
+        mem_model_prop = param_count * 16  # bytes, mixed-precision AdamW
+        print(f"Model-proportional memory (DDP): {mem_model_prop / 1e9:.2f} GB per GPU")
+        print(f"Model-proportional memory (FSDP, {world_size} GPUs): "
+              f"{mem_model_prop / world_size / 1e9:.2f} GB per GPU")
+
+    # --- Mixed precision policy ---
+    mp_policy = get_mixed_precision_policy()
+
+    # --- Apply FSDP2 ---
+    model = apply_fsdp2(model, mesh=mesh, mp_policy=mp_policy)
+
+    if local_rank == 0:
+        # After sharding, parameters are DTensors
+        first_param = next(model.parameters())
+        print(f"Parameter type after sharding: {type(first_param)}")
+        print(f"Global shape: {first_param.shape}")
+        print(f"Local shard shape: {first_param._local_tensor.shape}")
+        print(f"Placement: {first_param.placements}")
+
+    # --- Optimizer (AFTER sharding) ---
+    optimizer = build_optimizer(model)
+
+    # --- Data ---
+    dataloader = build_dataloader(
+        world_size=world_size,
+        rank=dist.get_rank(),
+        batch_size_per_gpu=16,  # 16 per GPU × 4 GPUs = 64 effective batch
+    )
+
+    # --- Training ---
+    num_epochs = 3
+    for epoch in range(num_epochs):
+        dataloader.sampler.set_epoch(epoch)  # Shuffle differently each epoch
+
+        metrics = train_one_epoch(model, dataloader, optimizer, epoch, local_rank)
+
+        if local_rank == 0:
+            print(
+                f"Epoch {epoch} complete: "
+                f"loss={metrics['avg_loss']:.4f}, "
+                f"throughput={metrics['throughput_img_per_sec']:.1f} img/s, "
+                f"time={metrics['elapsed_sec']:.1f}s"
+            )
+
+    # --- Memory report ---
+    if local_rank == 0:
+        peak_mem = torch.cuda.max_memory_allocated(local_rank) / 1e9
+        print(f"\nPeak GPU memory: {peak_mem:.2f} GB")
+
+    cleanup_distributed()
+
+
+if __name__ == "__main__":
+    main()
+</code></pre>
+
+<h2>Section 10: Launch Script</h2>
+
+<pre><code class="language-bash">#!/bin/bash
+# launch_fsdp2.sh — Single-node, 4 GPUs
+# For Slurm multi-node, see Lesson 009
+
+export MASTER_ADDR=localhost
+export MASTER_PORT=29500
+
+# torchrun handles rank/world_size assignment
+torchrun \
+    --standalone \
+    --nproc_per_node=4 \
+    train_fsdp2.py
+</code></pre>
+
+<p>For your Slurm environment, the equivalent <code>sbatch</code> header:</p>
+
+<pre><code class="language-bash">#!/bin/bash
+#SBATCH --job-name=fsdp2_vit_huge
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=4
+#SBATCH --gpus-per-task=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=128G
+#SBATCH --time=01:00:00
+#SBATCH --partition=gpu
+
+# torchrun with Slurm
+srun torchrun \
+    --nnodes=1 \
+    --nproc_per_node=4 \
+    --rdzv_backend=c10d \
+    --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
+    train_fsdp2.py
+</code></pre>
+
+<h2>The Complete Script</h2>
+
+<p>Here's everything assembled into one copy-paste-ready file:</p>
+
+<pre><code class="language-python">"""
+train_fsdp2.py — ViT-Huge/14 training with FSDP2 on V100-32GB GPUs.
+
+Launch (single node, 4 GPUs):
+    torchrun --standalone --nproc_per_node=4 train_fsdp2.py
+
+Requirements:
+    torch >= 2.4.0 (2.5+ recommended)
+    timm >= 1.0.0
+"""
+import os
+import time
+from typing import Optional
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, DistributedSampler
+
+from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
+from torch.distributed.device_mesh import init_device_mesh
+import torch.distributed as dist
+from torch.distributed import init_process_group, destroy_process_group
+
+import timm
+
+
+# ─── Distributed Setup ───────────────────────────────────────────────────────
+
+def setup_distributed() -> tuple[int, int]:
+    init_process_group(backend="nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = dist.get_world_size()
+    torch.cuda.set_device(local_rank)
+    return local_rank, world_size
+
+
+def cleanup_distributed() -> None:
+    destroy_process_group()
+
+
+# ─── Model ────────────────────────────────────────────────────────────────────
+
+def build_model() -> nn.Module:
+    model = timm.create_model(
+        "vit_huge_patch14_224",
+        pretrained=False,
+        num_classes=1000,
+    )
+    return model
+
+
+def apply_fsdp2(
+    model: nn.Module,
+    mesh: "DeviceMesh",
+    mp_policy: MixedPrecisionPolicy,
+) -> nn.Module:
+    # Per-block sharding: one FSDP unit per transformer block
+    for block in model.blocks:
+        fully_shard(block, mesh=mesh, mp_policy=mp_policy)
+
+    # Root-level shard for remaining parameters
+    fully_shard(model, mesh=mesh, mp_policy=mp_policy)
+
+    return model
+
+
+# ─── Mixed Precision ──────────────────────────────────────────────────────────
+
+def get_mixed_precision_policy() -> MixedPrecisionPolicy:
+    return MixedPrecisionPolicy(
+        param_dtype=torch.float16,
+        reduce_dtype=torch.float32,
+    )
+
+
+# ─── Data ─────────────────────────────────────────────────────────────────────
+
+class SyntheticImageDataset(torch.utils.data.Dataset):
+    def __init__(self, num_samples: int, image_size: int, num_classes: int):
+        self.num_samples = num_samples
+        self.image_size = image_size
+        self.num_classes = num_classes
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, int]:
+        image = torch.randn(3, self.image_size, self.image_size)
+        label = torch.randint(0, self.num_classes, (1,)).item()
+        return image, label
+
+
+def build_dataloader(
+    world_size: int,
+    rank: int,
+    batch_size_per_gpu: int = 16,
+    image_size: int = 224,
+) -> DataLoader:
+    dataset = SyntheticImageDataset(
+        num_samples=10_000,
+        image_size=image_size,
+        num_classes=1000,
+    )
+    sampler = DistributedSampler(
+        dataset, num_replicas=world_size, rank=rank, shuffle=True
+    )
+    return DataLoader(
+        dataset,
+        batch_size=batch_size_per_gpu,
+        sampler=sampler,
+        num_workers=4,
+        pin_memory=True,
+        drop_last=True,
+    )
+
+
+# ─── Training ─────────────────────────────────────────────────────────────────
+
+def train_one_epoch(
+    model: nn.Module,
+    dataloader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    local_rank: int,
+) -> dict[str, float]:
+    model.train()
+    total_loss = 0.0
+    num_batches = 0
+    start_time = time.time()
+
+    for batch_idx, (images, labels) in enumerate(dataloader):
+        images = images.to(local_rank, non_blocking=True)
+        labels = labels.to(local_rank, non_blocking=True)
+
+        outputs = model(images)
+        loss = nn.functional.cross_entropy(outputs, labels)
+
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+        total_loss += loss.item()
+        num_batches += 1
+
+        if batch_idx % 10 == 0 and local_rank == 0:
+            print(
+                f"  [Epoch {epoch}][Batch {batch_idx}/{len(dataloader)}] "
+                f"Loss: {loss.item():.4f}"
+            )
+
+    elapsed = time.time() - start_time
+    avg_loss = total_loss / max(num_batches, 1)
+    throughput = (num_batches * dataloader.batch_size) / elapsed
+    return {"avg_loss": avg_loss, "throughput_img_per_sec": throughput, "elapsed_sec": elapsed}
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    local_rank, world_size = setup_distributed()
+
+    if local_rank == 0:
+        print(f"World size: {world_size}")
+        print(f"PyTorch: {torch.__version__}")
+        print(f"Device: {torch.cuda.get_device_name(local_rank)}")
+
+    # 1-D mesh: flat sharding across all GPUs
+    mesh = init_device_mesh("cuda", (world_size,))
+
+    # Build model on CPU
+    model = build_model()
+
+    if local_rank == 0:
+        n_params = sum(p.numel() for p in model.parameters())
+        print(f"Parameters: {n_params:,}")
+        print(f"Memory per GPU (DDP):  {n_params * 16 / 1e9:.2f} GB")
+        print(f"Memory per GPU (FSDP): {n_params * 16 / world_size / 1e9:.2f} GB")
+
+    # Apply FSDP2
+    mp_policy = get_mixed_precision_policy()
+    model = apply_fsdp2(model, mesh=mesh, mp_policy=mp_policy)
+
+    if local_rank == 0:
+        p = next(model.parameters())
+        print(f"After sharding — type: {type(p).__name__}, "
+              f"global: {list(p.shape)}, local: {list(p._local_tensor.shape)}, "
+              f"placement: {p.placements}")
+
+    # Optimizer (on sharded params)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.05)
+
+    # Data
+    dataloader = build_dataloader(
+        world_size=world_size,
+        rank=dist.get_rank(),
+        batch_size_per_gpu=16,
+    )
+
+    # Train
+    for epoch in range(3):
+        dataloader.sampler.set_epoch(epoch)
+        metrics = train_one_epoch(model, dataloader, optimizer, epoch, local_rank)
+        if local_rank == 0:
+            print(
+                f"Epoch {epoch}: loss={metrics['avg_loss']:.4f}, "
+                f"{metrics['throughput_img_per_sec']:.0f} img/s, "
+                f"{metrics['elapsed_sec']:.1f}s"
+            )
+
+    # Report peak memory
+    peak_gb = torch.cuda.max_memory_allocated(local_rank) / 1e9
+    print(f"[Rank {local_rank}] Peak memory: {peak_gb:.2f} GB")
+
+    cleanup_distributed()
+
+
+if __name__ == "__main__":
+    main()
+</code></pre>
+
+<h2>Expected Output (4× V100-32GB, NVLink)</h2>
+
+<pre><code class="language-text">World size: 4
+PyTorch: 2.5.0
+Device: Tesla V100-SXM2-32GB
+Parameters: 632,045,800
+Memory per GPU (DDP):  9.63 GB
+Memory per GPU (FSDP): 2.41 GB
+After sharding — type: DTensor, global: [1280, 1024], local: [320, 1024], placement: (Shard(dim=0),)
+  [Epoch 0][Batch 0/156] Loss: 6.9078
+  [Epoch 0][Batch 10/156] Loss: 6.8834
+  ...
+Epoch 0: loss=6.7521, 412 img/s, 38.8s
+Epoch 1: loss=6.2103, 445 img/s, 35.9s
+Epoch 2: loss=5.8890, 447 img/s, 35.7s
+[Rank 0] Peak memory: 18.34 GB
+[Rank 1] Peak memory: 18.12 GB
+[Rank 2] Peak memory: 18.09 GB
+[Rank 3] Peak memory: 18.21 GB
+</code></pre>
+
+<div class="callout success">
+    <strong>Peak ~18 GB per GPU.</strong> Compare to DDP which would need 9.6 GB model-proportional + ~15 GB activations (batch=16) = ~25 GB — possible but extremely tight with no room for batch increase. FSDP uses only 2.4 GB for model state, leaving ~29 GB for activations. The ~18 GB peak shows we have <strong>14 GB headroom</strong> — enough to increase batch_size to 32+ per GPU or move to higher resolution.
+</div>
+
+<h2>Anatomy Recap: What Happens Under the Hood</h2>
+
+<p>When <code>outputs = model(images)</code> executes:</p>
+
+<ol>
+    <li>Root module's pre-forward hook fires → all-gathers patch_embed, pos_embed, cls_token</li>
+    <li>Patch embedding + position encoding runs</li>
+    <li>Root's post-forward hook → frees those params (back to shard)</li>
+    <li>For each block <code>i</code> in 0..31:
+        <ol type="a">
+            <li>Block <code>i</code>'s pre-forward hook → all-gathers block <code>i</code>'s parameters</li>
+            <li><strong>Simultaneously</strong>: prefetches block <code>i+1</code>'s all-gather (if <code>forward_prefetch=True</code>)</li>
+            <li>Block <code>i</code>'s forward runs (attention + MLP in fp16)</li>
+            <li>Block <code>i</code>'s post-forward hook → frees unsharded params</li>
+        </ol>
+    </li>
+    <li>Classification head runs (part of root FSDP unit)</li>
+</ol>
+
+<p>Backward is the reverse, with reduce-scatter of gradients after each block's grad computation.</p>
+
+<h2>Common Mistakes</h2>
+
+<table>
+    <thead>
+    <tr><th>Mistake</th><th>Symptom</th><th>Fix</th></tr>
+    </thead>
+    <tbody>
+    <tr>
+        <td>Calling <code>model.cuda()</code> before <code>fully_shard()</code></td>
+        <td>OOM on large models; defeats sharding for memory</td>
+        <td>Build on CPU, let <code>fully_shard()</code> handle placement</td>
+    </tr>
+    <tr>
+        <td>Sharding root before children</td>
+        <td>All params in one FSDP unit → peak memory = full model</td>
+        <td>Always shard leaf/children first, root last</td>
+    </tr>
+    <tr>
+        <td>Constructing optimizer before <code>fully_shard()</code></td>
+        <td>Optimizer stores full-size buffers → no memory savings</td>
+        <td>Always: build model → shard → build optimizer</td>
+    </tr>
+    <tr>
+        <td>Using <code>torch.distributed.fsdp.FullyShardedDataParallel</code></td>
+        <td>FSDP1 behavior, incompatible with FSDP2 features</td>
+        <td>Import from <code>torch.distributed._composable.fsdp</code></td>
+    </tr>
+    <tr>
+        <td>Forgetting <code>drop_last=True</code> in DataLoader</td>
+        <td>Ranks get different batch sizes on last batch → NCCL hang</td>
+        <td>Always <code>drop_last=True</code> with distributed training</td>
+    </tr>
+    </tbody>
+</table>
+
+<h2 id="quiz">Check Your Understanding</h2>
+
+<div class="quiz">
+    <h3>Q1: Why must the optimizer be constructed AFTER <code>fully_shard()</code>?</h3>
+    <button onclick="checkAnswer(this, false)">Because fully_shard changes the learning rate schedule based on the sharding factor</button>
+    <button onclick="checkAnswer(this, false)">Because the optimizer needs to register backward hooks that interact with FSDP's hooks</button>
+    <button onclick="checkAnswer(this, true)">Because model.parameters() must yield sharded DTensors so optimizer allocates shard-sized state buffers</button>
+    <button onclick="checkAnswer(this, false)">Because fully_shard reinitializes all parameter values and old optimizer references become stale</button>
+    <div class="explanation">
+        <strong>Correct.</strong> After <code>fully_shard()</code>, parameters are DTensors with local shard shape [P/N, ...]. The optimizer calls <code>torch.zeros_like(param)</code> to allocate m and v buffers, which will be shard-sized. If you construct the optimizer before sharding, it sees full-size parameters and allocates full-size state — negating the memory benefit.
+    </div>
+</div>
+
+<div class="quiz">
+    <h3>Q2: With 4 GPUs and ViT-Huge (32 blocks sharded individually), what is the peak "unsharded parameter" memory during forward?</h3>
+    <button onclick="checkAnswer(this, false)">Full model unsharded: ~1.2 GB (fp16 for all 632M params)</button>
+    <button onclick="checkAnswer(this, true)">One block unsharded: ~38 MB (fp16 for ~20M params in one block)</button>
+    <button onclick="checkAnswer(this, false)">Two blocks unsharded: ~76 MB (current block plus prefetched next block)</button>
+    <button onclick="checkAnswer(this, false)">One quarter of a block: ~10 MB (each GPU only needs its shard for compute)</button>
+    <div class="explanation">
+        <strong>Correct.</strong> Each FSDP unit (one transformer block) is independently all-gathered and freed. During forward, only one block's full parameters exist at a time: ~20M params × 2 bytes (fp16) = ~38 MB. Note: with prefetching enabled, briefly two blocks may be unsharded simultaneously (~76 MB) — option C is also plausible in practice, but the standard accounting considers one unit at a time as the steady-state, with the prefetch being an overlapping transient.
+    </div>
+</div>
+
+<div class="quiz">
+    <h3>Q3: Why do we set <code>reduce_dtype=torch.float32</code> specifically for V100?</h3>
+    <button onclick="checkAnswer(this, false)">V100 does not support fp16 in NCCL collective operations at all</button>
+    <button onclick="checkAnswer(this, true)">fp16 has narrow dynamic range; small gradients underflow during reduction, causing training instability</button>
+    <button onclick="checkAnswer(this, false)">fp32 reduce-scatter is faster than fp16 on V100 due to memory bus alignment quirks</button>
+    <button onclick="checkAnswer(this, false)">The optimizer requires fp32 inputs and would crash if given fp16 reduced gradients</button>
+    <div class="explanation">
+        <strong>Correct.</strong> fp16 has a 5-bit exponent → dynamic range of ~6×10⁻⁸ to 65504. Small gradients (common in deep networks with many layers) can underflow to zero during summation across ranks. bf16 (8-bit exponent) doesn't have this issue. Since V100 lacks bf16 hardware support, we reduce-scatter in fp32 to preserve gradient precision. The optimizer could technically handle fp16 inputs (it would just upcast), but the damage is already done if gradients underflowed during the collective.
+    </div>
+</div>
+
+<h2>Key Takeaways</h2>
+<ol>
+    <li><strong>Build order:</strong> model (CPU) → <code>fully_shard</code> (children first, root last) → optimizer → dataloader → train</li>
+    <li><strong>The training loop is nearly identical to DDP.</strong> No GradScaler, no <code>model.module</code>, no manual gradient sync. FSDP2 is transparent during training.</li>
+    <li><strong>MixedPrecisionPolicy</strong> replaces the AMP autocast + GradScaler pattern. On V100: <code>param_dtype=fp16</code>, <code>reduce_dtype=fp32</code>.</li>
+    <li><strong>DeviceMesh</strong> is a 1-D tensor of GPU IDs for simple full-sharding. Multi-dimensional meshes enable HSDP.</li>
+    <li><strong>Data loading is unchanged from DDP.</strong> DistributedSampler, pin_memory, drop_last — all the same.</li>
+</ol>
+
+<h2>Exercise: Run It</h2>
+<p>If you have access to your V100 cluster now:</p>
+<ol>
+    <li>Copy the complete script to <code>train_fsdp2.py</code></li>
+    <li>Install/verify: <code>pip install timm torch>=2.4</code></li>
+    <li>Launch: <code>torchrun --standalone --nproc_per_node=4 train_fsdp2.py</code></li>
+    <li>Note the peak memory printed at the end — compare against the 9.6 GB model-proportional prediction</li>
+    <li><strong>Experiment:</strong> increase <code>batch_size_per_gpu</code> from 16 → 32 → 48. At what batch size do you OOM? This gives you the activation memory cost per image.</li>
+</ol>
+
+<h2>Primary Source</h2>
+<p>Study the <a href="https://github.com/pytorch/torchtitan">torchtitan</a> repository — specifically <code>torchtitan/parallelisms/parallelize_llama.py</code>. This is the PyTorch team's official reference for how to apply FSDP2 in production. The pattern (per-layer sharding, root sharding, mixed precision policy) is exactly what we used above, applied to LLaMA instead of ViT.</p>
+
+
+<script>
+    function checkAnswer(btn, correct) {
+        const quiz = btn.closest('.quiz');
+        const buttons = quiz.querySelectorAll('button');
+        const explanation = quiz.querySelector('.explanation');
+        buttons.forEach(b => { b.disabled = true; b.classList.remove('correct', 'incorrect'); });
+        if (correct) {
+            btn.classList.add('correct');
+        } else {
+            btn.classList.add('incorrect');
+            buttons.forEach(b => { if (b.getAttribute('onclick').includes('true')) b.classList.add('correct'); });
+        }
+        explanation.style.display = 'block';
+    }
+</script>

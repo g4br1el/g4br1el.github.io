@@ -1,0 +1,42 @@
+<!-- _includes/tutorial-nav.html -->
+{% assign tutorial_id = page.tutorial %}
+{% assign current_lesson = page.lesson %}
+{% assign all_lessons = site.tutorials | where: "tutorial", tutorial_id | where: "type", "lesson" | sort: "lesson" %}
+
+{% assign prev_lesson = nil %}
+{% assign next_lesson = nil %}
+
+{% for lesson in all_lessons %}
+{% if lesson.lesson == current_lesson %}
+{% assign prev_idx = forloop.index0 | minus: 1 %}
+{% assign next_idx = forloop.index0 | plus: 1 %}
+{% endif %}
+{% endfor %}
+
+{% if prev_idx >= 0 %}
+{% assign prev_lesson = all_lessons[prev_idx] %}
+{% endif %}
+{% if next_idx < all_lessons.size %}
+{% assign next_lesson = all_lessons[next_idx] %}
+{% endif %}
+
+<nav class="tutorial-nav" aria-label="Lesson navigation">
+    {% if prev_lesson %}
+    <a href="{{ prev_lesson.url | relative_url }}" class="tutorial-nav-btn tutorial-nav-prev">
+        <span class="tutorial-nav-label">← Previous</span>
+        <span class="tutorial-nav-title">{{ prev_lesson.lesson | prepend: '00' | slice: -3, 3 }} — {{ prev_lesson.title }}</span>
+    </a>
+    {% else %}
+    <a href="{{ site.baseurl }}/heap/fsdp2/" class="tutorial-nav-btn tutorial-nav-prev">
+        <span class="tutorial-nav-label">← Back</span>
+        <span class="tutorial-nav-title">Tutorial Overview</span>
+    </a>
+    {% endif %}
+
+    {% if next_lesson %}
+    <a href="{{ next_lesson.url | relative_url }}" class="tutorial-nav-btn tutorial-nav-next">
+        <span class="tutorial-nav-label">Next →</span>
+        <span class="tutorial-nav-title">{{ next_lesson.lesson | prepend: '00' | slice: -3, 3 }} — {{ next_lesson.title }}</span>
+    </a>
+    {% endif %}
+</nav>

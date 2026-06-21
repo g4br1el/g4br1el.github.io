@@ -1,0 +1,35 @@
+---
+layout: default
+---
+
+<div class="tutorial-wrapper">
+
+    <nav class="tutorial-breadcrumb">
+        <a href="{{ site.baseurl }}/heap/">← All Tutorials</a>
+        {% if page.type == "lesson" %}
+        <span class="tutorial-position">Lesson {{ page.lesson }} / {{ page.total }}</span>
+        {% else %}
+        <span class="tutorial-position">{{ page.type | capitalize }}</span>
+        {% endif %}
+    </nav>
+
+    <article class="tutorial-article">
+        {% if page.type == "lesson" %}
+        <div class="tutorial-lesson-header">
+            <span class="tutorial-tag">Lesson {{ page.lesson | prepend: '00' | slice: -3, 3 }}</span>
+            {% for tag in page.tags %}
+            <span class="tutorial-tag tutorial-tag--secondary">{{ tag }}</span>
+            {% endfor %}
+        </div>
+        {% endif %}
+
+        <h1>{{ page.title }}</h1>
+
+        {{ content }}
+
+        {% if page.type == "lesson" %}
+        {% include tutorial-nav.html %}
+        {% endif %}
+    </article>
+
+</div>
