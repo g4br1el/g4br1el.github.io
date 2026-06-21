@@ -1,12 +1,11 @@
 ---
 layout: tutorial
-title: "FSDP2 Mission"
+title: "FSDP2 Resources"
 tutorial: fsdp2
 type: mission
 permalink: /heap/fsdp2/resources/
 ---
 
-# FSDP2 Resources
 
 ## Knowledge
 

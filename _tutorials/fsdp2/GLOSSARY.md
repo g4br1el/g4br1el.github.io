@@ -1,12 +1,11 @@
 ---
 layout: tutorial
-title: "FSDP2 Mission"
+title: "FSDP2 Glossary"
 tutorial: fsdp2
 type: mission
 permalink: /heap/fsdp2/glossary/
 ---
 
-# FSDP2 Glossary
 
 Terminology for distributed training with PyTorch's Fully Sharded Data Parallel (v2).
 

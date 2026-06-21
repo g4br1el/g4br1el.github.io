@@ -1,12 +1,10 @@
 ---
 layout: tutorial
-title: "FSDP2 Mission"
+title: "Teaching Notes"
 tutorial: fsdp2
 type: mission
 permalink: /heap/fsdp2/notes/
 ---
-
-# Teaching Notes
 
 ## User Preferences
 - Wants full depth: internals, DTensor mechanics, not just API usage

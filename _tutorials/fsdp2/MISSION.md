@@ -1,12 +1,11 @@
 ---
 layout: tutorial
-title: "FSDP2 Mission"
+title: "Mission: FSDP2 Mastery"
 tutorial: fsdp2
 type: mission
 permalink: /heap/fsdp2/mission/
 ---
 
-# Mission: FSDP2 Mastery
 
 ## Why
 Train large vision transformers (ViT-H class, 600M+ params) that exceed single-GPU memory under DDP on a V100-32GB NVLink/InfiniBand cluster. Build deep, internals-level understanding of FSDP2 (DTensor, DeviceMesh, communication patterns) to future-proof for larger models and strengthen candidacy for senior distributed-training roles.
