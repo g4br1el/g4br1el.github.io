@@ -1,0 +1,374 @@
+---
+layout: tutorial
+tutorial: ai-day
+type: lesson
+lesson: 4
+total: 5
+title: "Cheat Sheet"
+tags: [Cheat Sheet]
+permalink: /heap/ai-day/004/
+---
+
+<head>
+    <style>
+        :root {
+            --bg: #fdfdfd;
+            --fg: #1a1a1a;
+            --accent: #76b900;
+            --accent-dim: #5a8f00;
+            --muted: #555;
+            --border: #ddd;
+            --card-bg: #f8f8f8;
+            --highlight: #fffde7;
+            --font: -apple-system, 'Inter', sans-serif;
+            --mono: 'JetBrains Mono', 'SF Mono', monospace;
+        }
+
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --bg: #111;
+                --fg: #e8e8e8;
+                --accent: #76b900;
+                --accent-dim: #9bd41c;
+                --muted: #aaa;
+                --border: #333;
+                --card-bg: #1a1a1a;
+                --highlight: #2a2a1a;
+            }
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+
+        p, li { font-size: 0.9rem; margin-bottom: 0.4rem; }
+        ul { margin-left: 1.2rem; }
+        li { margin-bottom: 0.3rem; }
+
+        .meta {
+            font-size: 0.8rem;
+            color: var(--muted);
+            margin-bottom: 1rem;
+        }
+
+        .toc {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 0.8rem 1rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .toc a {
+            color: var(--accent-dim);
+            text-decoration: none;
+            font-size: 0.85rem;
+            display: block;
+            padding: 0.2rem 0;
+        }
+
+        .toc a:hover { text-decoration: underline; }
+
+        .question-card {
+            background: var(--highlight);
+            border-left: 4px solid var(--accent);
+            padding: 0.7rem 0.9rem;
+            margin: 0.6rem 0;
+            border-radius: 0 6px 6px 0;
+        }
+
+        .question-card .q {
+            font-weight: 700;
+            font-size: 0.88rem;
+            margin-bottom: 0.3rem;
+        }
+
+        .question-card .why {
+            font-size: 0.78rem;
+            color: var(--muted);
+            font-style: italic;
+        }
+
+        .term-grid {
+            display: grid;
+            grid-template-columns: auto 1fr;
+            gap: 0.2rem 0.8rem;
+            font-size: 0.85rem;
+            margin: 0.5rem 0;
+        }
+
+        .term-grid dt {
+            font-weight: 700;
+            color: var(--accent-dim);
+            white-space: nowrap;
+        }
+
+        .term-grid dd { color: var(--fg); }
+
+        .corridor {
+            background: var(--card-bg);
+            border: 1px dashed var(--accent);
+            padding: 0.7rem 0.9rem;
+            margin: 0.6rem 0;
+            border-radius: 6px;
+            font-size: 0.85rem;
+            font-style: italic;
+        }
+
+        .corridor::before {
+            content: '🗣️ ';
+        }
+
+        .bridge-tag {
+            display: inline-block;
+            background: var(--accent);
+            color: #fff;
+            font-size: 0.7rem;
+            font-weight: 700;
+            padding: 0.1rem 0.4rem;
+            border-radius: 3px;
+            margin-right: 0.3rem;
+            vertical-align: middle;
+        }
+
+        .schedule {
+            font-size: 0.82rem;
+            border-collapse: collapse;
+            width: 100%;
+            margin: 0.5rem 0;
+        }
+
+        .schedule td, .schedule th {
+            padding: 0.3rem 0.5rem;
+            border: 1px solid var(--border);
+            text-align: left;
+        }
+
+        .schedule th { background: var(--card-bg); font-size: 0.8rem; }
+
+        .role-fit {
+            background: var(--card-bg);
+            border: 2px solid var(--accent);
+            padding: 0.7rem 0.9rem;
+            border-radius: 6px;
+            margin: 0.8rem 0;
+            font-size: 0.85rem;
+        }
+
+        .role-fit strong { color: var(--accent-dim); }
+
+        hr { border: none; border-top: 1px solid var(--border); margin: 1rem 0; }
+
+        @media print {
+            body { font-size: 11pt; padding: 0.5cm; max-width: 100%; }
+            .question-card { break-inside: avoid; }
+            h2 { break-after: avoid; }
+        }
+    </style>
+</head>
+<body>
+<h2 id="talk1">Talk 1: LLM Lifecycle (14:30–15:15)</h2>
+<p><strong>Speaker:</strong> Dr. Giuseppe Fiameni (NVIDIA Solution Architect)</p>
+
+<h3>Key Terms to Recognize Instantly</h3>
+<dl class="term-grid">
+    <dt>Pre-training</dt>
+    <dd>Next-token prediction on ~15T tokens → base model. 99% of total compute.</dd>
+    <dt>SFT</dt>
+    <dd>Supervised fine-tuning on (instruction, response) pairs. 10k–100k examples.</dd>
+    <dt>RLHF</dt>
+    <dd>Train reward model on preferences → optimize policy via PPO. 4 models in memory.</dd>
+    <dt>DPO</dt>
+    <dd>Skip reward model. Direct loss on preference pairs. Simpler, stable, offline.</dd>
+    <dt>Megatron-LM</dt>
+    <dd>NVIDIA's 5D parallelism (TP+PP+DP+SP+EP). TP intra-node (NVLink), PP inter-node.</dd>
+    <dt>NeMo</dt>
+    <dd>End-to-end LLM framework: data curation → training → alignment → export.</dd>
+    <dt>NeMo-Aligner</dt>
+    <dd>PPO/DPO orchestration. Handles multi-model interleaved generation + training.</dd>
+    <dt>Transformer Engine</dt>
+    <dd>FP8 training on Hopper. Delayed scaling. Drop-in for nn.Linear.</dd>
+    <dt>MFU</dt>
+    <dd>Model FLOPs Utilization. Frontier target: 40–55% on H100 clusters.</dd>
+</dl>
+
+<h3>🎯 Your Question</h3>
+<div class="question-card">
+    <p class="q">"The RLHF stage interleaves autoregressive generation (memory-bound) with gradient updates (compute-bound). How does NeMo-Aligner handle GPU utilization during PPO? Do you overlap generation with backward passes, or is there a pipeline bubble?"</p>
+    <p class="why"><span class="bridge-tag">BRIDGE</span> Connects to your HPC profiling work. Signals you think about GPU utilization at the systems level — directly relevant to JR1980206.</p>
+</div>
+
+<!-- ═══════════════════════════════════════════ -->
+<h2 id="talk2">Talk 2: Inference Optimization (15:30–16:30)</h2>
+<p><strong>Speaker:</strong> Dr. Séverine Habert (NVIDIA)</p>
+
+<h3>Key Terms to Recognize Instantly</h3>
+<dl class="term-grid">
+    <dt>Prefill</dt>
+    <dd>Process all input tokens in parallel. Compute-bound. Metric: TTFT.</dd>
+    <dt>Decode</dt>
+    <dd>Generate 1 token per step. Memory-bandwidth-bound. Metric: TPS.</dd>
+    <dt>KV-Cache</dt>
+    <dd>Stored K,V from past tokens. Grows linearly with seq len. Llama-70B: ~2.6 MB/token.</dd>
+    <dt>Paged Attention</dt>
+    <dd>Non-contiguous KV pages (like OS virtual memory). Near-zero fragmentation. From vLLM.</dd>
+    <dt>In-flight Batching</dt>
+    <dd>Insert/remove requests every iteration. GPU always full. 2–5× over static.</dd>
+    <dt>Speculative Decode</dt>
+    <dd>Small draft model → K candidates → big model verifies in 1 pass. Trades compute for latency.</dd>
+    <dt>CUDA Graphs</dt>
+    <dd>Capture decode step as single GPU graph. Eliminates per-kernel launch overhead.</dd>
+    <dt>FP8 (Hopper)</dt>
+    <dd>E4M3 fwd, E5M2 grad. 2× throughput vs FP16. Negligible accuracy loss.</dd>
+    <dt>FP4 (Blackwell)</dt>
+    <dd>2× over FP8. Weights-only for now. Native Tensor Core support.</dd>
+    <dt>AWQ</dt>
+    <dd>Weight-only INT4. Protect salient weights (by activation magnitude).</dd>
+    <dt>SmoothQuant</dt>
+    <dd>Migrate quant difficulty: divide activations, multiply weights by same factor.</dd>
+    <dt>2:4 Sparsity</dt>
+    <dd>2 zeros per 4 weights. HW-native on Hopper/Blackwell. 2× compute, ~0 accuracy loss.</dd>
+    <dt>FlashAttention</dt>
+    <dd>Tiled attention in SRAM. Never materializes seq×seq matrix. O(seq) memory.</dd>
+    <dt>TensorRT-LLM</dt>
+    <dd>NOT classic TensorRT. Python model def → Executor (scheduler + KV mgmt + TP).</dd>
+    <dt>NIM</dt>
+    <dd>Pre-optimized Docker containers. "docker run" optimal inference.</dd>
+</dl>
+
+<h3>The Decode Bottleneck (memorize this)</h3>
+<p>
+    70B FP16 → load 140 GB weights per token. H100 = 3.35 TB/s → minimum ~42 ms/token at batch=1.<br>
+    Arithmetic intensity ≈ 1 FLOP/byte. Need ~1181 for compute-bound. <strong>GPU compute is ~99% idle during single-request decode.</strong><br>
+    → Quantization reduces bytes loaded. Batching amortizes weight loads.
+</p>
+
+<h3>🎯 Your Question</h3>
+<div class="question-card">
+    <p class="q">"With FP4 on Blackwell, weight loading cost drops 4× vs FP16, pushing decode closer to compute-bound. Does that change the optimization strategy — specifically, does speculative decoding become less beneficial when decode is no longer purely bandwidth-limited?"</p>
+    <p class="why"><span class="bridge-tag">BRIDGE</span> Shows second-order systems thinking. You understand how quantization shifts the roofline and invalidates assumptions. This is exactly what the Performance SW team analyzes.</p>
+</div>
+
+<h3>Backup Question (if someone asks yours first)</h3>
+<div class="question-card">
+    <p class="q">"In-flight batching changes batch size every iteration, conflicting with CUDA Graphs' static-shape requirement. Do you maintain a pool of pre-captured graphs for different batch sizes? What's the graph switching overhead relative to decode step time?"</p>
+    <p class="why"><span class="bridge-tag">BRIDGE</span> Directly connects to "Graph Compilation" in job listing. Shows CUDA-level understanding.</p>
+</div>
+
+<!-- ═══════════════════════════════════════════ -->
+<h2 id="talk3">Talk 3: Physical AI & World Models (16:30–17:30)</h2>
+<p><strong>Speaker:</strong> Dr. Pallavi Mohan (NVIDIA)</p>
+
+<h3>Key Terms to Recognize Instantly</h3>
+<dl class="term-grid">
+    <dt>Physical AI</dt>
+    <dd>AI that perceives, predicts, and acts in the physical world. Robots, AV, factories.</dd>
+    <dt>World Foundation Model</dt>
+    <dd>Predicts future environment states given past observations + actions. Learned physics.</dd>
+    <dt>Cosmos</dt>
+    <dd>NVIDIA's WFM platform. Tokenizer + Diffusion models + AR models + Guardrails.</dd>
+    <dt>Cosmos Tokenizer</dt>
+    <dd>Video → tokens. 8×8 spatial × 8 temporal = 512× compression.</dd>
+    <dt>DiT</dt>
+    <dd>Diffusion Transformer. Replaces U-Net. Used in Cosmos, Sora, SD3.</dd>
+    <dt>GR00T</dt>
+    <dd>Humanoid robot foundation model. Vision+language → joint actions.</dd>
+    <dt>Isaac Sim / Isaac Lab</dt>
+    <dd>GPU-accelerated robot simulation on Omniverse. 4096 parallel envs per GPU.</dd>
+    <dt>Omniverse</dt>
+    <dd>3D simulation platform. USD format. RTX rendering + PhysX physics.</dd>
+    <dt>Domain Randomization</dt>
+    <dd>Vary sim parameters (light, texture, physics) → policy robust to real world.</dd>
+    <dt>Sim-to-Real</dt>
+    <dd>Train in simulation, deploy on physical hardware. The gap is the central challenge.</dd>
+    <dt>Jetson Thor</dt>
+    <dd>Robot SoC. Blackwell GPU, ~800 TOPS INT8, ~100W. Edge deployment for GR00T.</dd>
+    <dt>Digital Twin</dt>
+    <dd>Live simulation mirroring a real physical system in real-time.</dd>
+</dl>
+
+<h3>The NVIDIA Physical AI Stack (top to bottom)</h3>
+<p style="font-size: 0.82rem; font-family: var(--mono); line-height: 1.6;">
+    Applications (AV, Robots, Factories)<br>
+    &nbsp;&nbsp;↑<br>
+    Foundation Models (Cosmos, GR00T, NIM)<br>
+    &nbsp;&nbsp;↑<br>
+    Simulation (Isaac Sim, DRIVE Sim, NeMo)<br>
+    &nbsp;&nbsp;↑<br>
+    Platform (Omniverse / USD / PhysX / RTX)<br>
+    &nbsp;&nbsp;↑<br>
+    Hardware (DGX training, Jetson edge, IGX industrial)
+</p>
+
+<h3>🎯 Your Question</h3>
+<div class="question-card">
+    <p class="q">"My background is in compression-based spatial ML. The Cosmos tokenizer applies 512× compression — I'm curious what that information bottleneck does to fine-grained physics: can the tokenizer distinguish rigid sliding from deformable deformation? Is tokenizer fidelity or the world model itself currently the accuracy bottleneck?"</p>
+    <p class="why"><span class="bridge-tag">BRIDGE</span> Connects your PhD (Algorithmic Information Theory / compression in spatial DL) to NVIDIA's newest product. Unique differentiator — no other candidate will have published on this.</p>
+</div>
+
+<!-- ═══════════════════════════════════════════ -->
+<h2 id="role">🎯 Role Fit Reminders (JR1980206)</h2>
+
+<div class="role-fit">
+    <p><strong>What they want → What you have:</strong></p>
+    <ul>
+        <li><strong>5+ yrs DL implementation</strong> → Fraunhofer + TUM + DLR (5+ years)</li>
+        <li><strong>Multiple DL frameworks</strong> → PyTorch (deep), TF, TensorRT</li>
+        <li><strong>Profiling & optimization</strong> → CUDA profiling, scaling efficiency, throughput tools</li>
+        <li><strong>Large-scale HPC</strong> → 32 GPUs / 8 nodes, Slurm, NCCL, Apptainer</li>
+        <li><strong>DevOps/Docker/Linux</strong> → Docker, Apptainer, Slurm scripting</li>
+        <li><strong>CUDA (plus)</strong> → Custom kernels (tiled inference, IoU, image proc)</li>
+        <li><strong>Graph Compilation (new SW feature)</strong> → Understand CUDA Graphs (from Lesson 2)</li>
+        <li><strong>Reduced precision</strong> → INT8 PTQ, FP16/BF16, now understand FP8/FP4</li>
+    </ul>
+    <p style="margin-top: 0.5rem;"><strong>Your gap to acknowledge honestly if asked:</strong> Limited LLM hands-on (CLIP only, no TensorRT-LLM deployment). Frame it as: "I have the systems foundation — profiling, CUDA, distributed training — and I'm extending it to the LLM domain."</p>
+</div>
+
+<!-- ═══════════════════════════════════════════ -->
+<h2 id="corridor">🗣️ Corridor Conversation Openers</h2>
+
+<h3>After Talk 1 (Break, 15:15–15:30) — Approach Fiameni</h3>
+<div class="corridor">
+    "I work on distributed training at Fraunhofer — we scale to 32 GPUs on Slurm with FSDP2 and NCCL. I'm curious how Megatron-LM's distributed optimizer compares to ZeRO-3 at your scale — is the communication pattern fundamentally different?"
+</div>
+
+<h3>After Talk 2 — Approach Habert</h3>
+<div class="corridor">
+    "I build profiling tools for distributed training pipelines — measuring scaling efficiency, memory utilization. How does your team approach the same problem for inference? Primarily Nsight traces, or do you have higher-level tooling mapping to TTFT and TPS?"
+</div>
+
+<h3>Directly About the Role (Any NVIDIA Engineer)</h3>
+<div class="corridor">
+    "I saw the Senior DL Performance Engineer role — JR1980206. It mentions graph compilation and reduced precision as new features. Is that team focused on inference CUDA Graphs, or does it extend to torch.compile and training as well?"
+</div>
+
+<div class="corridor">
+    "I've deployed quantized CNNs to FPGAs for satellite onboard processing and profiled the accuracy-latency trade-offs. I imagine the LLM quantization story is more complex with outlier activations. How much of the AWQ/SmoothQuant pipeline is automated in ModelOpt today?"
+</div>
+
+<h3>After Talk 3 — Approach Mohan</h3>
+<div class="corridor">
+    "My PhD was on compression in spatial ML — how information loss from compression affects downstream tasks. The Cosmos tokenizer feels very related — a lossy compression decision that constrains everything downstream. Is there work on the rate-distortion trade-off for video tokenizers?"
+</div>
+
+<!-- ═══════════════════════════════════════════ -->
+<h2>🧠 Mental Models to Keep Loaded</h2>
+
+<h3>LLM Training Pipeline</h3>
+<p style="font-size: 0.82rem; font-family: var(--mono);">
+    Pre-train (15T tok, 99% compute) → SFT (100k examples) → Align (DPO/RLHF)<br>
+    Megatron-LM → NeMo → NeMo-Aligner → TensorRT-LLM (export)
+</p>
+
+<h3>LLM Inference: Two Phases</h3>
+<p style="font-size: 0.82rem; font-family: var(--mono);">
+    PREFILL: all input tokens in parallel → compute-bound → metric: TTFT<br>
+    DECODE: 1 token/step, load all weights → bandwidth-bound → metric: TPS<br>
+    Optimization: quantize (reduce bytes) + batch (amortize loads) + speculate (skip steps)
+</p>
+
+<h3>Physical AI Loop</h3>
+<p style="font-size: 0.82rem; font-family: var(--mono);">
+    Real video → Cosmos (learn physics) → generate scenarios<br>
+    Isaac Sim (precise physics) → train policy (GR00T) → domain randomization<br>
+    Deploy to Jetson Thor (edge, quantized) → act in real world
+</p>

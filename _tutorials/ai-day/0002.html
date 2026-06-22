@@ -1,0 +1,893 @@
+---
+layout: tutorial
+tutorial: ai-day
+type: lesson
+lesson: 2
+total: 5
+title: "Scaling Inference with Optimization and Compression"
+tags: [Inference Optimization]
+permalink: /heap/ai-day/002/
+---
+
+
+
+<h2>1. Context: Why This Talk Is Your Opportunity</h2>
+
+<p>
+    This is the talk closest to the <a href="../CAREERS AT NVIDIA.pdf">JR1980206 role</a>. The job description
+    literally says: <em>"Analyze, profile, and optimize deep learning workloads on state-of-the-art
+    hardware and software platforms"</em> and <em>"Implement and test new SW features (Graph Compilation,
+    reduced precision training) that use the most recent HW functionalities."</em>
+</p>
+
+<p>
+    You already know TensorRT (engine building, INT8 calibration, layer fusion), CUDA profiling, and
+    model compression for edge deployment (VitisAI/FPGA). What you <strong>don't</strong> know is how
+    LLM inference differs architecturally from CNN inference, and what TensorRT-LLM does that classic
+    TensorRT cannot. That's this lesson.
+</p>
+
+<div class="bridge">
+    <strong>Your position</strong>: You are NOT a beginner here. You're extending existing expertise to a new
+    domain. The speaker (Habert) will likely cover material you partially know — your goal is to identify
+    the LLM-specific pieces, connect them to your optimization background, and ask questions that reveal
+    you've already been thinking about these problems.
+</div>
+
+<h2>2. Why LLM Inference Is Fundamentally Different</h2>
+
+<p>
+    With CNNs (your domain), inference is straightforward: one forward pass, fixed input shape, fixed compute.
+    You build a TensorRT engine, optimize the graph, and you're done. LLM inference breaks every assumption:
+</p>
+
+<table>
+    <thead>
+    <tr><th>Property</th><th>CNN Inference (your experience)</th><th>LLM Inference (new)</th></tr>
+    </thead>
+    <tbody>
+    <tr>
+        <td>Compute pattern</td>
+        <td>Single forward pass</td>
+        <td>Autoregressive: N sequential forward passes for N output tokens</td>
+    </tr>
+    <tr>
+        <td>Bottleneck</td>
+        <td>Compute-bound (FLOPS)</td>
+        <td>Memory-bandwidth-bound (weight loading dominates)</td>
+    </tr>
+    <tr>
+        <td>Input shape</td>
+        <td>Fixed (e.g., 224×224×3)</td>
+        <td>Variable sequence length, growing at each step</td>
+    </tr>
+    <tr>
+        <td>State</td>
+        <td>Stateless</td>
+        <td>Stateful: KV-cache grows with sequence length</td>
+    </tr>
+    <tr>
+        <td>Batching</td>
+        <td>Static padding to max shape</td>
+        <td>Dynamic: requests arrive/finish at different times</td>
+    </tr>
+    <tr>
+        <td>Latency metric</td>
+        <td>Single number (ms/image)</td>
+        <td>Two numbers: TTFT + TPS (explained below)</td>
+    </tr>
+    <tr>
+        <td>Memory scaling</td>
+        <td>Constant (fixed activations)</td>
+        <td>Linear with sequence length (KV-cache)</td>
+    </tr>
+    </tbody>
+</table>
+
+<div class="concept-box">
+    <h4>The Two Phases of LLM Inference</h4>
+    <p>Every LLM inference request has two distinct phases with different compute characteristics:</p>
+    <ol>
+        <li><strong>Prefill (prompt processing)</strong>: Process all input tokens in parallel. This IS compute-bound
+            (like a CNN forward pass). Produces the KV-cache for all input positions. Measured by
+            <strong>TTFT</strong> (Time To First Token).</li>
+        <li><strong>Decode (token generation)</strong>: Generate tokens one at a time, each requiring a forward pass
+            through the full model but only for a single token. This is <strong>memory-bandwidth-bound</strong>
+            because you load all model weights for a single token's worth of compute. Measured by
+            <strong>TPS</strong> (Tokens Per Second) or inter-token latency.</li>
+    </ol>
+    <p>
+        The decode phase is the bottleneck. For a 70B model in FP16, each token requires loading ~140 GB
+        of weights from HBM. On an H100 (3.35 TB/s bandwidth), that's ~42 ms per token <em>minimum</em>,
+        even ignoring KV-cache reads. This is why quantization matters so much for LLMs — it directly
+        reduces the bytes loaded per token.
+    </p>
+</div>
+
+<h3>2.1 The Arithmetic Intensity Problem</h3>
+
+<p>
+    Arithmetic intensity = FLOPs / bytes loaded. For decode phase with batch size 1:
+</p>
+
+<pre><code># For a single token through a linear layer (d_in × d_out):
+FLOPs = 2 × d_in × d_out          (matmul)
+Bytes = d_in × d_out × bytes_per_param  (load entire weight matrix)
+
+# For Llama-3 70B, FP16:
+# Arithmetic intensity ≈ 2 / 2 = 1 FLOP/byte
+# H100 roofline: 3958 TFLOPS / 3350 GB/s ≈ 1181 FLOPS/byte needed for compute-bound
+
+# → Decode is ~1000× below the roofline ridge point
+# → GPU compute units are almost entirely idle during decode
+# → You're paying for TFLOPS but bottlenecked on bandwidth</code></pre>
+
+<p>
+    This is why <strong>batching</strong> is critical: if you process B tokens simultaneously, arithmetic
+    intensity scales by B. At batch size 64, you're at 64 FLOPS/byte — still memory-bound on H100, but
+    much better GPU utilization.
+</p>
+
+<div class="bridge">
+    <strong>Your mental model</strong>: Think of it like your CUDA kernel profiling work — but instead of
+    optimizing compute occupancy, the entire game is maximizing memory bandwidth utilization and amortizing
+    weight loads across as many tokens as possible. The roofline analysis you'd do for a CUDA kernel applies
+    identically here.
+</div>
+
+<h2>3. The KV-Cache: LLM's Unique Memory Challenge</h2>
+
+<h3>3.1 What It Is</h3>
+
+<p>
+    In self-attention, each token attends to all previous tokens via Query × Key and then weighted sum over
+    Values. Without caching, generating token N requires recomputing attention for all N positions — O(N²)
+    total compute for a sequence.
+</p>
+
+<p>
+    The <strong>KV-cache</strong> stores the Key and Value projections of all previous tokens so they don't
+    need to be recomputed. Each new token only computes its own Q, K, V and attends to the cached K, V:
+</p>
+
+<pre><code># KV-cache memory per token per layer:
+bytes_per_token_per_layer = 2 × n_heads × d_head × bytes_per_element
+# (2 for K and V, n_heads × d_head = d_model typically)
+
+# For Llama-3 70B (80 layers, 64 KV-heads × 128 dim, FP16):
+# Per token: 2 × 64 × 128 × 2 bytes × 80 layers = 2.62 MB per token
+# For 4096 tokens: 2.62 MB × 4096 = 10.7 GB
+# For 128k context: 2.62 MB × 131072 = 336 GB (!)
+
+# This is why long-context inference is a memory nightmare.
+# The KV-cache can exceed the model weights themselves.</code></pre>
+
+<h3>3.2 Paged Attention (vLLM → TensorRT-LLM)</h3>
+
+<p>
+    Classic KV-cache allocation pre-allocates contiguous memory for the maximum sequence length per request.
+    If you allocate for 4096 tokens but the response is only 200 tokens, you've wasted 95% of that memory.
+    With many concurrent requests, this fragmentation kills throughput.
+</p>
+
+<p>
+    <strong>Paged Attention</strong> (<a href="https://arxiv.org/abs/2309.06180">Kwon et al., 2023</a>)
+    borrows from OS virtual memory: KV-cache is stored in fixed-size "pages" (blocks) that can be
+    non-contiguous in physical GPU memory. A page table maps logical token positions to physical memory blocks.
+</p>
+
+<pre><code># Paged Attention benefits:
+# 1. Near-zero memory waste — allocate pages on demand
+# 2. Memory sharing — identical prefixes share KV pages (copy-on-write)
+#    e.g., system prompt cached once, shared across all requests
+# 3. Dynamic memory — no need to know max sequence length upfront
+# 4. Preemption — can evict pages to disk/CPU to handle load spikes
+
+# TensorRT-LLM implements this as "KV-cache block management"
+# Configured via: kv_cache_config in the executor API</code></pre>
+
+<div class="concept-box">
+    <h4>Why This Matters for Performance Engineering</h4>
+    KV-cache management is now the primary determinant of serving throughput — not model compute. A well-tuned
+    KV-cache system (page size, eviction policy, prefix caching hit rate) can 2–3× throughput without touching
+    the model itself. This is exactly the kind of systems-level optimization the JR1980206 role handles.
+</div>
+
+<h2>4. TensorRT-LLM vs. Classic TensorRT</h2>
+
+<p>
+    You know TensorRT well: ONNX import → layer fusion → kernel auto-tuning → serialized engine.
+    TensorRT-LLM is a <strong>different system</strong> that happens to use TensorRT's kernel library
+    under the hood. Here's the architectural comparison:
+</p>
+
+<table>
+    <thead>
+    <tr><th>Aspect</th><th>TensorRT (Classic)</th><th>TensorRT-LLM</th></tr>
+    </thead>
+    <tbody>
+    <tr>
+        <td>Input</td>
+        <td>ONNX graph</td>
+        <td>Python model definition (like PyTorch)</td>
+    </tr>
+    <tr>
+        <td>Model type</td>
+        <td>Any DNN (CNNs, transformers, etc.)</td>
+        <td>Autoregressive transformers specifically</td>
+    </tr>
+    <tr>
+        <td>Execution</td>
+        <td>Single forward pass</td>
+        <td>Iterative generation loop with state</td>
+    </tr>
+    <tr>
+        <td>Batching</td>
+        <td>Static (fixed batch dim)</td>
+        <td>In-flight batching (continuous)</td>
+    </tr>
+    <tr>
+        <td>Memory mgmt</td>
+        <td>TRT runtime allocator</td>
+        <td>Paged KV-cache manager</td>
+    </tr>
+    <tr>
+        <td>Parallelism</td>
+        <td>Single GPU (or manual)</td>
+        <td>Built-in tensor parallelism across GPUs</td>
+    </tr>
+    <tr>
+        <td>Quantization</td>
+        <td>INT8/FP16 PTQ, QAT</td>
+        <td>FP8, FP4, INT4 (AWQ, GPTQ), SmoothQuant</td>
+    </tr>
+    <tr>
+        <td>Optimizations</td>
+        <td>Layer fusion, kernel selection</td>
+        <td>+ FlashAttention, speculative decoding, CUDA graphs</td>
+    </tr>
+    <tr>
+        <td>Serving</td>
+        <td>Via Triton Inference Server</td>
+        <td>Built-in executor + Triton backend</td>
+    </tr>
+    </tbody>
+</table>
+
+<div class="concept-box">
+    <h4>Key Architecture: The Executor API</h4>
+    <p>
+        TensorRT-LLM's runtime is centered on the <strong>Executor</strong> — a C++ component that manages:
+    </p>
+    <ul>
+        <li>Request scheduling (which requests run in this iteration)</li>
+        <li>KV-cache block allocation/deallocation</li>
+        <li>In-flight batching (inserting new requests, removing completed ones)</li>
+        <li>Multi-GPU coordination (tensor parallelism across NCCL communicators)</li>
+    </ul>
+    <p>
+        Think of it as a "mini OS" for LLM inference — it solves the same scheduling/memory problems
+        an OS solves for processes, but for concurrent LLM requests.
+    </p>
+</div>
+
+<h3>4.1 In-Flight Batching (Continuous Batching)</h3>
+
+<p>
+    In classic TensorRT serving, you batch N requests, wait for all to complete, then start the next batch.
+    Short requests are blocked by long ones. GPU utilization drops as requests finish at different times.
+</p>
+
+<p>
+    <strong>In-flight batching</strong> (<a href="https://www.usenix.org/conference/osdi22/presentation/yu">Orca, Yu et al., 2022</a>)
+    operates at the <em>iteration</em> level: each decode step, the scheduler can:
+</p>
+<ul>
+    <li>Add new requests that just arrived (insert into the batch)</li>
+    <li>Remove requests that just finished (free their KV-cache)</li>
+    <li>Preempt low-priority requests if memory is exhausted</li>
+</ul>
+
+<pre><code># Iteration-level scheduling (pseudocode):
+while requests_pending():
+    # 1. Select which requests participate in this decode step
+    active_batch = scheduler.select(
+        pending_requests,
+        available_kv_blocks,
+        max_batch_tokens   # memory constraint
+    )
+
+    # 2. Run one decode step for all active requests
+    #    (each request generates exactly 1 token)
+    new_tokens = model.decode_step(active_batch)
+
+    # 3. Check stopping criteria
+    for req in active_batch:
+        if req.is_finished(new_tokens[req]):
+            scheduler.release(req)  # free KV blocks
+            output_queue.put(req)
+
+    # 4. Accept new arrivals
+    scheduler.enqueue(new_arrivals())</code></pre>
+
+<p>
+    The result: GPU utilization stays high because the batch is always full. Throughput improvements
+    of 2–5× over static batching are typical, with no latency penalty.
+</p>
+
+<div class="bridge">
+    <strong>Your analogy</strong>: Think of this like Slurm job scheduling — but at microsecond granularity.
+    Instead of scheduling jobs to nodes, you're scheduling inference requests to GPU memory blocks.
+    The constraints are identical: memory capacity, fairness, priority, preemption.
+</div>
+
+<h2>5. Quantization for LLMs</h2>
+
+<p>
+    You already know INT8 PTQ and calibration. LLM quantization has the same goal (reduce memory → faster
+    decode) but different challenges:
+</p>
+
+<ul>
+    <li><strong>Outlier features</strong>: LLMs have activation outliers (values 100× larger than median)
+        concentrated in a few channels. Naive per-tensor INT8 quantization destroys accuracy because
+        the dynamic range is dominated by outliers.</li>
+    <li><strong>Weight-only vs. weight+activation</strong>: Since decode is memory-bound, quantizing only
+        weights (keeping activations in FP16) still gives the full speedup — the bottleneck is weight loading.</li>
+    <li><strong>Granularity matters more</strong>: Per-channel and per-group quantization (e.g., 128-element groups)
+        is essential for aggressive formats like INT4.</li>
+</ul>
+
+<h3>5.1 Quantization Methods Landscape</h3>
+
+<table>
+    <thead>
+    <tr><th>Method</th><th>What It Quantizes</th><th>Precision</th><th>Key Idea</th><th>Accuracy Impact</th></tr>
+    </thead>
+    <tbody>
+    <tr>
+        <td><strong>SmoothQuant</strong></td>
+        <td>Weights + activations</td>
+        <td>INT8/FP8</td>
+        <td>Migrate quantization difficulty from activations to weights via per-channel scaling</td>
+        <td>Minimal for INT8</td>
+    </tr>
+    <tr>
+        <td><strong>AWQ</strong></td>
+        <td>Weights only</td>
+        <td>INT4 (group-wise)</td>
+        <td>Protect salient weights (identified by activation magnitude) with per-channel scaling</td>
+        <td>Very low for INT4</td>
+    </tr>
+    <tr>
+        <td><strong>GPTQ</strong></td>
+        <td>Weights only</td>
+        <td>INT4/INT3</td>
+        <td>Layer-wise optimal quantization using second-order information (Hessian approx)</td>
+        <td>Low, but requires calibration data</td>
+    </tr>
+    <tr>
+        <td><strong>FP8 (Hopper)</strong></td>
+        <td>Weights + activations</td>
+        <td>FP8 E4M3</td>
+        <td>Native HW support. Per-tensor dynamic scaling. Drop-in via Transformer Engine</td>
+        <td>Negligible (well within noise)</td>
+    </tr>
+    <tr>
+        <td><strong>FP4 (Blackwell)</strong></td>
+        <td>Weights (+ activations TBD)</td>
+        <td>FP4</td>
+        <td>Native HW support on B100/B200. 2× compute density vs FP8</td>
+        <td>Under active research</td>
+    </tr>
+    </tbody>
+</table>
+
+<div class="concept-box">
+    <h4>SmoothQuant — The Clever Trick</h4>
+    <p>
+        The insight: if activation channel <em>j</em> has outliers (large dynamic range) but the corresponding
+        weight column <em>j</em> has small values, you can divide the activation by a scaling factor <em>s_j</em>
+        and multiply the weight by the same <em>s_j</em>. Mathematically equivalent (Y = XW = (X/s)(sW)),
+        but now both are "smooth" — easier to quantize.
+    </p>
+    <pre><code># SmoothQuant transformation:
+# Original: Y = X @ W
+# Smoothed: Y = (X @ diag(s)^-1) @ (diag(s) @ W)
+# Where s_j = max(|X_j|)^α / max(|W_j|)^(1-α), α ∈ [0.5, 0.75]
+
+# After smoothing, both X' and W' have manageable dynamic ranges
+# → INT8 quantization works for both with minimal error</code></pre>
+</div>
+
+<div class="concept-box">
+    <h4>FP8 on Hopper: What You Need to Know</h4>
+    <p>Two formats defined by <a href="https://arxiv.org/abs/2209.05433">Micikevicius et al. (2022)</a>:</p>
+    <ul>
+        <li><strong>E4M3</strong> (4-bit exponent, 3-bit mantissa): Range ±448, precision 0.0625 at scale 1.
+            Used for forward pass (weights and activations).</li>
+        <li><strong>E5M2</strong> (5-bit exponent, 2-bit mantissa): Range ±57344, lower precision.
+            Used for gradients (needs wider range, can tolerate noise).</li>
+    </ul>
+    <p>
+        On Hopper, FP8 matrix multiply is done by the Tensor Cores natively — 2× throughput vs FP16.
+        The <strong>Transformer Engine</strong> handles per-tensor scaling automatically: it tracks the
+        maximum absolute value of each tensor (using a delayed scaling strategy — the scale from iteration N
+        is used at iteration N+1) and requantizes on the fly.
+    </p>
+    <p>
+        For inference specifically, FP8 E4M3 for both weights and activations is standard. The accuracy loss
+        is negligible for most models — it's essentially a free 2× speedup on Hopper.
+    </p>
+</div>
+
+<div class="bridge">
+    <strong>Your existing knowledge extension</strong>: You've done INT8 PTQ with TensorRT (calibration,
+    histogram entropy, per-tensor vs per-channel). FP8 is actually simpler — no calibration dataset needed
+    for the common "delayed scaling" approach. The scaling factors are computed online from the previous
+    iteration's statistics. AWQ/GPTQ are analogous to your INT8 calibration workflow but with more
+    sophisticated weight-selection heuristics.
+</div>
+
+<h3>5.2 KV-Cache Quantization</h3>
+
+<p>
+    A frontier technique: quantize the KV-cache itself (not just weights) to INT8 or FP8. Since the
+    KV-cache is the memory bottleneck for long sequences, compressing it directly increases the number
+    of concurrent requests you can serve:
+</p>
+
+<pre><code># KV-cache quantization impact:
+# Llama-3 70B, 4096 context, FP16 KV-cache:
+#   KV per request: 10.7 GB
+#   With 80 GB GPU, ~5 concurrent requests (after model weights)
+
+# Same model, INT8 KV-cache:
+#   KV per request: 5.35 GB
+#   With 80 GB GPU, ~10 concurrent requests
+#   → 2× throughput improvement from KV quantization alone
+
+# TensorRT-LLM supports FP8 and INT8 KV-cache via:
+# quantize(model, quant_config=QuantConfig(kv_cache_quant_algo="FP8"))</code></pre>
+
+<h2>6. Speculative Decoding</h2>
+
+<p>
+    The decode phase is memory-bandwidth-bound: each token requires loading all weights for minimal compute.
+    <strong>Speculative decoding</strong> trades compute for latency by exploiting the fact that GPU compute
+    is underutilized during decode:
+</p>
+
+<pre><code># Speculative decoding algorithm:
+# 1. A small "draft" model (e.g., 1B params) generates K candidate tokens quickly
+# 2. The large "target" model verifies all K tokens in ONE forward pass (parallel)
+# 3. Accept tokens where draft and target agree; reject from first disagreement
+
+# Example: K=5 draft tokens
+# Draft generates: ["The", "cat", "sat", "on", "the"]
+# Target verifies in parallel (single forward pass, like prefill)
+# Target agrees with first 4, disagrees at position 5
+# → Accept 4 tokens in 1 target forward pass instead of 4 separate passes
+
+# Speedup depends on acceptance rate α:
+# Expected tokens per step = 1/(1-α) (geometric distribution)
+# If α = 0.8: expected 5 tokens per target forward pass → ~5× latency reduction
+# If α = 0.5: expected 2 tokens → ~2× latency reduction
+
+# Acceptance rate depends on domain (structured text → high α)
+# and draft model quality (larger draft → higher α but slower draft)</code></pre>
+
+<p>Key variants in TensorRT-LLM:</p>
+<ul>
+    <li><strong>Draft-model speculative decoding</strong>: Separate smaller model as draft</li>
+    <li><strong>Self-speculative / Medusa</strong>: Additional prediction heads on the target model itself
+        (no separate model needed, but requires fine-tuning the heads)</li>
+    <li><strong>Eagle</strong>: Uses hidden states from previous tokens to predict future tokens via
+        a lightweight autoregressive head</li>
+    <li><strong>Lookahead decoding</strong>: Parallel Jacobi iteration without a draft model</li>
+</ul>
+
+<div class="concept-box">
+    <h4>When Speculative Decoding Helps (and When It Doesn't)</h4>
+    <ul>
+        <li><strong>Helps</strong>: Low-batch-size, latency-sensitive scenarios (interactive chat, coding assistants).
+            When decode is strongly memory-bound and compute is idle.</li>
+        <li><strong>Doesn't help</strong>: High-batch-size throughput scenarios (offline processing). At large batch
+            sizes, decode is already closer to compute-bound, and the extra draft model compute competes with
+            serving more requests.</li>
+    </ul>
+</div>
+
+<h2>7. CUDA Graphs for LLM Inference</h2>
+
+<p>
+    Each decode step launches hundreds of small CUDA kernels (attention, FFN layers, norms, etc.). The
+    CPU-side kernel launch overhead (~5–10 μs per kernel) accumulates to milliseconds per step —
+    significant when a decode step should take ~20–40 ms total.
+</p>
+
+<p>
+    <strong>CUDA Graphs</strong> capture an entire decode step as a single GPU-side graph, eliminating
+    per-kernel launch overhead. TensorRT-LLM uses them aggressively:
+</p>
+
+<pre><code># Without CUDA Graphs:
+# CPU launches 200+ kernels sequentially
+# Each launch: CPU-GPU synchronization + overhead
+# Total overhead: ~1-2 ms per decode step (5-10% of total time)
+
+# With CUDA Graphs:
+# First iteration: record all kernel launches into a graph
+# Subsequent iterations: replay the graph with a single CPU call
+# Overhead: ~10 μs per decode step
+
+# Constraint: Graph topology must be static
+# → Input tensor shapes must be fixed within a graph
+# → TensorRT-LLM pre-builds graphs for common batch sizes
+# → When batch size changes (request arrives/finishes), switch graphs
+
+# This is why in-flight batching + CUDA graphs interact subtly:
+# Batch size changes every iteration → need graph switching logic</code></pre>
+
+<div class="bridge">
+    <strong>Direct connection to your work</strong>: You write custom CUDA kernels and understand launch
+    overhead. The JR1980206 role specifically mentions <em>"Graph Compilation"</em> as a new SW feature.
+    CUDA Graphs for LLM inference is exactly this. Your profiling experience (measuring kernel launch
+    overhead, GPU utilization gaps) directly applies to understanding when CUDA Graphs help and what
+    their limitations are (static shapes, graph switching cost).
+</div>
+
+<h2>8. The Full NVIDIA Inference Stack</h2>
+
+<p>
+    Habert will likely present the complete deployment picture. Here's how the pieces fit:
+</p>
+
+<pre><code>┌─────────────────────────────────────────────────────────────────────────┐
+│                     NVIDIA INFERENCE STACK                                │
+│                                                                          │
+│  ┌─────────────────────────────────────────────────────────────────────┐ │
+│  │  NVIDIA NIM (API layer)                                              │ │
+│  │  Pre-built, optimized containers for specific models                 │ │
+│  │  "docker pull nvcr.io/nim/meta/llama-3.1-70b-instruct"              │ │
+│  └──────────────────────────────┬──────────────────────────────────────┘ │
+│                                 │                                         │
+│  ┌──────────────────────────────▼──────────────────────────────────────┐ │
+│  │  Triton Inference Server (orchestration)                             │ │
+│  │  Multi-model serving, request routing, metrics, A/B testing         │ │
+│  │  TensorRT-LLM backend for LLMs, TensorRT backend for vision        │ │
+│  └──────────────────────────────┬──────────────────────────────────────┘ │
+│                                 │                                         │
+│  ┌──────────────────────────────▼──────────────────────────────────────┐ │
+│  │  TensorRT-LLM (execution engine)                                     │ │
+│  │  Executor: scheduling, KV-cache mgmt, tensor parallelism            │ │
+│  │  Runtime: CUDA kernels, FlashAttention, FP8 Tensor Cores            │ │
+│  └──────────────────────────────┬──────────────────────────────────────┘ │
+│                                 │                                         │
+│  ┌──────────────────────────────▼──────────────────────────────────────┐ │
+│  │  NVIDIA ModelOpt (quantization & compression)                        │ │
+│  │  PTQ: AWQ, SmoothQuant, FP8 calibration                            │ │
+│  │  Sparsity: 2:4 structured sparsity                                  │ │
+│  │  Distillation: teacher → student compression                         │ │
+│  └──────────────────────────────┬──────────────────────────────────────┘ │
+│                                 │                                         │
+│  ┌──────────────────────────────▼──────────────────────────────────────┐ │
+│  │  Hardware Layer                                                       │ │
+│  │  H100: FP8 Tensor Cores, 80GB HBM3 (3.35 TB/s)                     │ │
+│  │  H200: FP8 Tensor Cores, 141GB HBM3e (4.8 TB/s)                    │ │
+│  │  B100/B200: FP4 Tensor Cores, 192GB HBM3e (8 TB/s)                 │ │
+│  └─────────────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────────────┘</code></pre>
+
+<h3>8.1 NIM (NVIDIA Inference Microservices)</h3>
+
+<p>
+    NIM is NVIDIA's productized inference layer — pre-optimized Docker containers that bundle a model
+    with TensorRT-LLM, optimal quantization, and serving config for specific hardware. The idea: customers
+    shouldn't need to know about KV-cache page sizes or FP8 calibration. They just <code>docker run</code>
+    and get optimal performance.
+</p>
+
+<p>
+    For the JR1980206 role, the team likely <em>builds</em> what goes inside NIM — profiling models,
+    finding optimal configurations, ensuring peak performance on new hardware. You would be upstream of NIM.
+</p>
+
+<h2>9. Performance Metrics for LLM Serving</h2>
+
+<p>
+    This is the language Habert will use. Know these cold:
+</p>
+
+<table>
+    <thead>
+    <tr><th>Metric</th><th>Definition</th><th>What It Measures</th><th>Optimization Lever</th></tr>
+    </thead>
+    <tbody>
+    <tr>
+        <td><strong>TTFT</strong></td>
+        <td>Time To First Token</td>
+        <td>Prefill latency (prompt processing)</td>
+        <td>Parallelism, FlashAttention, FP8 compute</td>
+    </tr>
+    <tr>
+        <td><strong>TPS (or TPOT)</strong></td>
+        <td>Tokens Per Second (Time Per Output Token)</td>
+        <td>Decode speed per request</td>
+        <td>Quantization, speculative decoding, bandwidth</td>
+    </tr>
+    <tr>
+        <td><strong>Throughput</strong></td>
+        <td>Total tokens/sec across all requests</td>
+        <td>System-level efficiency</td>
+        <td>Batching, KV-cache mgmt, scheduling</td>
+    </tr>
+    <tr>
+        <td><strong>P99 latency</strong></td>
+        <td>99th percentile end-to-end response time</td>
+        <td>Tail latency (worst case)</td>
+        <td>Preemption policy, load balancing</td>
+    </tr>
+    <tr>
+        <td><strong>MBU</strong></td>
+        <td>Memory Bandwidth Utilization</td>
+        <td>% of theoretical peak HBM bandwidth used</td>
+        <td>Kernel fusion, memory access patterns</td>
+    </tr>
+    <tr>
+        <td><strong>MFU</strong></td>
+        <td>Model FLOPs Utilization</td>
+        <td>% of theoretical peak FLOPS achieved</td>
+        <td>Batch size, compute overlap</td>
+    </tr>
+    </tbody>
+</table>
+
+<div class="concept-box">
+    <h4>The Throughput–Latency Trade-off</h4>
+    <p>
+        Larger batch sizes improve throughput (more tokens/sec total) but increase per-request latency
+        (each request gets less bandwidth share). This is the fundamental tension in LLM serving:
+    </p>
+    <ul>
+        <li><strong>Interactive (chat)</strong>: Optimize for TTFT < 500ms and TPS > 30 (human reading speed).
+            Batch size limited.</li>
+        <li><strong>Batch processing (summarization, classification)</strong>: Maximize throughput.
+            Latency can be seconds. Pack as many requests as GPU memory allows.</li>
+    </ul>
+    <p>
+        The scheduler must balance these — this is where the engineering complexity lives.
+    </p>
+</div>
+
+<h2>10. Structured Sparsity (2:4)</h2>
+
+<p>
+    Hopper and Blackwell Tensor Cores support <strong>2:4 structured sparsity</strong>: in every group of
+    4 consecutive weights, exactly 2 must be zero. The hardware skips zero computations, giving 2× speedup
+    with zero software overhead at inference time.
+</p>
+
+<pre><code># 2:4 sparsity pattern:
+# Original weights: [0.3, 0.1, -0.7, 0.2, 0.5, -0.1, 0.4, 0.8]
+# After pruning:    [0.3, 0.0, -0.7, 0.0, 0.5,  0.0, 0.4, 0.8]
+#                    ^^^       ^^^^        ^^^        ^^^  ^^^
+#                    (2 nonzero per group of 4)
+
+# The sparse format stores:
+# 1. Compressed values (only non-zeros): [0.3, -0.7, 0.5, 0.4, 0.8]
+# 2. A 2-bit index metadata (which 2 of 4 positions are non-zero)
+
+# Tensor Core sparse GEMM:
+# - Loads compressed weight matrix (50% size)
+# - Hardware decompresses on-the-fly using metadata
+# - Compute at 2× the dense FLOPS rate
+
+# Accuracy: typically <1% degradation after fine-tuning
+# The pruning decision (which 2 to keep) is made by magnitude
+# Requires a brief fine-tuning phase after pruning to recover accuracy</code></pre>
+
+<div class="bridge">
+    <strong>Connection</strong>: This is model compression you're familiar with from VitisAI/FPGA work —
+    but with hardware-native support. No custom kernels needed; the Tensor Cores handle decompression.
+    Combinable with quantization: FP8 sparse = 4× effective compression vs FP16 dense.
+</div>
+
+<h2>11. FlashAttention and Kernel-Level Optimizations</h2>
+
+<p>
+    <a href="https://arxiv.org/abs/2205.14135">FlashAttention</a> (Dao et al., 2022) is the most impactful
+    single kernel optimization for transformers. You should understand it at the systems level:
+</p>
+
+<pre><code># Standard attention (naive):
+# 1. S = Q @ K^T         → materialized: (seq × seq) matrix in HBM
+# 2. P = softmax(S)      → read S from HBM, write P to HBM
+# 3. O = P @ V           → read P from HBM
+
+# Memory: O(seq²) for the attention matrix
+# Bandwidth: 3 HBM round-trips for the (seq × seq) matrix
+
+# FlashAttention:
+# Never materializes the full (seq × seq) matrix
+# Processes attention in tiles that fit in SRAM (shared memory)
+# Fuses Q@K^T, softmax, and @V into a single kernel
+# Uses online softmax (numerically stable running computation)
+
+# Memory: O(seq) — only stores output and running softmax stats
+# Bandwidth: 1 HBM pass (reads Q, K, V once, writes O once)
+# Speedup: 2-4× for long sequences, enables 128k+ context
+
+# TensorRT-LLM uses FlashAttention-2/3 variants:
+# - FlashAttention-3 (Hopper): exploits async copy (TMA), FP8 attention
+# - Paged FlashAttention: combines paged KV-cache with flash kernel</code></pre>
+
+<div class="concept-box">
+    <h4>Why FlashAttention Matters for the Job</h4>
+    FlashAttention is a <strong>perfect example</strong> of what the JR1980206 team does: taking a
+    mathematically equivalent computation and rewriting it as a custom kernel that exploits hardware
+    memory hierarchy (SRAM vs HBM). Your CUDA kernel experience (tiled inference, shared memory usage)
+    gives you the foundation to understand — and potentially contribute to — these optimizations.
+</div>
+
+<h2>12. Putting It All Together: An Optimization Decision Tree</h2>
+
+<pre><code>┌─── Is decode latency (TPS) the bottleneck? ───┐
+│                                                  │
+│  YES                                    NO (TTFT is bottleneck)
+│  ↓                                          ↓
+│  Memory-bandwidth bound              Compute-bound (prefill)
+│  ↓                                          ↓
+│  ┌──────────────────────┐            ┌──────────────────────┐
+│  │ Reduce bytes loaded: │            │ Reduce FLOPs:        │
+│  │ • FP8/FP4 weights    │            │ • FP8 compute        │
+│  │ • INT4 (AWQ/GPTQ)    │            │ • 2:4 sparsity       │
+│  │ • KV-cache quant     │            │ • Shorter context    │
+│  │ • 2:4 sparsity       │            │ • FlashAttention     │
+│  │                       │            │                      │
+│  │ Reduce decode steps:  │            │ Increase parallelism:│
+│  │ • Speculative decode  │            │ • Tensor parallelism │
+│  │ • Multi-token pred.   │            │ • Context parallelism│
+│  │                       │            │                      │
+│  │ Reduce overhead:      │            │                      │
+│  │ • CUDA Graphs         │            │                      │
+│  │ • Kernel fusion       │            │                      │
+│  └──────────────────────┘            └──────────────────────┘
+│
+├─── Is throughput (total tokens/sec) the bottleneck? ───┐
+│                                                          │
+│  ↓                                                       │
+│  ┌──────────────────────────────────────────────┐        │
+│  │ Serve more requests concurrently:             │        │
+│  │ • In-flight batching (maximize batch size)    │        │
+│  │ • Paged attention (reduce memory waste)       │        │
+│  │ • KV-cache quantization (fit more requests)   │        │
+│  │ • Prefix caching (share KV across requests)   │        │
+│  │ • Model quantization (smaller model = more    │        │
+│  │   memory for KV-cache = larger batches)       │        │
+│  └──────────────────────────────────────────────┘        │
+└──────────────────────────────────────────────────────────┘</code></pre>
+
+<h2>13. What's New in 2025–2026 (What Habert Will Likely Cover)</h2>
+
+<p>Beyond the fundamentals above, here are the frontier topics she may touch:</p>
+
+<ul>
+    <li><strong>FP4 on Blackwell</strong>: Native 4-bit floating point on B100/B200. 2× throughput vs FP8.
+        Early results show minimal accuracy loss for inference when combined with fine-grained scaling.
+        Still research-stage for activations; weights-only FP4 is production-ready.</li>
+    <li><strong>Disaggregated serving</strong>: Separate prefill and decode onto different GPU pools.
+        Prefill GPUs are compute-optimized (high batch, high FLOPS). Decode GPUs are bandwidth-optimized
+        (high HBM bandwidth, lower compute). Reduces cost by right-sizing hardware per phase.</li>
+    <li><strong>Multi-token prediction</strong>: Models trained to predict multiple future tokens simultaneously
+        (Meta's approach in Llama-3). Enables ~2× decode speedup without a separate draft model.</li>
+    <li><strong>KV-cache compression beyond quantization</strong>: Evicting old tokens (attention sinks),
+        merging similar KV entries, learned compression. Active research for million-token context.</li>
+    <li><strong>Mixture-of-Experts (MoE) inference</strong>: Only 2 of 8 experts activated per token,
+        but all expert weights must reside in memory. Expert offloading, expert caching, and expert
+        parallelism are hot topics.</li>
+</ul>
+
+<h2>14. Signal Questions for This Talk</h2>
+
+<div class="question-box">
+    <p class="question">
+        "You showed the throughput–latency trade-off in LLM serving. I'm curious about the profiling
+        methodology: when you're characterizing a new model on new hardware — say, a MoE model on Blackwell —
+        what's your process for identifying whether the bottleneck is memory bandwidth, compute, or
+        the scheduling overhead? Do you have internal tooling that gives you roofline-style analysis
+        specifically for the decode phase?"
+    </p>
+    <p class="rationale">
+        <strong>Why this works</strong>: This is the exact question someone in JR1980206 would ask on day one.
+        It signals (1) you think in terms of roofline models and bottleneck analysis, (2) you know the decode
+        phase is bandwidth-bound (not compute-bound), (3) you're implicitly asking "what tools would I use
+        if I joined your team?" — which invites the speaker to describe the internal workflow. It's also
+        flattering: you're asking about <em>their</em> methodology.
+    </p>
+</div>
+
+<div class="question-box">
+    <p class="question">
+        "With FP4 on Blackwell, the weight loading cost drops by 4× compared to FP16, which should push
+        decode closer to compute-bound territory — at least for reasonable batch sizes. Does that change the
+        optimization strategy? Specifically, does speculative decoding become less beneficial when the
+        decode phase is no longer purely bandwidth-limited?"
+    </p>
+    <p class="rationale">
+        <strong>Why this works</strong>: This shows you understand the <em>second-order effects</em> of
+        quantization — not just "makes it faster" but how it shifts the bottleneck and potentially
+        invalidates other optimizations. It demonstrates systems thinking: you're reasoning about how
+        changes propagate through the stack. This is exactly the kind of analysis the Performance SW
+        Engineering team does.
+    </p>
+</div>
+
+<div class="question-box">
+    <p class="question">
+        "In-flight batching changes the active batch size every iteration, which conflicts with CUDA Graphs
+        that require static shapes. How does TensorRT-LLM handle this in practice — do you maintain a pool
+        of pre-captured graphs for different batch sizes and switch between them? And if so, what's the
+        graph switching overhead relative to the decode step time?"
+    </p>
+    <p class="rationale">
+        <strong>Why this works</strong>: This is a very specific systems question that shows you understand
+        both CUDA Graphs (a technology the job listing mentions as "Graph Compilation") and the scheduling
+        complexities of LLM serving. The speaker will either confirm the graph-pool approach or describe
+        something more sophisticated — either way, you've demonstrated you're thinking at the right level
+        of abstraction for this role.
+    </p>
+</div>
+
+<div class="question-box">
+    <p class="question">
+        "For KV-cache quantization to INT8 or FP8 — how do you handle the accuracy degradation for
+        long-context tasks where early tokens in the KV-cache accumulate quantization error across many
+        attention layers? Do you see different behavior for attention-heavy layers vs. later layers?"
+    </p>
+    <p class="rationale">
+        <strong>Why this works</strong>: KV-cache quantization is frontier (not yet standard in all deployments).
+        This question shows you're thinking about failure modes — not just "does it work?" but "where does it
+        break?" The layer-specific angle connects to your understanding of how errors propagate through deep
+        networks (from your model compression work at Fraunhofer).
+    </p>
+</div>
+
+<h2>15. Corridor Conversation Anchors</h2>
+
+<ul>
+    <li><em>"I work on profiling and benchmarking distributed training pipelines at Fraunhofer — measuring
+        scaling efficiency, memory utilization, throughput per GPU. I'd love to understand how your team
+        approaches the same problem for inference. Is it primarily Nsight Systems traces, or do you have
+        higher-level tooling that maps directly to the LLM metrics like TTFT and TPS?"</em></li>
+    <li><em>"I noticed the Performance SW Engineer role mentions graph compilation as a new feature.
+        Is that team focused specifically on CUDA Graphs for inference, or does it extend to torch.compile
+        and the broader graph capture story for training as well?"</em></li>
+    <li><em>"I've deployed quantized models to FPGAs via VitisAI and profiled the accuracy-latency trade-offs
+        across 11 CNN architectures. I imagine the quantization story for LLMs is more complex because of
+        the outlier activations. How much of the AWQ/SmoothQuant pipeline is automated in ModelOpt today
+        vs. requiring manual tuning?"</em></li>
+</ul>
+
+<h2>16. Primary Source Recommendation</h2>
+
+<p>
+    <strong>Read before the workshop</strong>:
+    <a href="https://nvidia.github.io/TensorRT-LLM/overview.html">TensorRT-LLM Architecture Overview</a>
+    — the official docs page explaining the executor, runtime, and how the pieces fit together.
+    15-minute read that will make every term in Habert's talk click immediately.
+</p>
+
+<p>
+    <strong>If you have more time</strong>:
+    <a href="https://arxiv.org/abs/2309.06180">Efficient Memory Management for LLM Serving with PagedAttention</a>
+    (Kwon et al., 2023) — the vLLM paper. Sections 1–4 give you the full picture of why memory management
+    is the key problem in LLM serving.
+</p>
+
+<p>
+    <strong>For the job specifically</strong>:
+    <a href="https://developer.nvidia.com/blog/nvidia-tensorrt-llm-supercharges-large-language-model-inference-on-nvidia-h100-gpus/">NVIDIA Blog: TensorRT-LLM on H100</a>
+    — gives you NVIDIA's framing and the benchmarks they care about. Notice how they present results
+    (tokens/sec, latency at various batch sizes). This is the language you should speak.
+</p>

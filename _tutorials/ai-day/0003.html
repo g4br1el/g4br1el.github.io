@@ -1,0 +1,850 @@
+---
+layout: tutorial
+tutorial: ai-day
+type: lesson
+lesson: 3
+total: 5
+title: "Physical AI and World Foundation Models"
+tags: [World Models]
+permalink: /heap/ai-day/003/
+---
+
+
+
+<h2>1. Context: Why NVIDIA Bets on Physical AI</h2>
+
+<p>
+    Jensen Huang has framed <strong>Physical AI</strong> as NVIDIA's next trillion-dollar opportunity — the
+    thesis that AI will move from generating text and images (digital world) to perceiving, predicting,
+    and acting in the <em>physical</em> world. This means robots, autonomous vehicles, industrial automation,
+    and any system that must understand physics.
+</p>
+
+<p>
+    The business logic is straightforward: LLMs need GPUs for training and inference. Physical AI needs GPUs for
+    training, inference, <em>and simulation</em>. Every robot trained in simulation requires millions of
+    GPU-hours of rendered environments. NVIDIA sells the entire stack: simulation platform (Omniverse),
+    world models (Cosmos), robot foundation models (GR00T), and the hardware they all run on.
+</p>
+
+<div class="bridge">
+    <strong>Why this matters for your candidacy</strong>: The JR1980206 role says "implement DL models
+    from multiple data domains." Physical AI is a domain NVIDIA is scaling aggressively — showing you
+    understand it signals that you're not just a narrow inference optimizer but someone who can work
+    across the company's strategic priorities. Moreover, world model training is a <em>massive</em>
+    HPC workload — video generation models are 10–100× more compute-intensive than LLMs. Your distributed
+    training and profiling expertise applies directly.
+</div>
+
+<h2>2. What Is Physical AI?</h2>
+
+<p>
+    Physical AI refers to AI systems that interact with the physical world through perception and action.
+    Unlike an LLM (inputs: text tokens, outputs: text tokens), a Physical AI system:
+</p>
+
+<ul>
+    <li><strong>Perceives</strong> the world through sensors (cameras, LiDAR, IMUs, tactile sensors)</li>
+    <li><strong>Understands</strong> physics — objects have mass, gravity exists, collisions happen</li>
+    <li><strong>Predicts</strong> future states — "if I push this cup, it will fall off the table"</li>
+    <li><strong>Acts</strong> through actuators (robot arms, wheels, legs) to achieve goals</li>
+</ul>
+
+<p>
+    The fundamental challenge: you cannot train these systems the way you train LLMs. An LLM trains on
+    15 trillion tokens scraped from the internet. A robot cannot crash into walls 15 trillion times in the
+    real world — it's too slow, expensive, and dangerous. The solution is <strong>simulation</strong>:
+    train in a virtual world, deploy in the real world.
+</p>
+
+<div class="concept-box">
+    <h4>The Three Pillars of Physical AI (NVIDIA's Framing)</h4>
+    <ol>
+        <li><strong>World Foundation Models</strong> — Models that understand and predict the physical world
+            (Cosmos). The "brain" that learns physics.</li>
+        <li><strong>Simulation</strong> — GPU-accelerated virtual environments for training and testing
+            (Omniverse, Isaac Sim). The "gym" where robots practice.</li>
+        <li><strong>Robot Foundation Models</strong> — General-purpose models that control robot bodies
+            (GR00T). The "motor cortex" that translates intent to action.</li>
+    </ol>
+</div>
+
+<h2>3. World Foundation Models (Cosmos)</h2>
+
+<h3>3.1 What Is a World Model?</h3>
+
+<p>
+    A <strong>world model</strong> is a neural network that predicts future states of a physical environment
+    given past observations and (optionally) actions. Formally:
+</p>
+
+<pre><code># World model prediction:
+# Given: past observations o₁, ..., oₜ and action aₜ
+# Predict: future observation oₜ₊₁ (or distribution over futures)
+
+# In practice for video-based world models:
+# Input: sequence of video frames + conditioning (text, action, camera pose)
+# Output: predicted future video frames
+
+# This is fundamentally a video generation problem conditioned on actions/physics</code></pre>
+
+<p>
+    The key insight: a world model that can accurately predict what happens next in a video
+    <em>must</em> have learned something about physics — object permanence, gravity, collisions,
+    fluid dynamics, lighting. It's an implicit physics simulator learned from data.
+</p>
+
+<h3>3.2 NVIDIA Cosmos</h3>
+
+<p>
+    <a href="https://arxiv.org/abs/2501.03575">Cosmos</a> (NVIDIA, January 2025) is NVIDIA's world
+    foundation model platform. It's not a single model — it's a family of models and tools:
+</p>
+
+<table>
+    <thead>
+    <tr><th>Component</th><th>What It Does</th><th>Architecture</th></tr>
+    </thead>
+    <tbody>
+    <tr>
+        <td><strong>Cosmos Tokenizers</strong></td>
+        <td>Compress video into discrete/continuous tokens for efficient processing</td>
+        <td>Encoder-decoder (like VQVAE but for video). Spatial + temporal compression.</td>
+    </tr>
+    <tr>
+        <td><strong>Cosmos Diffusion Models</strong></td>
+        <td>Generate future video frames via iterative denoising</td>
+        <td>Diffusion transformer (DiT) architecture. Text/action-conditioned.</td>
+    </tr>
+    <tr>
+        <td><strong>Cosmos Autoregressive Models</strong></td>
+        <td>Predict next video tokens autoregressively (like an LLM but for video)</td>
+        <td>GPT-style transformer over video tokens. Supports long-horizon prediction.</td>
+    </tr>
+    <tr>
+        <td><strong>Cosmos Guardrails</strong></td>
+        <td>Safety filtering for generated content (pre- and post-generation)</td>
+        <td>Classifier-based content filtering pipelines</td>
+    </tr>
+    <tr>
+        <td><strong>Cosmos Transfer</strong></td>
+        <td>Fine-tune world models for specific domains (driving, manipulation, etc.)</td>
+        <td>LoRA / full fine-tuning recipes for domain adaptation</td>
+    </tr>
+    </tbody>
+</table>
+
+<h3>3.3 Architecture: How Cosmos Works</h3>
+
+<pre><code>┌─────────────────────────────────────────────────────────────────────────┐
+│                       COSMOS PIPELINE                                     │
+│                                                                          │
+│  ┌────────────┐     ┌──────────────────┐     ┌────────────────────────┐ │
+│  │ Raw Video  │────▶│ Cosmos Tokenizer │────▶│ Latent Video Tokens    │ │
+│  │ (pixels)   │     │ (encoder)         │     │ (compressed repr.)     │ │
+│  └────────────┘     └──────────────────┘     └───────────┬────────────┘ │
+│                                                           │              │
+│                                              ┌────────────▼────────────┐ │
+│                                              │  World Foundation Model  │ │
+│                                              │  (Diffusion or AR)       │ │
+│  ┌──────────────────┐                        │                          │ │
+│  │ Conditioning:     │───────────────────────▶│  Predicts future tokens │ │
+│  │ • Text prompt     │                        │  conditioned on past    │ │
+│  │ • Robot action    │                        │  + conditioning         │ │
+│  │ • Camera pose     │                        │                          │ │
+│  │ • Physics params  │                        └────────────┬────────────┘ │
+│  └──────────────────┘                                      │              │
+│                                                            │              │
+│                      ┌──────────────────┐     ┌────────────▼────────────┐ │
+│                      │ Decoded Video    │◀────│ Cosmos Tokenizer        │ │
+│                      │ (future frames)  │     │ (decoder)               │ │
+│                      └──────────────────┘     └─────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────────────┘</code></pre>
+
+<h3>3.4 Video Tokenization (The Key Innovation)</h3>
+
+<p>
+    Just as LLMs tokenize text (BPE → vocabulary of 128k tokens), world models tokenize video.
+    But video is vastly more data-dense: a 10-second 720p video at 24 fps = 720×1280×3×240 frames
+    ≈ 665 million values. You cannot feed this directly into a transformer.
+</p>
+
+<pre><code># Cosmos Tokenizer compression ratios:
+# Spatial compression: 8×8 (each 8×8 pixel patch → 1 token)
+# Temporal compression: 8× (8 consecutive frames → 1 temporal token)
+# Total compression: 8 × 8 × 8 = 512× reduction
+
+# So 240 frames of 720×1280 video becomes:
+# Spatial: (720/8) × (1280/8) = 90 × 160 = 14,400 spatial positions
+# Temporal: 240/8 = 30 time steps
+# Total tokens: 14,400 × 30 = 432,000 tokens
+
+# Compare to LLM context: GPT-4 handles ~128k text tokens
+# World models need to handle 400k+ video tokens
+# → This is why world model training is 10-100× more expensive than LLM training</code></pre>
+
+<div class="concept-box">
+    <h4>Two Approaches to Video Generation</h4>
+    <p>Cosmos offers both, and the speaker will likely contrast them:</p>
+    <ul>
+        <li><strong>Diffusion models</strong>: Start from noise, iteratively denoise toward a target video.
+            Higher visual quality, but slow generation (many denoising steps). Architecture: DiT
+            (Diffusion Transformer) — same family as Stable Diffusion 3, Sora, Movie Gen.
+            Good for: high-fidelity synthetic data generation, visual quality-critical applications.</li>
+        <li><strong>Autoregressive models</strong>: Predict next video token given previous tokens (like an LLM).
+            Faster generation (single pass per token), naturally handles variable-length sequences.
+            Better for: real-time prediction, action-conditioned generation, long-horizon planning.
+            Worse for: visual quality (accumulates errors over long sequences).</li>
+    </ul>
+    <p>
+        The industry trend (2025–2026) is <strong>hybrid approaches</strong>: autoregressive for structure/planning,
+        diffusion for visual refinement. Cosmos supports both and allows combining them.
+    </p>
+</div>
+
+<div class="bridge">
+    <strong>Connection to your experience</strong>: Video tokenization is essentially learned
+    compression — your PhD was literally about "Algorithmic Information Theory in Spatial ML"
+    and one of your papers is "Compression Supports Spatial Deep Learning" (JSTARS 2023). The idea
+    of compressing spatial-temporal data into a compact representation before processing is something
+    you've published on. When the speaker discusses Cosmos Tokenizers, you can connect it to your
+    work on how compression affects downstream ML performance.
+</div>
+
+<h3>3.5 Training Cosmos Models</h3>
+
+<p>
+    Cosmos models are trained on massive video datasets:
+</p>
+
+<ul>
+    <li><strong>Data</strong>: 20M+ hours of video (driving, robotics, general internet video, synthetic).
+        NVIDIA curated this using their own filtering pipeline (similar to NeMo Data Curator for text).</li>
+    <li><strong>Scale</strong>: Cosmos models range from 4B to 14B+ parameters. The largest are comparable
+        to medium LLMs but operating on much higher-dimensional data (video tokens).</li>
+    <li><strong>Compute</strong>: Training a Cosmos-scale model requires thousands of GPUs for weeks.
+        The video data pipeline (decoding, tokenizing, batching variable-length clips) is itself a
+        major engineering challenge — far harder than text data loading.</li>
+    <li><strong>Multi-modal conditioning</strong>: Models are trained with various conditioning signals
+        (text captions, camera poses, action labels) to enable controllable generation at inference time.</li>
+</ul>
+
+<div class="bridge">
+    <strong>HPC connection</strong>: Training world models is one of the most demanding HPC workloads that
+    exists — more so than LLM training because video data is 100–1000× larger per sample than text.
+    The data pipeline alone requires GPU-accelerated video decoding (NVIDIA DALI — which you already use),
+    on-the-fly tokenization, and careful batching of variable-length sequences. Your profiling and
+    distributed training infrastructure work at Fraunhofer directly transfers to understanding
+    (and optimizing) these workloads.
+</div>
+
+<h2>4. Use Cases: What World Models Enable</h2>
+
+<p>
+    The speaker will likely walk through applications. Here's the landscape:
+</p>
+
+<table>
+    <thead>
+    <tr><th>Domain</th><th>What the World Model Does</th><th>NVIDIA Product</th></tr>
+    </thead>
+    <tbody>
+    <tr>
+        <td><strong>Autonomous Driving</strong></td>
+        <td>Predicts future traffic scenes conditioned on ego-vehicle actions. Generates synthetic driving scenarios for testing.</td>
+        <td>Cosmos + NVIDIA DRIVE Sim</td>
+    </tr>
+    <tr>
+        <td><strong>Humanoid Robotics</strong></td>
+        <td>Predicts consequences of robot actions before executing them. Enables "mental rehearsal" for manipulation tasks.</td>
+        <td>Cosmos + GR00T + Isaac Sim</td>
+    </tr>
+    <tr>
+        <td><strong>Industrial Automation</strong></td>
+        <td>Simulates factory floor changes, predicts equipment failures, generates training data for inspection systems.</td>
+        <td>Cosmos + Omniverse Digital Twins</td>
+    </tr>
+    <tr>
+        <td><strong>Synthetic Data Generation</strong></td>
+        <td>Generates photorealistic training data for perception models without real-world data collection.</td>
+        <td>Cosmos + Omniverse Replicator</td>
+    </tr>
+    <tr>
+        <td><strong>Embodied AI Research</strong></td>
+        <td>Provides a learned physics prior for RL agents — the agent can "imagine" outcomes before trying them.</td>
+        <td>Cosmos (open-weight models)</td>
+    </tr>
+    </tbody>
+</table>
+
+<div class="concept-box">
+    <h4>World Models as "Imagination" for Robots</h4>
+    <p>
+        The most powerful use case is <strong>model-based reinforcement learning</strong>: instead of a robot
+        trying millions of actions in the real world (or even in a physics simulator), it can use the world
+        model to "imagine" outcomes:
+    </p>
+    <ol>
+        <li>Robot considers action A (reach for cup from the left)</li>
+        <li>World model predicts: "cup gets knocked over" (from learned physics)</li>
+        <li>Robot considers action B (reach from above)</li>
+        <li>World model predicts: "cup is grasped successfully"</li>
+        <li>Robot executes action B in reality</li>
+    </ol>
+    <p>
+        This "mental simulation" is orders of magnitude faster than physics simulation because it's a
+        neural network forward pass, not a PDE solver. But it's approximate — the world model can hallucinate
+        physically impossible outcomes. This accuracy-speed trade-off is the central research challenge.
+    </p>
+</div>
+
+<h2>5. The Simulation Stack: Omniverse and Isaac Sim</h2>
+
+<h3>5.1 Omniverse</h3>
+
+<p>
+    <strong>Omniverse</strong> is NVIDIA's platform for building and connecting 3D simulation environments.
+    Think of it as the "operating system" for 3D worlds:
+</p>
+
+<ul>
+    <li><strong>USD (Universal Scene Description)</strong>: The file format/API for 3D scenes. Originally
+        developed by Pixar for film production. NVIDIA adopted it as the lingua franca for simulation.
+        Every object, material, physics property, and animation is described in USD.</li>
+    <li><strong>RTX rendering</strong>: Real-time ray tracing for photorealistic visual output.
+        Uses the same GPU hardware you know (Tensor Cores for denoising, RT Cores for ray tracing).</li>
+    <li><strong>PhysX</strong>: GPU-accelerated physics simulation (rigid body, soft body, fluids, cloth).
+        Runs on CUDA — thousands of parallel physics environments on a single GPU.</li>
+    <li><strong>Connectors</strong>: Plugins that link Omniverse to external tools (ROS, Unreal Engine,
+        CAD software). Enables digital twin workflows where the simulation mirrors a real factory.</li>
+</ul>
+
+<h3>5.2 Isaac Sim</h3>
+
+<p>
+    <strong>Isaac Sim</strong> is the robotics-specific application built on Omniverse. It provides:
+</p>
+
+<ul>
+    <li><strong>Robot simulation</strong>: Import URDF/MJCF robot descriptions, simulate motors, joints,
+        contacts with PhysX.</li>
+    <li><strong>Sensor simulation</strong>: Synthetic cameras, LiDAR, IMU, tactile sensors — all with
+        physically accurate noise models.</li>
+    <li><strong>Domain randomization</strong>: Automatically vary textures, lighting, object positions,
+        physics parameters to make trained policies robust to real-world variation.</li>
+    <li><strong>Parallel environments</strong>: Run thousands of simulation instances simultaneously
+        on a single GPU (Isaac Gym / Isaac Lab). Essential for RL training where you need millions
+        of episodes.</li>
+    <li><strong>Synthetic data generation</strong>: Automatically generate labeled training data
+        (bounding boxes, segmentation masks, depth maps) for perception models.</li>
+</ul>
+
+<pre><code># Isaac Sim / Isaac Lab parallelism:
+# Single H100 GPU can simulate:
+# - 4,096 parallel robot environments (simple manipulation)
+# - 1,024 parallel environments (humanoid locomotion)
+# - 256 parallel environments (complex multi-object scenes)
+
+# Each environment runs independent physics
+# All environments share the same GPU memory for neural network inference
+# This is "environment parallelism" — similar to data parallelism in training
+
+# Training loop:
+# 1. All 4096 environments step in parallel (PhysX on GPU)
+# 2. Observations collected from all environments (already on GPU)
+# 3. Policy network does batched inference (batch_size=4096)
+# 4. Actions sent to all environments
+# 5. Repeat at ~1000+ steps/second (vs ~30 in real world)
+# → 4096 × 33× realtime = ~135,000× data collection speedup</code></pre>
+
+<div class="bridge">
+    <strong>HPC connection</strong>: Isaac Lab's parallel environment execution is fundamentally a GPU
+    computing problem — thousands of physics simulations sharing CUDA streams, memory management for
+    thousands of scene states, efficient batched inference. Your CUDA kernel experience and understanding
+    of GPU memory hierarchies is directly relevant to optimizing these workloads. The "profiling and
+    optimization" aspect of JR1980206 could easily include profiling Isaac Sim rendering/physics pipelines.
+</div>
+
+<h2>6. GR00T: Robot Foundation Model</h2>
+
+<h3>6.1 The Architecture</h3>
+
+<p>
+    <strong>GR00T</strong> (Generalist Robot 00 Technology) is NVIDIA's foundation model for humanoid robots.
+    It takes multimodal input and produces robot actions:
+</p>
+
+<pre><code>┌─────────────────────────────────────────────────────────────────┐
+│                        GR00T ARCHITECTURE                         │
+│                                                                   │
+│  Inputs:                              Outputs:                    │
+│  ┌─────────────────┐                  ┌──────────────────────┐   │
+│  │ Vision (cameras) │──┐              │ Joint positions/      │   │
+│  └─────────────────┘  │              │ velocities/torques    │   │
+│  ┌─────────────────┐  │  ┌────────┐  │ (per actuator,        │   │
+│  │ Language (task   │──┼─▶│ GR00T  │─▶│  per timestep)        │   │
+│  │ description)     │  │  │ Model  │  └──────────────────────┘   │
+│  └─────────────────┘  │  └────────┘                              │
+│  ┌─────────────────┐  │                                          │
+│  │ Proprioception   │──┘  Architecture:                          │
+│  │ (joint states,   │     • Vision encoder (pre-trained)         │
+│  │  IMU, force)     │     • Language encoder (pre-trained)        │
+│  └─────────────────┘     • Action decoder (transformer)          │
+│                           • Trained end-to-end in simulation      │
+│                                                                   │
+│  Training pipeline:                                               │
+│  Isaac Sim → demonstrations → imitation learning → RL fine-tune  │
+│  + Cosmos → synthetic video demonstrations → cross-embodiment    │
+└─────────────────────────────────────────────────────────────────┘</code></pre>
+
+<h3>6.2 The Sim-to-Real Pipeline</h3>
+
+<p>
+    The central engineering challenge of Physical AI: policies trained in simulation must work in the real
+    world. The gap between simulation and reality (the "sim-to-real gap") arises from:
+</p>
+
+<ul>
+    <li><strong>Visual gap</strong>: Rendered images don't perfectly match real camera images
+        (lighting, textures, sensor noise). Addressed by domain randomization and photorealistic rendering.</li>
+    <li><strong>Physics gap</strong>: Simulated contact, friction, and dynamics don't perfectly match
+        reality. Addressed by system identification (measuring real parameters) and randomizing physics
+        parameters during training.</li>
+    <li><strong>Embodiment gap</strong>: Simulated actuators respond perfectly to commands; real motors
+        have delay, backlash, and wear. Addressed by adding noise and delays in simulation.</li>
+</ul>
+
+<pre><code># Domain randomization example (Isaac Sim):
+# During training, randomly vary:
+randomize:
+  lighting:
+    intensity: [0.3, 2.0]      # 0.3× to 2× normal brightness
+    color_temperature: [3000, 8000]  # warm to cool
+    position: uniform_sphere(r=2m)
+  textures:
+    table: random_from(wood_textures, 50)
+    objects: random_from(material_library, 200)
+  physics:
+    friction: [0.3, 1.2]
+    mass_scale: [0.8, 1.2]     # ±20% mass variation
+    joint_damping: [0.9, 1.1]
+  camera:
+    position_noise: gaussian(σ=2cm)
+    orientation_noise: gaussian(σ=1°)
+    fov: [55°, 75°]
+
+# After training with this randomization, the policy has "seen"
+# a much wider distribution than reality — real world becomes
+# just another sample from the training distribution.</code></pre>
+
+<div class="concept-box">
+    <h4>World Models + Simulation = Complete Loop</h4>
+    <p>
+        The NVIDIA vision connects Cosmos and Isaac Sim in a virtuous cycle:
+    </p>
+    <ol>
+        <li><strong>Cosmos generates synthetic scenarios</strong> — diverse, physically plausible situations
+            the robot might encounter (using learned physics from video)</li>
+        <li><strong>Isaac Sim provides precise physics</strong> — exact contact forces, collision detection,
+            joint dynamics needed for policy training</li>
+        <li><strong>Together</strong>: Cosmos provides visual diversity and high-level scenario generation;
+            Isaac Sim provides physics accuracy for low-level control. Cosmos is fast but approximate;
+            Isaac Sim is precise but limited in visual diversity.</li>
+    </ol>
+</div>
+
+<h2>7. The Full Physical AI Stack (NVIDIA's View)</h2>
+
+<pre><code>┌─────────────────────────────────────────────────────────────────────────┐
+│                    NVIDIA PHYSICAL AI STACK                               │
+│                                                                          │
+│  Layer 4: Applications                                                   │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │ Autonomous Vehicles │ Humanoid Robots │ Industrial Automation │ ...│  │
+│  └────────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  Layer 3: Foundation Models                                              │
+│  ┌───────────────┐  ┌───────────────┐  ┌────────────────────────────┐  │
+│  │ Cosmos (World) │  │ GR00T (Robot) │  │ NVIDIA NIM (deployment)    │  │
+│  │ Perception &   │  │ Perception &  │  │ Optimized serving for       │  │
+│  │ Prediction     │  │ Action        │  │ edge/cloud                  │  │
+│  └───────────────┘  └───────────────┘  └────────────────────────────┘  │
+│                                                                          │
+│  Layer 2: Simulation & Training                                          │
+│  ┌───────────────┐  ┌───────────────┐  ┌────────────────────────────┐  │
+│  │ Isaac Sim/Lab  │  │ DRIVE Sim     │  │ NeMo + Megatron-LM         │  │
+│  │ (Robotics)     │  │ (AV)          │  │ (Foundation model training) │  │
+│  └───────────────┘  └───────────────┘  └────────────────────────────┘  │
+│                                                                          │
+│  Layer 1: Platform                                                       │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │ Omniverse (USD, RTX rendering, PhysX, connectors)                  │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  Layer 0: Hardware                                                       │
+│  ┌───────────────┐  ┌───────────────┐  ┌────────────────────────────┐  │
+│  │ DGX (training) │  │ AGX (edge)    │  │ IGX (industrial)           │  │
+│  │ H100/B200     │  │ Jetson Thor   │  │ Real-time certified        │  │
+│  └───────────────┘  └───────────────┘  └────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────┘</code></pre>
+
+<h3>7.1 Edge Deployment: Jetson Thor</h3>
+
+<p>
+    Robots can't run inference on a data center GPU. NVIDIA's <strong>Jetson Thor</strong> is a
+    system-on-chip designed for humanoid robots:
+</p>
+
+<ul>
+    <li>Blackwell GPU architecture (next-gen Tensor Cores)</li>
+    <li>~800 TOPS INT8 inference performance</li>
+    <li>Transformer Engine for on-device FP8 inference</li>
+    <li>Functional safety features (for industrial/autonomous use)</li>
+    <li>Power envelope: ~100W (suitable for battery-powered robots)</li>
+</ul>
+
+<div class="bridge">
+    <strong>Edge deployment connection</strong>: This is directly analogous to your VitisAI/FPGA work —
+    deploying quantized models to resource-constrained hardware with strict latency and power budgets.
+    The difference is scale: instead of deploying a single CNN to an FPGA, you're deploying a multimodal
+    transformer to Jetson Thor. But the workflow (quantize → profile → optimize → deploy) is the same.
+    TensorRT is the deployment engine on Jetson, which you already know.
+</div>
+
+<h2>8. The Research Frontier: Open Problems</h2>
+
+<p>
+    Physical AI is much less mature than LLMs. The speaker will likely acknowledge these challenges:
+</p>
+
+<h3>8.1 World Model Fidelity</h3>
+<ul>
+    <li><strong>Physics violations</strong>: World models can generate physically impossible outcomes
+        (objects passing through each other, gravity reversing). They learn statistical correlations
+        from video, not actual physics equations.</li>
+    <li><strong>Long-horizon drift</strong>: Prediction quality degrades over time. Predicting 1 second
+        ahead is good; 30 seconds ahead is hallucination. This limits planning horizon.</li>
+    <li><strong>Evaluation metrics</strong>: How do you measure if a world model is "good enough" for
+        downstream policy learning? FID/FVD (visual quality metrics) don't capture physics correctness.
+        This is an open research question.</li>
+</ul>
+
+<h3>8.2 Sim-to-Real Transfer</h3>
+<ul>
+    <li><strong>The long tail</strong>: Domain randomization handles common variations, but rare events
+        (unusual lighting, novel objects, unexpected human behavior) still cause failures.</li>
+    <li><strong>Contact-rich manipulation</strong>: Simulating precise contact (inserting a plug,
+        tying a knot) is extremely hard. Physics simulators struggle with deformable objects and
+        multi-contact scenarios.</li>
+    <li><strong>Reward specification</strong>: Defining what "success" means for complex tasks is itself
+        a research problem (reward hacking exists in physical RL too).</li>
+</ul>
+
+<h3>8.3 Data Challenges</h3>
+<ul>
+    <li><strong>Video data scale</strong>: Training Cosmos required 20M+ hours of video, but most of
+        it is internet video (not robot-specific). High-quality robot manipulation data is scarce
+        and expensive to collect.</li>
+    <li><strong>Cross-embodiment transfer</strong>: Can a world model trained on human hands manipulating
+        objects transfer to a robot gripper? Different morphology, different affordances.</li>
+    <li><strong>Action conditioning</strong>: Most internet video has no action labels. Learning
+        action-conditioned world models requires either labeled robot data or unsupervised action
+        discovery from video.</li>
+</ul>
+
+<div class="concept-box">
+    <h4>The Scaling Hypothesis for Physical AI</h4>
+    <p>
+        NVIDIA's bet (and the broader research community's) is that world models will follow the same
+        scaling laws as LLMs: more data + more compute = better physics understanding. The evidence
+        is preliminary but encouraging:
+    </p>
+    <ul>
+        <li>Sora (OpenAI, 2024) showed that scaling video diffusion models produces emergent physics
+            understanding (fluid dynamics, reflections, 3D consistency)</li>
+        <li>Cosmos shows improvement with model size on physics benchmarks</li>
+        <li>But: unlike text (where internet-scale data is effectively unlimited), high-quality
+            physics video data may have a ceiling</li>
+    </ul>
+    <p>
+        This is perhaps THE open question: is physical understanding an emergent property of scale,
+        or does it require inductive biases (explicit physics equations, structured representations)?
+    </p>
+</div>
+
+<h2>9. Competitive Landscape</h2>
+
+<p>
+    The speaker won't cover competitors, but knowing the landscape helps you ask informed questions:
+</p>
+
+<table>
+    <thead>
+    <tr><th>Company/Lab</th><th>World Model Effort</th><th>Differentiator</th></tr>
+    </thead>
+    <tbody>
+    <tr>
+        <td>NVIDIA</td>
+        <td>Cosmos</td>
+        <td>Full stack: model + simulation + hardware + deployment. Open-weight models.</td>
+    </tr>
+    <tr>
+        <td>OpenAI</td>
+        <td>Sora</td>
+        <td>Highest visual quality. But not open, not robotics-focused.</td>
+    </tr>
+    <tr>
+        <td>Google DeepMind</td>
+        <td>Genie 2, UniSim</td>
+        <td>Interactive world models (playable environments). Strong research.</td>
+    </tr>
+    <tr>
+        <td>Meta</td>
+        <td>V-JEPA, Meta Movie Gen</td>
+        <td>Self-supervised video understanding (JEPA architecture). Open research.</td>
+    </tr>
+    <tr>
+        <td>Tesla</td>
+        <td>FSD World Model</td>
+        <td>Largest real-world driving dataset (fleet data). Narrow domain.</td>
+    </tr>
+    <tr>
+        <td>1X / Figure / Unitree</td>
+        <td>Various</td>
+        <td>Robot companies building own world models for specific embodiments.</td>
+    </tr>
+    </tbody>
+</table>
+
+<p>
+    NVIDIA's advantage is unique: they don't compete with robot companies or AV companies — they sell
+    <em>to</em> them. Cosmos is the platform layer that all these companies might build on, just as
+    cuDNN is the layer all DL frameworks build on.
+</p>
+
+<h2>10. How This Connects to BayernKI and LRZ</h2>
+
+<p>
+    The first talk (14:10–14:30) introduces BayernKI and LRZ compute resources. This context matters:
+</p>
+
+<ul>
+    <li><strong>BayernKI</strong> is Bavaria's AI initiative, heavily invested in NVIDIA hardware.
+        LRZ (Leibniz Rechenzentrum) operates the SuperMUC-NG and upcoming JUICE (Jülich) systems.</li>
+    <li>Training world models is exactly the kind of workload that justifies national HPC investments —
+        thousands of GPUs for weeks.</li>
+    <li>If NVIDIA is presenting at an LRZ-affiliated event, they're likely positioning Cosmos/Isaac Sim
+        as workloads for BayernKI compute resources — "here's what you can build with our hardware."</li>
+</ul>
+
+<div class="bridge">
+    <strong>Your position</strong>: You already work on LRZ-class infrastructure (Slurm, multi-node,
+    NCCL). If you join the JR1980206 team, you'd be profiling and optimizing exactly these workloads
+    on exactly this class of hardware. Mentioning your familiarity with LRZ/BayernKI infrastructure
+    in corridor conversations with NVIDIA engineers signals you understand the ecosystem.
+</div>
+
+<h2>11. Signal Questions for This Talk</h2>
+
+<div class="question-box">
+    <p class="question">
+        "You showed how Cosmos generates future predictions conditioned on actions. My background is in
+        compression-based ML and spatial information theory — I'm curious about the tokenizer's compression
+        ratio. At 512× compression, what's the information bottleneck doing to the model's ability to
+        represent fine-grained physics — like the difference between a rigid object sliding versus a
+        deformable object deforming on contact? Is tokenizer fidelity currently the bottleneck for
+        physics accuracy, or is it the world model itself?"
+    </p>
+    <p class="rationale">
+        <strong>Why this works</strong>: It connects your PhD research (compression and ML) to NVIDIA's
+        newest product. It shows you understand information bottleneck theory and can apply it to a novel
+        domain. The question is genuinely open — even NVIDIA's researchers debate whether the tokenizer
+        or the world model is the accuracy bottleneck. It also invites a technical conversation where
+        your information-theoretic background becomes an asset.
+    </p>
+</div>
+
+<div class="question-box">
+    <p class="question">
+        "Training world models on video requires enormous data throughput — 20M hours of video is petabytes
+        of raw data. I work on data pipeline optimization for distributed training on HPC clusters.
+        What does the training data pipeline look like for Cosmos? Is video decoding and tokenization
+        done on-the-fly on GPU (like NVIDIA DALI), or are the tokens pre-computed and stored?
+        I'd expect the I/O pattern to be very different from text-based LLM training."
+    </p>
+    <p class="rationale">
+        <strong>Why this works</strong>: This is a systems/infrastructure question that (1) directly connects
+        to your DALI experience, (2) shows you think about practical training bottlenecks rather than just
+        the model architecture, and (3) is relevant to the JR1980206 role (profiling training workloads).
+        The speaker may not be a systems person and might defer — but that's fine, it opens a conversation
+        with other NVIDIA engineers present.
+    </p>
+</div>
+
+<div class="question-box">
+    <p class="question">
+        "You mentioned sim-to-real transfer. In my experience with deploying quantized models to edge
+        hardware, there's always a gap between development-time accuracy and deployment-time accuracy.
+        For Physical AI, you have a similar compounding: sim-to-real gap PLUS model compression gap
+        when deploying to Jetson Thor. How does NVIDIA handle this — do you do quantization-aware training
+        in simulation, or is the policy robust enough that post-training quantization doesn't significantly
+        affect control quality?"
+    </p>
+    <p class="rationale">
+        <strong>Why this works</strong>: This bridges Physical AI (the speaker's topic) with inference
+        optimization (Talk 2's topic) and your VitisAI/FPGA edge deployment experience. It demonstrates
+        systems thinking — you see the full pipeline from simulation to edge deployment. It's also a
+        very practical engineering question that shows you're thinking about productionizing this, not
+        just researching it.
+    </p>
+</div>
+
+<div class="question-box">
+    <p class="question">
+        "World models learn physics implicitly from video statistics, while Isaac Sim implements physics
+        explicitly via PhysX equations. Is there work on using the explicit simulator to validate or
+        constrain the world model's predictions — something like physics-informed neural networks but
+        for video generation? Or are these currently separate systems with no feedback loop between them?"
+    </p>
+    <p class="rationale">
+        <strong>Why this works</strong>: This is a research-depth question that shows you understand the
+        fundamental tension between learned and explicit physics. It's the kind of question a researcher
+        would ask, not an engineer — and it signals the kind of cross-domain thinking that NVIDIA values.
+        There's no clean answer yet, which makes it a good conversation starter.
+    </p>
+</div>
+
+<h2>12. Corridor Conversation Anchors</h2>
+
+<ul>
+    <li><em>"I work on data pipelines for distributed training at Fraunhofer — we use DALI and WebDataset
+        for image-heavy workloads on HPC clusters. I imagine video training data for Cosmos is a whole
+        different scale of I/O challenge. Is the bottleneck more on the storage side or the GPU decoding
+        side?"</em></li>
+    <li><em>"My PhD was on compression in spatial ML — essentially how information loss from compression
+        affects downstream ML tasks. The Cosmos tokenizer feels very related — it's making a lossy
+        compression decision that constrains everything downstream. Is there published work on the
+        rate-distortion trade-off for video tokenizers in world models?"</em></li>
+    <li><em>"I've deployed quantized CNNs to FPGAs for satellite onboard processing — the performance
+        envelope is similar to Jetson (low power, strict latency). Is the performance team also involved
+        in optimizing GR00T inference for Jetson Thor, or is that a different group?"</em>
+        (This directly asks about team scope for the role.)</li>
+    <li><em>"I'm very interested in the JR1980206 Performance Engineer role. Given that Physical AI
+        workloads are so different from LLMs — continuous control loops vs. autoregressive generation —
+        does the performance team specialize, or is it expected to profile across all these domains?"</em>
+        (This directly explores the role scope.)</li>
+</ul>
+
+<h2>13. Key Terminology Quick-Reference for This Talk</h2>
+
+<p>
+    Terms the speaker will likely use without defining. Know these cold:
+</p>
+
+<table>
+    <thead>
+    <tr><th>Term</th><th>What It Means</th><th>Don't Confuse With</th></tr>
+    </thead>
+    <tbody>
+    <tr>
+        <td>USD (Universal Scene Description)</td>
+        <td>3D scene format (Pixar-originated) used throughout Omniverse</td>
+        <td>US Dollars; USDA (USD ASCII format)</td>
+    </tr>
+    <tr>
+        <td>Digital Twin</td>
+        <td>A simulation that mirrors a real physical system in real-time</td>
+        <td>A static 3D model (digital twin is live/synchronized)</td>
+    </tr>
+    <tr>
+        <td>Embodiment</td>
+        <td>The physical form of a robot (its body, sensors, actuators)</td>
+        <td>Embodied AI (broader concept of AI in physical world)</td>
+    </tr>
+    <tr>
+        <td>Policy (in RL)</td>
+        <td>The neural network that maps observations → actions</td>
+        <td>LLM policy (in RLHF — same word, different domain)</td>
+    </tr>
+    <tr>
+        <td>Imitation Learning</td>
+        <td>Learning from expert demonstrations (supervised, no reward needed)</td>
+        <td>Reinforcement learning (trial-and-error with reward)</td>
+    </tr>
+    <tr>
+        <td>Zero-shot transfer</td>
+        <td>Deploying a sim-trained policy to real world without any real-world fine-tuning</td>
+        <td>Zero-shot in NLP (no examples in prompt)</td>
+    </tr>
+    <tr>
+        <td>DiT (Diffusion Transformer)</td>
+        <td>Transformer architecture for diffusion models (replaces U-Net)</td>
+        <td>ViT (Vision Transformer for classification)</td>
+    </tr>
+    </tbody>
+</table>
+
+<h2>14. The Strategic Narrative You Should Internalize</h2>
+
+<p>
+    When Jensen Huang or NVIDIA engineers talk about Physical AI, they tell a specific story.
+    Understanding this story lets you speak their language:
+</p>
+
+<blockquote>
+    "The next wave of AI will move from the digital world to the physical world. Just as LLMs need
+    language data and compute, Physical AI needs world data and simulation. NVIDIA provides the
+    complete platform: the GPU hardware for training, the Omniverse platform for simulation,
+    the Cosmos models for world understanding, and the Jetson hardware for deployment. Every
+    robot, every autonomous vehicle, every smart factory will need this stack. This is not a
+    product — it's an ecosystem."
+</blockquote>
+
+<p>
+    The implied message: NVIDIA's TAM (Total Addressable Market) expands from "companies training LLMs"
+    to "every company with physical operations." This is why Wall Street values NVIDIA's Physical AI
+    narrative — it justifies continued GPU demand growth even as LLM training saturates.
+</p>
+
+<h2>15. Primary Source Recommendation</h2>
+
+<p>
+    <strong>Read before the workshop</strong>:
+    <a href="https://arxiv.org/abs/2501.03575">Cosmos World Foundation Model Platform for Physical AI</a>
+    (NVIDIA, January 2025) — the technical report. Read Sections 1–3 (Introduction, Platform Overview,
+    Tokenizers). This gives you the vocabulary and architecture the speaker will reference directly.
+    ~30 minute read for those sections.
+</p>
+
+<p>
+    <strong>If you have more time</strong>:
+    <a href="https://blogs.nvidia.com/blog/what-is-physical-ai/">What Is Physical AI?</a> (NVIDIA Blog, 2025) —
+    Jensen's framing in accessible language. 10-minute read. Gives you the strategic narrative and
+    key talking points.
+</p>
+
+<p>
+    <strong>For deeper understanding</strong>:
+    <a href="https://arxiv.org/abs/2405.17109">Genie 2: A Large-Scale Foundation World Model</a>
+    (Google DeepMind, 2024) — alternative approach to world models. Reading this lets you compare
+    NVIDIA's Cosmos to DeepMind's Genie, which enables much sharper questions about design trade-offs.
+</p>
+
+<hr>
+
+<p style="font-size: 0.9rem; color: var(--muted); margin-top: 2rem;">
+    <strong>📝 Reminder</strong>: This is your greenfield topic — you're building understanding from scratch.
+    But you have three powerful bridges: (1) your PhD on compression/information theory connects to
+    video tokenization, (2) your HPC/data-pipeline experience connects to world model training infrastructure,
+    (3) your edge deployment experience connects to Jetson Thor deployment. Use these bridges in every
+    question and conversation — they prove you can contribute to Physical AI from day one.
+    <br><br>
+    Ask me anything that's unclear. This is also the last talk of the day — energy will be lower.
+    Having 1–2 questions prepared that you can deliver confidently will matter more here than in
+    earlier talks. Pick the one that feels most natural given your background.
+</p>
+
+<nav class="lesson-nav">
+    <a href="0002-inference-optimization-and-compression.html">← Lesson 2: Inference Optimization</a>
+    <span style="color: var(--muted);">(final lesson) →</span>
+</nav>
