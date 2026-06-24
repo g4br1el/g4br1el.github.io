@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FSDP2 Glossary — Gabriel Dax</title>
+  <!-- Begin Jekyll SEO tag v2.9.0 -->
+<meta name="generator" content="Jekyll v4.4.1" />
+<meta property="og:title" content="FSDP2 Glossary" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="Terminology for distributed training with PyTorch’s Fully Sharded Data Parallel (v2)." />
+<meta name="twitter:description" property="og:description" content="Terminology for distributed training with PyTorch’s Fully Sharded Data Parallel (v2)." />
+<link rel="canonical" href="https://www.gabrieldax.de/heap/fsdp2/glossary/" />
+<meta property="og:url" content="https://www.gabrieldax.de/heap/fsdp2/glossary/" />
+<meta property="og:site_name" content="Gabriel Dax — ML Research Engineer" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2026-06-24T07:37:12+00:00" />
+<meta property="article:modified_time" content="2026-06-24T07:37:12+00:00" />
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:title" content="FSDP2 Glossary" />
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"BlogPosting","dateModified":"2026-06-24T07:37:12+00:00","datePublished":"2026-06-24T07:37:12+00:00","description":"Terminology for distributed training with PyTorch’s Fully Sharded Data Parallel (v2).","headline":"FSDP2 Glossary","mainEntityOfPage":{"@type":"WebPage","@id":"https://www.gabrieldax.de/heap/fsdp2/glossary/"},"url":"https://www.gabrieldax.de/heap/fsdp2/glossary/"}</script>
+<!-- End Jekyll SEO tag -->
+
+  <meta content='text/html; charset=utf-8' http-equiv='Content-Type'>
+<meta http-equiv='X-UA-Compatible' content='IE=edge'>
+<meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0'>
+
+
+<meta property="og:description" content="Terminology for distributed training with PyTorch’s Fully Sharded Data Parallel (v2).
+" />
+
+<meta name="author" content="Gabriel Dax" />
+
+
+
+<meta property="og:title" content="FSDP2 Glossary" />
+<meta property="twitter:title" content="FSDP2 Glossary" />
+
+
+
+<meta property="og:image" content="https://www.gabrieldax.de/images/self.png"/>
+<meta property="twitter:image" content="https://www.gabrieldax.de/images/self.png"/>
+
+
+  <link rel="stylesheet" href="/assets/style.css">
+  <link rel="icon" type="image/png" sizes="32x32" href="/images/favicon.jpg">
+  <link rel="canonical" href="https://www.gabrieldax.de/heap/fsdp2/glossary/">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  
+
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div>
+      <a href="/" class="site-name">Gabriel Dax</a>
+      <span class="site-tagline">ML Research Engineer</span>
+    </div>
+    <nav>
+      <a href="/" >Home</a>
+      <a href="/projects" >Projects</a>
+      <a href="/publications" >Publications</a>
+      <a href="/bio" >CV</a>
+    </nav>
+  </div>
+</header>
+
+<main class="main-content">
+  <div class="container">
+    <div class="tutorial-wrapper">
+
+    <nav class="tutorial-breadcrumb">
+        <a href="/heap/">← All Tutorials</a>
+        
+        <span class="tutorial-position">Mission</span>
+        
+    </nav>
+
+    <article class="tutorial-article">
+        
+
+        <h1>FSDP2 Glossary</h1>
+
+        <p>Terminology for distributed training with PyTorch’s Fully Sharded Data Parallel (v2).</p>
+
+<h2 id="core-concepts">Core Concepts</h2>
+
+<p><strong>Model-proportional memory</strong>:
+GPU memory consumed by parameters, gradients, and optimizer states — everything that scales linearly with parameter count P, independent of batch size or sequence length.
+<em>Avoid</em>: model memory, weight memory</p>
+
+<p><strong>Sharding</strong>:
+Partitioning a tensor across multiple devices such that each device holds only a 1/N slice. Distinguished from replication, where each device holds a full copy.
+<em>Avoid</em>: splitting, distributing</p>
+
+<p><strong>FSDP unit</strong>:
+The granularity at which sharding is applied — defined by a single <code class="language-plaintext highlighter-rouge">fully_shard()</code> call on a module. Each unit is independently all-gathered and freed. Typically one transformer block.
+<em>Avoid</em>: shard group, wrap unit, FSDP layer</p>
+
+<p><strong>DTensor</strong>:
+A PyTorch tensor type that encodes distribution semantics (placement + mesh). Reports its global shape regardless of local shard size. The substrate of FSDP2 — every sharded parameter is a DTensor.
+<em>Avoid</em>: distributed tensor (ambiguous), sharded tensor (FSDP1 terminology)</p>
+
+<p><strong>DeviceMesh</strong>:
+A logical N-dimensional grid of devices that DTensors are distributed over. Encodes the topology: 1-D for flat sharding, 2-D for HSDP (one dim for sharding, one for replication).
+<em>Avoid</em>: process group (lower-level abstraction), device grid</p>
+
+<h2 id="placement-types">Placement Types</h2>
+
+<p><strong>Shard(dim)</strong>:
+DTensor placement indicating the tensor is partitioned along dimension <code class="language-plaintext highlighter-rouge">dim</code> across the mesh. Each rank holds 1/N of that dimension. Default FSDP2 rest state.
+<em>Avoid</em>: split, partitioned</p>
+
+<p><strong>Replicate()</strong>:
+DTensor placement indicating every rank holds the full tensor. Achieved via all-gather from Shard state. Active during compute in FSDP2.
+<em>Avoid</em>: broadcast, full copy</p>
+
+<p><strong>Partial(reduce_op)</strong>:
+DTensor placement indicating each rank holds a partial result (e.g., partial gradient sum from its micro-batch) that must be reduced. Precedes reduce-scatter in backward.
+<em>Avoid</em>: unreduced, partial sum</p>
+
+<h2 id="collective-operations">Collective Operations</h2>
+
+<p><strong>All-gather</strong>:
+Collective operation where each rank contributes its shard and all ranks receive the full concatenated tensor. In FSDP2, transitions a parameter from Shard → Replicate.
+<em>Avoid</em>: gather (which sends only to one root)</p>
+
+<p><strong>Reduce-scatter</strong>:
+Collective operation that reduces (sums) a tensor across ranks and scatters the result so each rank holds only its 1/N shard. In FSDP2, transitions a gradient from Partial → Shard.
+<em>Avoid</em>: scatter-reduce, partial reduce</p>
+
+<p><strong>All-reduce</strong>:
+Collective equivalent to reduce-scatter followed by all-gather. Each rank ends with the full reduced tensor. Used in HSDP’s replicate dimension and by DDP.
+<em>Avoid</em>: sync gradients</p>
+
+<h2 id="infrastructure">Infrastructure</h2>
+
+<p><strong>Rank</strong>:
+A single process in the distributed group, typically mapped 1:1 to a GPU.
+<em>Avoid</em>: worker, node (a node contains multiple ranks)</p>
+
+<p><strong>FlatParamHandle</strong> (deprecated):
+FSDP1’s internal mechanism that flattened all parameters in an FSDP unit into a single contiguous 1-D buffer for efficient communication. Eliminated in FSDP2 in favor of per-parameter DTensors.
+<em>Avoid</em>: Using this in new code — it’s FSDP1 only.</p>
+
+<p><strong>FSDPState</strong>:
+The internal state object created by <code class="language-plaintext highlighter-rouge">fully_shard()</code> that manages communication scheduling (prefetching), hook registration, and placement transitions for an FSDP unit.
+<em>Avoid</em>: FSDP handle, shard state</p>
+
+<p><strong>HSDP (Hybrid Sharded Data Parallel)</strong>:
+A 2-D strategy: shard within a fast communication domain (e.g., NVLink intra-node) and replicate across a slower domain (e.g., InfiniBand inter-node). Implemented via a 2-D DeviceMesh.
+<em>Avoid</em>: hybrid parallelism (too generic)</p>
+
+
+        
+    </article>
+
+</div>
+  </div>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <div class="footer-links">
+      <a href="https://github.com/g4br1el">GitHub</a>
+      <a href="https://www.linkedin.com/in/gadax">LinkedIn</a>
+      <a href="mailto:gdax.science@gmail.com">Email</a>
+      <a href="/files/CV-Gabriel_Dax.pdf">Resume ↓</a>
+    </div>
+    <p class="footer-copyright">© 2026 Gabriel Dax</p>
+  </div>
+</footer>
+
+
+
+</body>
+</html>

@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FSDP1 vs FSDP2: The Death of FlatParamHandle — Gabriel Dax</title>
+  <!-- Begin Jekyll SEO tag v2.9.0 -->
+<meta name="generator" content="Jekyll v4.4.1" />
+<meta property="og:title" content="FSDP1 vs FSDP2: The Death of FlatParamHandle" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="Understanding why PyTorch rewrote FSDP from scratch — and what the new substrate looks like." />
+<meta name="twitter:description" property="og:description" content="Understanding why PyTorch rewrote FSDP from scratch — and what the new substrate looks like." />
+<link rel="canonical" href="https://www.gabrieldax.de/heap/fsdp2/002/" />
+<meta property="og:url" content="https://www.gabrieldax.de/heap/fsdp2/002/" />
+<meta property="og:site_name" content="Gabriel Dax — ML Research Engineer" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2026-06-24T07:37:12+00:00" />
+<meta property="article:modified_time" content="2026-06-24T07:37:12+00:00" />
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:title" content="FSDP1 vs FSDP2: The Death of FlatParamHandle" />
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"BlogPosting","dateModified":"2026-06-24T07:37:12+00:00","datePublished":"2026-06-24T07:37:12+00:00","description":"Understanding why PyTorch rewrote FSDP from scratch — and what the new substrate looks like.","headline":"FSDP1 vs FSDP2: The Death of FlatParamHandle","mainEntityOfPage":{"@type":"WebPage","@id":"https://www.gabrieldax.de/heap/fsdp2/002/"},"url":"https://www.gabrieldax.de/heap/fsdp2/002/"}</script>
+<!-- End Jekyll SEO tag -->
+
+  <meta content='text/html; charset=utf-8' http-equiv='Content-Type'>
+<meta http-equiv='X-UA-Compatible' content='IE=edge'>
+<meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0'>
+
+
+<meta property="og:description" content="Understanding why PyTorch rewrote FSDP from scratch — and what the new substrate looks like." />
+
+<meta name="author" content="Gabriel Dax" />
+
+
+
+<meta property="og:title" content="FSDP1 vs FSDP2: The Death of FlatParamHandle" />
+<meta property="twitter:title" content="FSDP1 vs FSDP2: The Death of FlatParamHandle" />
+
+
+
+<meta property="og:image" content="https://www.gabrieldax.de/images/self.png"/>
+<meta property="twitter:image" content="https://www.gabrieldax.de/images/self.png"/>
+
+
+  <link rel="stylesheet" href="/assets/style.css">
+  <link rel="icon" type="image/png" sizes="32x32" href="/images/favicon.jpg">
+  <link rel="canonical" href="https://www.gabrieldax.de/heap/fsdp2/002/">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  
+
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div>
+      <a href="/" class="site-name">Gabriel Dax</a>
+      <span class="site-tagline">ML Research Engineer</span>
+    </div>
+    <nav>
+      <a href="/" >Home</a>
+      <a href="/projects" >Projects</a>
+      <a href="/publications" >Publications</a>
+      <a href="/bio" >CV</a>
+    </nav>
+  </div>
+</header>
+
+<main class="main-content">
+  <div class="container">
+    <div class="tutorial-wrapper">
+
+    <nav class="tutorial-breadcrumb">
+        <a href="/heap/">← All Tutorials</a>
+        
+        <span class="tutorial-position">Lesson 2 / 18</span>
+        
+    </nav>
+
+    <article class="tutorial-article">
+        
+        <div class="tutorial-lesson-header">
+            <span class="tutorial-tag">Lesson 002</span>
+            
+            <span class="tutorial-tag tutorial-tag--secondary">Foundations</span>
+            
+        </div>
+        
+
+        <h1>FSDP1 vs FSDP2: The Death of FlatParamHandle</h1>
+
+        <p><em>Understanding why PyTorch rewrote FSDP from scratch — and what the new substrate looks like.</em></p>
+
+<h2>FSDP1: The Wrapper Approach</h2>
+
+<p>FSDP1 (<code>torch.distributed.fsdp.FullyShardedDataParallel</code>, introduced PyTorch 1.11) works like DDP — it's a <strong>module wrapper</strong>:</p>
+
+<pre><code class="language-python"># FSDP1 — wrapping approach
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+model = ViTHuge()
+# Wraps the entire model (or individual submodules via auto_wrap_policy)
+model = FSDP(model, sharding_strategy=ShardingStrategy.FULL_SHARD)
+</code></pre>
+
+<p>Internally, FSDP1 uses <strong>FlatParamHandle</strong> — the core abstraction that caused most of its problems:</p>
+
+<div class="diagram">
+    FSDP1 Internal: FlatParamHandle
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    Original module parameters:
+    encoder.layer_0.attn.q_proj.weight   [1024 × 1024]
+    encoder.layer_0.attn.q_proj.bias     [1024]
+    encoder.layer_0.attn.k_proj.weight   [1024 × 1024]
+    encoder.layer_0.attn.k_proj.bias     [1024]
+    ...
+
+    FlatParamHandle flattens ALL of these into one contiguous 1-D tensor:
+    flat_param: [████████████████████████████████████████]  ← single allocation
+    ↑ q.weight   ↑ q.bias  ↑ k.weight  ↑ ...
+
+    Sharding slices this 1-D tensor across N ranks:
+    Rank 0: [████████████]
+    Rank 1: [████████████]
+    Rank 2: [████████████]
+    Rank 3: [████████████]
+</div>
+
+<h3>Why FlatParamHandle Exists</h3>
+<p>It was an optimization: one contiguous buffer means one all-gather call per FSDP unit instead of many small ones. On 2021-era NCCL, many small collectives were catastrophically slower than one large one. The flattening was a <em>pragmatic concession</em> to communication efficiency.</p>
+
+<h3>Why FlatParamHandle Is Toxic</h3>
+
+<table>
+    <thead>
+    <tr><th>Problem</th><th>Root Cause</th><th>Consequence</th></tr>
+    </thead>
+    <tbody>
+    <tr>
+        <td><strong>torch.compile graph breaks</strong></td>
+        <td>Parameters lose their identity — the flat_param is not a "real" module parameter. torch.compile cannot trace through the unflatten/reshard logic.</td>
+        <td>Cannot compile FSDP1-wrapped modules without severe graph breaks → poor performance.</td>
+    </tr>
+    <tr>
+        <td><strong>State dict complexity</strong></td>
+        <td>Original param names map to offsets within a flat buffer. Saving/loading requires metadata to reconstruct the mapping.</td>
+        <td>Checkpoint code is fragile; converting between sharded ↔ full state dicts is error-prone.</td>
+    </tr>
+    <tr>
+        <td><strong>Composability with AC</strong></td>
+        <td>Activation checkpointing (<code>checkpoint_wrapper</code>) wraps modules. FSDP also wraps modules. Nesting wrappers creates ordering dependencies and subtle bugs.</td>
+        <td>Incorrect memory savings, recomputation of communication, or silent correctness bugs.</td>
+    </tr>
+    <tr>
+        <td><strong>Per-parameter flexibility lost</strong></td>
+        <td>All parameters in a FlatParamHandle are sharded identically. Cannot mix strategies (e.g., shard large weights, replicate small biases).</td>
+        <td>Suboptimal memory/communication trade-offs for heterogeneous architectures.</td>
+    </tr>
+    <tr>
+        <td><strong>Module structure distortion</strong></td>
+        <td>The wrapper replaces module attributes. <code>model.encoder.layer_0</code> is no longer the original module — it's wrapped.</td>
+        <td>Code that walks <code>model.named_parameters()</code> or <code>model.named_modules()</code> behaves differently. Hooks break. Debugging is harder.</td>
+    </tr>
+    </tbody>
+</table>
+
+<div class="callout warning">
+    <strong>The fundamental tension:</strong> FSDP1 was designed before <code>torch.compile</code> existed. The wrapper + flat-buffer approach is antithetical to graph tracing. PyTorch had to choose: patch FSDP1 forever, or redesign from first principles. They chose redesign.
+</div>
+
+<h2>FSDP2: The Composable Approach</h2>
+
+<p>FSDP2 (<code>torch.distributed._composable.fsdp.fully_shard</code>, PyTorch 2.4+) is <strong>not a wrapper</strong>. It's a function that <strong>mutates</strong> a module in-place, replacing its parameters with <code>DTensor</code> objects:</p>
+
+<pre><code class="language-python"># FSDP2 — composable approach
+from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
+
+model = ViTHuge()
+
+# Apply per-module — no wrapping, no class change
+for layer in model.encoder.layers:
+    fully_shard(layer)  # Each transformer block is an FSDP unit
+
+fully_shard(model)  # Root-level shard for remaining params (embeddings, head)
+</code></pre>
+
+<p>After <code>fully_shard(layer)</code>, the module's parameters are still accessible as <code>layer.attn.q_proj.weight</code>, but they are now <code>DTensor</code> instances with a <code>Shard(0)</code> placement on a <code>DeviceMesh</code>.</p>
+
+<h2>The Two New Abstractions</h2>
+
+<h3>1. DTensor (Distributed Tensor)</h3>
+
+<p><code>DTensor</code> is a tensor type that encodes <em>how</em> the tensor is distributed across devices. It wraps a local tensor shard and carries metadata about its global shape and placement:</p>
+
+<pre><code class="language-python">from torch.distributed._tensor import DTensor, Shard, Replicate
+
+# After fully_shard(), a parameter looks like:
+param = layer.attn.q_proj.weight
+print(type(param))           # &lt;class 'torch.distributed._tensor.DTensor'&gt;
+print(param.shape)           # torch.Size([1024, 1024])  ← GLOBAL shape
+print(param._local_tensor.shape)  # torch.Size([256, 1024])  ← LOCAL shard (4 GPUs)
+print(param.placements)      # (Shard(0),)  ← sharded along dim 0
+</code></pre>
+
+<div class="callout">
+    <strong>Key property:</strong> A DTensor <em>reports its global shape</em>. Code that calls <code>param.shape</code> sees the full [1024, 1024], not the local shard. This is what makes DTensor transparent to model code — operations on DTensors produce DTensors with correct global semantics, and the communication is handled internally.
+</div>
+
+<p>The placement types that matter for FSDP2:</p>
+
+<table>
+    <thead>
+    <tr><th>Placement</th><th>Meaning</th><th>When used in FSDP2</th></tr>
+    </thead>
+    <tbody>
+    <tr>
+        <td><code>Shard(dim)</code></td>
+        <td>Tensor is split along <code>dim</code> across the mesh</td>
+        <td><strong>At rest</strong> — parameters and gradients are sharded (dim=0 by default)</td>
+    </tr>
+    <tr>
+        <td><code>Replicate()</code></td>
+        <td>Full tensor is present on every rank in the mesh</td>
+        <td><strong>During compute</strong> — after all-gather, param is temporarily Replicate</td>
+    </tr>
+    <tr>
+        <td><code>Partial(reduce_op)</code></td>
+        <td>Each rank holds a partial result that needs reduction</td>
+        <td><strong>During backward</strong> — gradients before reduce-scatter are Partial(sum)</td>
+    </tr>
+    </tbody>
+</table>
+
+<h3>2. DeviceMesh</h3>
+
+<p><code>DeviceMesh</code> encodes the physical/logical topology of your GPUs. For FSDP2, you need at minimum a 1-D mesh (all GPUs in one flat group). For HSDP, you use a 2-D mesh:</p>
+
+<pre><code class="language-python">from torch.distributed.device_mesh import init_device_mesh
+
+# 1-D mesh: full sharding across all 8 GPUs
+mesh_1d = init_device_mesh("cuda", (8,))
+
+# 2-D mesh for HSDP: (replicate across 2 nodes, shard within 4 GPUs per node)
+# Shape: (num_replicas, shard_group_size)
+mesh_2d = init_device_mesh("cuda", (2, 4), mesh_dim_names=("replicate", "shard"))
+</code></pre>
+
+<div class="diagram">
+    1-D DeviceMesh (8 GPUs, full shard):
+    ┌────────────────────────────────────────────────────────────────┐
+    │  GPU0    GPU1    GPU2    GPU3    GPU4    GPU5    GPU6    GPU7   │
+    │  ◀──────────────── single shard group ────────────────────────▶│
+    └────────────────────────────────────────────────────────────────┘
+
+    2-D DeviceMesh (8 GPUs, HSDP: 2 replicas × 4 shards):
+    ┌────────────── Replica Group 0 ──────────────┐  ┌────────────── Replica Group 1 ──────────────┐
+    │  GPU0    GPU1    GPU2    GPU3                │  │  GPU4    GPU5    GPU6    GPU7                │
+    │  ◀──── shard group (intra-node) ────▶       │  │  ◀──── shard group (intra-node) ────▶       │
+    └─────────────────────────────────────────────┘  └─────────────────────────────────────────────┘
+    ◀────────── replicate across these two groups (inter-node) ──────────▶
+</div>
+
+<div class="callout success">
+    <strong>For your V100 cluster:</strong> 4 GPUs per node with NVLink, InfiniBand across nodes. The natural HSDP mapping is: <code>mesh_2d = init_device_mesh("cuda", (num_nodes, 4), mesh_dim_names=("replicate", "shard"))</code>. Shard within the fast NVLink domain, replicate across the slower InfiniBand links. We'll implement this in a later lesson.
+</div>
+
+<h2>The Lifecycle of a Parameter in FSDP2</h2>
+
+<p>This is the most important mental model for FSDP2. Let's trace what happens to a single parameter through one training step:</p>
+
+<div class="diagram">
+    Parameter lifecycle during one forward + backward pass:
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    State at rest (between steps):
+    param: DTensor, placement=Shard(0), local shape=[256, 1024]  (1/4 of [1024,1024])
+
+    ─── FORWARD ───────────────────────────────────────────────────────────────────
+
+    [1] Pre-forward hook fires for this FSDP unit
+    → Triggers all-gather on param
+    → param.placements transitions: Shard(0) → Replicate()
+    → local tensor is now full [1024, 1024] on every rank
+    → This is the "unsharded" parameter
+
+    [2] Module's forward() executes normally
+    → Uses the full [1024, 1024] parameter
+    → Produces activations (saved for backward)
+
+    [3] Post-forward hook fires
+    → Frees the unsharded parameter (returns to Shard(0) view)
+    → Memory reclaimed immediately
+    → Only the 1/4 shard is retained
+
+    ─── BACKWARD ──────────────────────────────────────────────────────────────────
+
+    [4] Pre-backward hook fires for this FSDP unit
+    → Triggers all-gather on param AGAIN (needs full param for grad computation)
+    → param: Shard(0) → Replicate()
+
+    [5] Backward computation executes
+    → Computes gradients w.r.t. the full parameter
+    → Gradient is initially a full [1024, 1024] tensor on each rank
+    → But each rank's gradient is a PARTIAL sum (only from its micro-batch)
+
+    [6] Post-backward hook fires
+    → Triggers reduce-scatter on the gradient
+    → Each rank receives 1/4 of the SUMMED gradient: shape [256, 1024]
+    → Gradient placement: Partial(sum) → Shard(0)
+    → Frees the unsharded parameter (back to Shard(0))
+
+    ─── OPTIMIZER STEP ────────────────────────────────────────────────────────────
+
+    [7] Optimizer runs on SHARDED state only
+    → param shard:      [256, 1024]
+    → grad shard:       [256, 1024]
+    → adam_m shard:     [256, 1024]
+    → adam_v shard:     [256, 1024]
+    → No communication needed!
+    → Updates param shard in-place
+</div>
+
+<div class="callout">
+    <strong>Critical insight:</strong> Steps [3] and [6] are where memory is saved. The full parameter exists only <em>transiently</em> during compute. Between FSDP units, memory holds only the shards. This is why FSDP's peak memory ≈ <code>model_sharded + largest_unit_unsharded + activations</code>.
+</div>
+
+<h2>Implementation: Hooks, Not Wrappers</h2>
+
+<p>FSDP2 achieves this lifecycle through <strong>module hooks</strong> registered by <code>fully_shard()</code>:</p>
+
+<pre><code class="language-python"># Conceptual view of what fully_shard(module) does internally:
+
+def fully_shard(module: nn.Module, mesh: DeviceMesh = None, ...):
+    # 1. Replace each parameter with a DTensor (Shard(0) placement)
+    for name, param in module.named_parameters(recurse=False):
+        sharded = distribute_tensor(param.data, mesh, placements=[Shard(0)])
+        # Parameter identity preserved — same name, same module attribute
+        setattr(module, name, nn.Parameter(sharded))
+
+    # 2. Create FSDPState (manages communication scheduling)
+    state = FSDPState(module, mesh, ...)
+
+    # 3. Register hooks
+    module.register_forward_pre_hook(state._pre_forward)    # all-gather
+    module.register_forward_hook(state._post_forward)        # free unshard
+    # Backward hooks are registered on the autograd graph, not the module
+
+    return module  # Same module, mutated in place — NOT wrapped
+</code></pre>
+
+<p>This is radically different from FSDP1:</p>
+
+<table>
+    <thead>
+    <tr><th>Aspect</th><th>FSDP1</th><th>FSDP2</th></tr>
+    </thead>
+    <tbody>
+    <tr>
+        <td>Module identity</td>
+        <td><code>type(model) == FSDP</code> — original class lost</td>
+        <td><code>type(model) == ViTHuge</code> — preserved</td>
+    </tr>
+    <tr>
+        <td>Parameter identity</td>
+        <td>Replaced by flat_param offsets</td>
+        <td>Preserved as named DTensor attributes</td>
+    </tr>
+    <tr>
+        <td>Sharding granularity</td>
+        <td>Per FSDP-wrap boundary (coarse)</td>
+        <td>Per parameter (fine-grained, though grouped by FSDP unit for efficiency)</td>
+    </tr>
+    <tr>
+        <td>torch.compile</td>
+        <td>Graph breaks at every FSDP boundary</td>
+        <td>Traceable — DTensor ops have torch.compile support</td>
+    </tr>
+    <tr>
+        <td>State dict</td>
+        <td>Requires special <code>StateDictType</code> context managers</td>
+        <td>Standard <code>model.state_dict()</code> returns sharded DTensors; DCP handles the rest</td>
+    </tr>
+    <tr>
+        <td>Activation checkpointing</td>
+        <td>Separate wrapper, ordering-sensitive</td>
+        <td><code>torch.utils.checkpoint</code> applied independently — orthogonal composition</td>
+    </tr>
+    <tr>
+        <td>API surface</td>
+        <td><code>FSDP(..., auto_wrap_policy=..., sharding_strategy=...)</code></td>
+        <td><code>fully_shard(module, mesh=..., mp_policy=...)</code> per module</td>
+    </tr>
+    </tbody>
+</table>
+
+<h2>Why "Composable"?</h2>
+
+<p>The term <em>composable</em> in FSDP2's official name (<code>torch.distributed._composable.fsdp</code>) refers to a design principle: distributed training features should compose like function applications, not wrapper nesting:</p>
+
+<pre><code class="language-python"># FSDP2 composes cleanly with other distributed features:
+from torch.distributed._composable.fsdp import fully_shard
+from torch.utils.checkpoint import checkpoint
+
+model = ViTHuge()
+
+for layer in model.encoder.layers:
+    # These are independent, order doesn't matter:
+    fully_shard(layer)                       # Shard this block's params
+    layer.forward = checkpoint(layer.forward) # Activation checkpoint this block
+    # Could also apply tensor parallelism here in future
+
+fully_shard(model)  # Shard remaining (embedding, head)
+</code></pre>
+
+<div class="callout">
+    <strong>Why this matters for you:</strong> If you're integrating FSDP into an existing framework at Fraunhofer, the composable API means you don't restructure your model class hierarchy. You apply <code>fully_shard()</code> to existing modules. Your custom hooks, custom layers (pybind11 extensions), and existing checkpoint logic remain undisturbed.
+</div>
+
+<h2>The Communication Scheduling Detail</h2>
+
+<p>FSDP2 doesn't naively all-gather one layer, compute, free, all-gather next layer. It uses <strong>prefetching</strong> — overlapping communication with computation:</p>
+
+<div class="diagram">
+    Timeline for 3 transformer blocks (simplified):
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    Block 0              Block 1              Block 2
+    Compute: ████████████         ████████████         ████████████
+    Comms:   ▓▓▓(AG B0)▓▓▓(AG B1)         ▓▓▓(AG B2)         ▓▓▓(RS B2)▓▓▓(RS B1)▓▓▓(RS B0)
+    ↑
+    Prefetch: all-gather Block 1 starts
+    DURING Block 0's compute
+
+    Legend: AG = all-gather, RS = reduce-scatter, ████ = compute, ▓▓▓ = communication
+</div>
+
+<p>The <code>FSDPState</code> manages this via:</p>
+<ul>
+    <li><strong><code>forward_prefetch</code></strong> (default: True) — starts all-gather of the <em>next</em> FSDP unit before current unit's compute finishes</li>
+    <li><strong><code>backward_prefetch</code></strong> — same for backward pass (default: <code>BACKWARD_PRE</code>, meaning prefetch the next unit's params before current grad computation)</li>
+    <li>CUDA streams — communication runs on a separate stream from compute, enabling true overlap on your V100s</li>
+</ul>
+
+<h2>What "FSDP Unit" Means in Practice</h2>
+
+<p>Each call to <code>fully_shard(module)</code> creates one FSDP unit. The granularity choice matters:</p>
+
+<table>
+    <thead>
+    <tr><th>Granularity</th><th>Memory peak</th><th>Communication efficiency</th><th>Recommendation</th></tr>
+    </thead>
+    <tbody>
+    <tr>
+        <td>One unit = entire model</td>
+        <td>Full model unsharded during compute (defeats the purpose)</td>
+        <td>One large all-gather (maximally efficient)</td>
+        <td>❌ Never do this</td>
+    </tr>
+    <tr>
+        <td>One unit = one transformer block</td>
+        <td>One block unsharded at a time</td>
+        <td>One all-gather per block (good on modern NCCL)</td>
+        <td>✓ Standard choice</td>
+    </tr>
+    <tr>
+        <td>One unit = one linear layer</td>
+        <td>One layer unsharded at a time</td>
+        <td>Many small all-gathers (potentially slower)</td>
+        <td>Only if blocks still don't fit</td>
+    </tr>
+    </tbody>
+</table>
+
+<div class="callout success">
+    <strong>For ViT-Huge on V100-32GB:</strong> One FSDP unit per transformer block is ideal. Each block is ~20M params = ~38 MB unsharded (fp16). The peak memory from unsharding is trivial (~38 MB) relative to activation memory. Finer granularity would add communication overhead for no memory benefit.
+</div>
+
+<h2>Summary: The Architecture Shift</h2>
+
+<div class="diagram">
+    FSDP1                                    FSDP2
+    ━━━━━━━━━━━━━━━━━━━━━                   ━━━━━━━━━━━━━━━━━━━━━
+    Module wrapper                           In-place module mutation
+    FlatParamHandle (1-D buffer)             DTensor (per-parameter, global shape)
+    Opaque internal state                    DeviceMesh (explicit topology)
+    Wrapper nesting for composition          Hook-based, orthogonal composition
+    Incompatible with torch.compile          Designed for torch.compile
+    Custom state_dict machinery              Standard state_dict + DCP
+    FSDP-specific checkpointing API          torch.distributed.checkpoint
+</div>
+
+<h2 id="quiz">Check Your Understanding</h2>
+
+<div class="quiz">
+    <h3>Q1: After calling <code>fully_shard(layer)</code>, what is the type of <code>layer.attn.q_proj.weight</code>?</h3>
+    <button onclick="checkAnswer(this, false)">torch.Tensor with a custom storage object pointing to the shard</button>
+    <button onclick="checkAnswer(this, false)">A FlatParameter containing flattened weights for the FSDP unit</button>
+    <button onclick="checkAnswer(this, true)">A DTensor with Shard(0) placement reporting the global parameter shape</button>
+    <button onclick="checkAnswer(this, false)">An nn.Parameter wrapping a local tensor with reduced first dimension</button>
+    <div class="explanation">
+        <strong>Correct.</strong> FSDP2 replaces parameters with DTensor instances. The DTensor carries a <code>Shard(0)</code> placement (at rest) and reports the global shape, while its <code>._local_tensor</code> holds only the rank's shard. This is what makes FSDP2 transparent to model code and traceable by torch.compile.
+    </div>
+</div>
+
+<div class="quiz">
+    <h3>Q2: Why does FSDP2 all-gather the parameters twice per training step (once in forward, once in backward)?</h3>
+    <button onclick="checkAnswer(this, false)">The first all-gather produces fp16 params and the second produces fp32 params</button>
+    <button onclick="checkAnswer(this, true)">The unsharded params are freed after forward to save memory and must be restored for gradient computation</button>
+    <button onclick="checkAnswer(this, false)">The backward pass needs a fresh copy because the forward pass modifies parameters in-place</button>
+    <button onclick="checkAnswer(this, false)">All-gather in backward aggregates gradients from all ranks before the reduce step</button>
+    <div class="explanation">
+        <strong>Correct.</strong> This is the core memory-communication trade-off. After forward compute on a layer, the post-forward hook discards the full-size parameter (transitions back to Shard). When backward reaches that layer, it needs the full parameter again to compute gradients. So it all-gathers a second time. The alternative — keeping it unsharded — would negate the memory savings.
+    </div>
+</div>
+
+<div class="quiz">
+    <h3>Q3: What is the primary reason FSDP1's FlatParamHandle breaks <code>torch.compile</code>?</h3>
+    <button onclick="checkAnswer(this, false)">FlatParamHandle uses custom CUDA kernels that the compiler cannot lower to Triton</button>
+    <button onclick="checkAnswer(this, true)">Parameters lose their identity as module attributes so the compiler cannot trace data flow through them</button>
+    <button onclick="checkAnswer(this, false)">The wrapper class introduces Python-level control flow that creates dynamic graph shapes</button>
+    <button onclick="checkAnswer(this, false)">FlatParamHandle relies on in-place memory views that violate the functional tracing model</button>
+    <div class="explanation">
+        <strong>Correct.</strong> torch.compile traces the computation graph by following tensor operations through module attributes. When FSDP1 flattens parameters into an opaque 1-D buffer and manages them through internal handles (not visible as module attributes), the tracer cannot connect inputs to outputs through these parameters. Each FSDP boundary becomes a graph break. FSDP2's DTensor parameters are standard module attributes with well-defined torch.compile dispatch rules.
+    </div>
+</div>
+
+<div class="quiz">
+    <h3>Q4: In a 2-D DeviceMesh of shape (2, 4) with dim_names ("replicate", "shard"), which communication happens over InfiniBand on your cluster?</h3>
+    <button onclick="checkAnswer(this, false)">The all-gather for parameter unsharding during forward and backward passes</button>
+    <button onclick="checkAnswer(this, false)">The reduce-scatter of gradients after backward computation on each layer</button>
+    <button onclick="checkAnswer(this, true)">The all-reduce of gradients across the replicate dimension between the two node groups</button>
+    <button onclick="checkAnswer(this, false)">No InfiniBand communication occurs because all sharding is within a single node</button>
+    <div class="explanation">
+        <strong>Correct.</strong> In HSDP (Hybrid Sharded Data Parallel), the "shard" dimension (size 4) maps to intra-node NVLink, and the "replicate" dimension (size 2) maps to inter-node InfiniBand. Sharding ops (all-gather, reduce-scatter) happen within each 4-GPU group over fast NVLink. But since the model is <em>replicated</em> across the two groups, gradients must be all-reduced across the replicate dimension — that traffic goes over InfiniBand.
+    </div>
+</div>
+
+<h2>Key Takeaways</h2>
+<ol>
+    <li>FSDP1 uses a <strong>wrapper class + FlatParamHandle</strong> (parameters flattened into one 1-D buffer). This was pragmatic but toxic for composability, torch.compile, and debugging.</li>
+    <li>FSDP2 uses <strong>in-place mutation + DTensor</strong>. Each parameter becomes a DTensor with <code>Shard(0)</code> placement. Module identity and parameter names are preserved.</li>
+    <li><strong>DTensor</strong> encodes distribution semantics (Shard, Replicate, Partial) and reports global shapes. FSDP2's lifecycle is a sequence of placement transitions: Shard → Replicate (all-gather) → compute → Shard (free) → Replicate (all-gather in bwd) → Partial (grad) → Shard (reduce-scatter).</li>
+    <li><strong>DeviceMesh</strong> encodes your GPU topology. 1-D for full sharding, 2-D for HSDP (shard intra-node over NVLink, replicate inter-node over InfiniBand).</li>
+    <li><strong>FSDP unit = one <code>fully_shard()</code> call</strong>. Standard choice for transformers: one unit per block. This determines peak memory (one block unsharded at a time) and communication granularity.</li>
+    <li>Prefetching overlaps communication with compute — FSDP2 automatically starts all-gathering the next unit while the current one computes.</li>
+</ol>
+
+<h2>Primary Source</h2>
+<p>Read the <strong>FSDP2 README / design doc</strong> in the PyTorch source: <a href="https://github.com/pytorch/pytorch/blob/main/torch/distributed/_composable/fsdp/README.md">torch/distributed/_composable/fsdp/README.md</a>. This is written by the authors (Andrew Gu, Wanchao Liang) and explains the DTensor-based design decisions. Also skim the <a href="https://github.com/pytorch/pytorch/blob/main/torch/distributed/_tensor/README.md">DTensor README</a> for the placement semantics.</p>
+
+<script>
+    function checkAnswer(btn, correct) {
+        const quiz = btn.closest('.quiz');
+        const buttons = quiz.querySelectorAll('button');
+        const explanation = quiz.querySelector('.explanation');
+        buttons.forEach(b => { b.disabled = true; b.classList.remove('correct', 'incorrect'); });
+        if (correct) {
+            btn.classList.add('correct');
+        } else {
+            btn.classList.add('incorrect');
+            buttons.forEach(b => { if (b.getAttribute('onclick').includes('true')) b.classList.add('correct'); });
+        }
+        explanation.style.display = 'block';
+    }
+</script>
+
+
+        
+        <!-- _includes/tutorial-nav.html -->
+
+
+
+
+
+
+
+
+
+
+
+
+<nav class="tutorial-nav" aria-label="Lesson navigation">
+    
+    <a href="/heap/fsdp2/001/" class="tutorial-nav-btn tutorial-nav-prev">
+        <span class="tutorial-nav-label">← Previous</span>
+        <span class="tutorial-nav-title">001 — GPU Memory Anatomy: Why DDP Hits the Wall</span>
+    </a>
+    
+
+    
+    <a href="/heap/fsdp2/003/" class="tutorial-nav-btn tutorial-nav-next">
+        <span class="tutorial-nav-label">Next →</span>
+        <span class="tutorial-nav-title">003 — Hands-On: Your First FSDP2 Training Loop</span>
+    </a>
+    
+</nav>
+        
+    </article>
+
+</div>
+  </div>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <div class="footer-links">
+      <a href="https://github.com/g4br1el">GitHub</a>
+      <a href="https://www.linkedin.com/in/gadax">LinkedIn</a>
+      <a href="mailto:gdax.science@gmail.com">Email</a>
+      <a href="/files/CV-Gabriel_Dax.pdf">Resume ↓</a>
+    </div>
+    <p class="footer-copyright">© 2026 Gabriel Dax</p>
+  </div>
+</footer>
+
+
+
+</body>
+</html>

@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FSDP2 Mastery — Gabriel Dax</title>
+  <!-- Begin Jekyll SEO tag v2.9.0 -->
+<meta name="generator" content="Jekyll v4.4.1" />
+<meta property="og:title" content="FSDP2 Mastery" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="PyTorch Fully Sharded Data Parallel v2 — from first principles to multi-node production." />
+<meta name="twitter:description" property="og:description" content="PyTorch Fully Sharded Data Parallel v2 — from first principles to multi-node production." />
+<link rel="canonical" href="https://www.gabrieldax.de/heap/fsdp2/" />
+<meta property="og:url" content="https://www.gabrieldax.de/heap/fsdp2/" />
+<meta property="og:site_name" content="Gabriel Dax — ML Research Engineer" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2026-06-24T07:37:12+00:00" />
+<meta property="article:modified_time" content="2026-06-24T07:37:12+00:00" />
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:title" content="FSDP2 Mastery" />
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"BlogPosting","dateModified":"2026-06-24T07:37:12+00:00","datePublished":"2026-06-24T07:37:12+00:00","description":"PyTorch Fully Sharded Data Parallel v2 — from first principles to multi-node production.","headline":"FSDP2 Mastery","mainEntityOfPage":{"@type":"WebPage","@id":"https://www.gabrieldax.de/heap/fsdp2/"},"url":"https://www.gabrieldax.de/heap/fsdp2/"}</script>
+<!-- End Jekyll SEO tag -->
+
+  <meta content='text/html; charset=utf-8' http-equiv='Content-Type'>
+<meta http-equiv='X-UA-Compatible' content='IE=edge'>
+<meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0'>
+
+
+<meta property="og:description" content="
+  Mission
+  Glossary
+  Resources
+  Notes
+
+" />
+
+<meta name="author" content="Gabriel Dax" />
+
+
+
+<meta property="og:title" content="FSDP2 Mastery" />
+<meta property="twitter:title" content="FSDP2 Mastery" />
+
+
+
+<meta property="og:image" content="https://www.gabrieldax.de/images/self.png"/>
+<meta property="twitter:image" content="https://www.gabrieldax.de/images/self.png"/>
+
+
+  <link rel="stylesheet" href="/assets/style.css">
+  <link rel="icon" type="image/png" sizes="32x32" href="/images/favicon.jpg">
+  <link rel="canonical" href="https://www.gabrieldax.de/heap/fsdp2/">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  
+
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div>
+      <a href="/" class="site-name">Gabriel Dax</a>
+      <span class="site-tagline">ML Research Engineer</span>
+    </div>
+    <nav>
+      <a href="/" >Home</a>
+      <a href="/projects" >Projects</a>
+      <a href="/publications" >Publications</a>
+      <a href="/bio" >CV</a>
+    </nav>
+  </div>
+</header>
+
+<main class="main-content">
+  <div class="container">
+    <article class="page">
+
+  <h1>FSDP2 Mastery</h1>
+
+  <div class="entry">
+    <div class="tutorial-detail-nav">
+  <a href="/heap/fsdp2/mission/">Mission</a>
+  <a href="/heap/fsdp2/glossary/">Glossary</a>
+  <a href="/heap/fsdp2/resources/">Resources</a>
+  <a href="/heap/fsdp2/notes/">Notes</a>
+</div>
+
+<ul class="lesson-list">
+
+<li class="lesson-list-item">
+  <a href="/heap/fsdp2/001/">
+    <span class="lesson-list-number">001</span>
+    <span class="lesson-list-title">GPU Memory Anatomy: Why DDP Hits the Wall</span>
+    
+    <span class="lesson-list-tags">
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Foundations</span>
+      
+    </span>
+    
+  </a>
+</li>
+
+<li class="lesson-list-item">
+  <a href="/heap/fsdp2/002/">
+    <span class="lesson-list-number">002</span>
+    <span class="lesson-list-title">FSDP1 vs FSDP2: The Death of FlatParamHandle</span>
+    
+    <span class="lesson-list-tags">
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Foundations</span>
+      
+    </span>
+    
+  </a>
+</li>
+
+<li class="lesson-list-item">
+  <a href="/heap/fsdp2/003/">
+    <span class="lesson-list-number">003</span>
+    <span class="lesson-list-title">Hands-On: Your First FSDP2 Training Loop</span>
+    
+    <span class="lesson-list-tags">
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Core</span>
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Code</span>
+      
+    </span>
+    
+  </a>
+</li>
+
+<li class="lesson-list-item">
+  <a href="/heap/fsdp2/004/">
+    <span class="lesson-list-number">004</span>
+    <span class="lesson-list-title">DTensor Deep Dive: Placements, Redistribution, Dispatch</span>
+    
+    <span class="lesson-list-tags">
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Core</span>
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Internals</span>
+      
+    </span>
+    
+  </a>
+</li>
+
+<li class="lesson-list-item">
+  <a href="/heap/fsdp2/005/">
+    <span class="lesson-list-number">005</span>
+    <span class="lesson-list-title">DeviceMesh: Topology Construction &amp; Multi-Dimensional Meshes</span>
+    
+    <span class="lesson-list-tags">
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Core</span>
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Infrastructure</span>
+      
+    </span>
+    
+  </a>
+</li>
+
+<li class="lesson-list-item">
+  <a href="/heap/fsdp2/006/">
+    <span class="lesson-list-number">006</span>
+    <span class="lesson-list-title">Mixed Precision in FSDP2: fp16 on V100</span>
+    
+    <span class="lesson-list-tags">
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Core</span>
+      
+      <span class="tutorial-tag tutorial-tag--secondary">V100-Specific</span>
+      
+    </span>
+    
+  </a>
+</li>
+
+<li class="lesson-list-item">
+  <a href="/heap/fsdp2/007/">
+    <span class="lesson-list-number">007</span>
+    <span class="lesson-list-title">Activation Checkpointing + FSDP2 Composition</span>
+    
+    <span class="lesson-list-tags">
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Core</span>
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Memory Optimization</span>
+      
+    </span>
+    
+  </a>
+</li>
+
+<li class="lesson-list-item">
+  <a href="/heap/fsdp2/008/">
+    <span class="lesson-list-number">008</span>
+    <span class="lesson-list-title">Communication Overlap &amp; Prefetch Tuning</span>
+    
+    <span class="lesson-list-tags">
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Performance</span>
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Tuning</span>
+      
+    </span>
+    
+  </a>
+</li>
+
+<li class="lesson-list-item">
+  <a href="/heap/fsdp2/009/">
+    <span class="lesson-list-number">009</span>
+    <span class="lesson-list-title">HSDP: Hybrid Sharding on Your NVLink/IB Cluster</span>
+    
+    <span class="lesson-list-tags">
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Performance</span>
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Multi-Node</span>
+      
+    </span>
+    
+  </a>
+</li>
+
+<li class="lesson-list-item">
+  <a href="/heap/fsdp2/010/">
+    <span class="lesson-list-number">010</span>
+    <span class="lesson-list-title">torch.compile + FSDP2: Tracing, Graph Breaks, Speedups</span>
+    
+    <span class="lesson-list-tags">
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Performance</span>
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Compilation</span>
+      
+    </span>
+    
+  </a>
+</li>
+
+<li class="lesson-list-item">
+  <a href="/heap/fsdp2/011/">
+    <span class="lesson-list-number">011</span>
+    <span class="lesson-list-title">Sharded Checkpointing with Distributed Checkpoint (DCP)</span>
+    
+    <span class="lesson-list-tags">
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Production</span>
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Checkpointing</span>
+      
+    </span>
+    
+  </a>
+</li>
+
+<li class="lesson-list-item">
+  <a href="/heap/fsdp2/012/">
+    <span class="lesson-list-number">012</span>
+    <span class="lesson-list-title">Profiling &amp; Debugging FSDP2: Memory, NCCL, Bottlenecks</span>
+    
+    <span class="lesson-list-tags">
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Production</span>
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Debugging</span>
+      
+    </span>
+    
+  </a>
+</li>
+
+<li class="lesson-list-item">
+  <a href="/heap/fsdp2/013/">
+    <span class="lesson-list-number">013</span>
+    <span class="lesson-list-title">Advanced Policies: CPU Offload, Per-Parameter Strategies</span>
+    
+    <span class="lesson-list-tags">
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Advanced</span>
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Policies</span>
+      
+    </span>
+    
+  </a>
+</li>
+
+<li class="lesson-list-item">
+  <a href="/heap/fsdp2/0014/">
+    <span class="lesson-list-number">014</span>
+    <span class="lesson-list-title">Migrating an Existing DDP Pipeline to FSDP2</span>
+    
+    <span class="lesson-list-tags">
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Integration</span>
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Migration</span>
+      
+    </span>
+    
+  </a>
+</li>
+
+<li class="lesson-list-item">
+  <a href="/heap/fsdp2/0015/">
+    <span class="lesson-list-number">015</span>
+    <span class="lesson-list-title">Capstone: End-to-End ViT-Huge Multi-Node Training</span>
+    
+    <span class="lesson-list-tags">
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Capstone</span>
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Production</span>
+      
+    </span>
+    
+  </a>
+</li>
+
+<li class="lesson-list-item">
+  <a href="/heap/fsdp2/0016/">
+    <span class="lesson-list-number">016</span>
+    <span class="lesson-list-title">Custom CUDA Kernels + FSDP2</span>
+    
+    <span class="lesson-list-tags">
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Add-On</span>
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Advanced</span>
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Advanced</span>
+      
+    </span>
+    
+  </a>
+</li>
+
+<li class="lesson-list-item">
+  <a href="/heap/fsdp2/0017/">
+    <span class="lesson-list-number">017</span>
+    <span class="lesson-list-title">Vision-Language Models with FSDP2</span>
+    
+    <span class="lesson-list-tags">
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Add-On</span>
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Advanced</span>
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Multi-Modal</span>
+      
+    </span>
+    
+  </a>
+</li>
+
+<li class="lesson-list-item">
+  <a href="/heap/fsdp2/0018/">
+    <span class="lesson-list-number">018</span>
+    <span class="lesson-list-title">Tensor Parallelism + FSDP2 Composition</span>
+    
+    <span class="lesson-list-tags">
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Add-On</span>
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Advanced</span>
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Tensor Parallelism</span>
+      
+    </span>
+    
+  </a>
+</li>
+
+</ul>
+
+  </div>
+</article>
+
+  </div>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <div class="footer-links">
+      <a href="https://github.com/g4br1el">GitHub</a>
+      <a href="https://www.linkedin.com/in/gadax">LinkedIn</a>
+      <a href="mailto:gdax.science@gmail.com">Email</a>
+      <a href="/files/CV-Gabriel_Dax.pdf">Resume ↓</a>
+    </div>
+    <p class="footer-copyright">© 2026 Gabriel Dax</p>
+  </div>
+</footer>
+
+
+
+</body>
+</html>

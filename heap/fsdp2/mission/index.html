@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mission: FSDP2 Mastery — Gabriel Dax</title>
+  <!-- Begin Jekyll SEO tag v2.9.0 -->
+<meta name="generator" content="Jekyll v4.4.1" />
+<meta property="og:title" content="Mission: FSDP2 Mastery" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="Why Train large vision transformers (ViT-H class, 600M+ params) that exceed single-GPU memory under DDP on a V100-32GB NVLink/InfiniBand cluster. Build deep, internals-level understanding of FSDP2 (DTensor, DeviceMesh, communication patterns) to future-proof for larger models and strengthen candidacy for senior distributed-training roles." />
+<meta name="twitter:description" property="og:description" content="Why Train large vision transformers (ViT-H class, 600M+ params) that exceed single-GPU memory under DDP on a V100-32GB NVLink/InfiniBand cluster. Build deep, internals-level understanding of FSDP2 (DTensor, DeviceMesh, communication patterns) to future-proof for larger models and strengthen candidacy for senior distributed-training roles." />
+<link rel="canonical" href="https://www.gabrieldax.de/heap/fsdp2/mission/" />
+<meta property="og:url" content="https://www.gabrieldax.de/heap/fsdp2/mission/" />
+<meta property="og:site_name" content="Gabriel Dax — ML Research Engineer" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2026-06-24T07:37:12+00:00" />
+<meta property="article:modified_time" content="2026-06-24T07:37:12+00:00" />
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:title" content="Mission: FSDP2 Mastery" />
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"BlogPosting","dateModified":"2026-06-24T07:37:12+00:00","datePublished":"2026-06-24T07:37:12+00:00","description":"Why Train large vision transformers (ViT-H class, 600M+ params) that exceed single-GPU memory under DDP on a V100-32GB NVLink/InfiniBand cluster. Build deep, internals-level understanding of FSDP2 (DTensor, DeviceMesh, communication patterns) to future-proof for larger models and strengthen candidacy for senior distributed-training roles.","headline":"Mission: FSDP2 Mastery","mainEntityOfPage":{"@type":"WebPage","@id":"https://www.gabrieldax.de/heap/fsdp2/mission/"},"url":"https://www.gabrieldax.de/heap/fsdp2/mission/"}</script>
+<!-- End Jekyll SEO tag -->
+
+  <meta content='text/html; charset=utf-8' http-equiv='Content-Type'>
+<meta http-equiv='X-UA-Compatible' content='IE=edge'>
+<meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0'>
+
+
+<meta property="og:description" content="Why
+Train large vision transformers (ViT-H class, 600M+ params) that exceed single-GPU memory under DDP on a V100-32GB NVLink/InfiniBand cluster. Build deep, internals-level understanding of FSDP2 (DTensor, DeviceMesh, communication patterns) to future-proof for larger models and strengthen candidacy for senior distributed-training roles.
+" />
+
+<meta name="author" content="Gabriel Dax" />
+
+
+
+<meta property="og:title" content="Mission: FSDP2 Mastery" />
+<meta property="twitter:title" content="Mission: FSDP2 Mastery" />
+
+
+
+<meta property="og:image" content="https://www.gabrieldax.de/images/self.png"/>
+<meta property="twitter:image" content="https://www.gabrieldax.de/images/self.png"/>
+
+
+  <link rel="stylesheet" href="/assets/style.css">
+  <link rel="icon" type="image/png" sizes="32x32" href="/images/favicon.jpg">
+  <link rel="canonical" href="https://www.gabrieldax.de/heap/fsdp2/mission/">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  
+
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div>
+      <a href="/" class="site-name">Gabriel Dax</a>
+      <span class="site-tagline">ML Research Engineer</span>
+    </div>
+    <nav>
+      <a href="/" >Home</a>
+      <a href="/projects" >Projects</a>
+      <a href="/publications" >Publications</a>
+      <a href="/bio" >CV</a>
+    </nav>
+  </div>
+</header>
+
+<main class="main-content">
+  <div class="container">
+    <div class="tutorial-wrapper">
+
+    <nav class="tutorial-breadcrumb">
+        <a href="/heap/">← All Tutorials</a>
+        
+        <span class="tutorial-position">Mission</span>
+        
+    </nav>
+
+    <article class="tutorial-article">
+        
+
+        <h1>Mission: FSDP2 Mastery</h1>
+
+        <h2 id="why">Why</h2>
+<p>Train large vision transformers (ViT-H class, 600M+ params) that exceed single-GPU memory under DDP on a V100-32GB NVLink/InfiniBand cluster. Build deep, internals-level understanding of FSDP2 (DTensor, DeviceMesh, communication patterns) to future-proof for larger models and strengthen candidacy for senior distributed-training roles.</p>
+
+<h2 id="success-looks-like">Success looks like</h2>
+<ul>
+  <li>Can train a ViT-Huge (632M params) with batch_size &gt; 1 across multiple V100 nodes using FSDP2</li>
+  <li>Can explain every communication primitive (all-gather, reduce-scatter) and when each fires during forward/backward</li>
+  <li>Can configure per-module sharding strategies with clear rationale</li>
+  <li>Can compose FSDP2 with mixed precision, activation checkpointing, and torch.compile</li>
+  <li>Can implement HSDP (shard intra-node, replicate inter-node) and justify when it wins over full sharding</li>
+  <li>Can save/load sharded checkpoints and convert to/from full state dicts</li>
+  <li>Can profile and debug FSDP2 training runs (identify comm bottlenecks, memory peaks)</li>
+  <li>Can migrate an existing DDP pipeline to FSDP2 with minimal code churn</li>
+</ul>
+
+<h2 id="constraints">Constraints</h2>
+<ul>
+  <li>Hardware: V100-32GB SXM2, NVLink intra-node, InfiniBand inter-node, up to 8 nodes / 32 GPUs</li>
+  <li>No H100/A100 features (no FP8, no NVSwitch beyond NVLink topology)</li>
+  <li>Access to PyTorch nightly acceptable (FSDP2 is torch &gt;= 2.4 but best on nightly)</li>
+  <li>Web-only Claude access (no local IDE integration)</li>
+  <li>Time: learning alongside active project work</li>
+</ul>
+
+<h2 id="out-of-scope">Out of scope</h2>
+<ul>
+  <li>Megatron-LM style tensor/pipeline parallelism (for now)</li>
+  <li>DeepSpeed ZeRO (different ecosystem)</li>
+  <li>NLP/LLM-specific concerns (focus is vision transformers)</li>
+  <li>Inference optimization (TensorRT etc. — separate skill)</li>
+</ul>
+
+
+        
+    </article>
+
+</div>
+  </div>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <div class="footer-links">
+      <a href="https://github.com/g4br1el">GitHub</a>
+      <a href="https://www.linkedin.com/in/gadax">LinkedIn</a>
+      <a href="mailto:gdax.science@gmail.com">Email</a>
+      <a href="/files/CV-Gabriel_Dax.pdf">Resume ↓</a>
+    </div>
+    <p class="footer-copyright">© 2026 Gabriel Dax</p>
+  </div>
+</footer>
+
+
+
+</body>
+</html>

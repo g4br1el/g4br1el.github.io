@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FPGA-Deployable CNN Model Library — Gabriel Dax</title>
+  <!-- Begin Jekyll SEO tag v2.9.0 -->
+<meta name="generator" content="Jekyll v4.4.1" />
+<meta property="og:title" content="FPGA-Deployable CNN Model Library" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="Reimplemented 12 CNN architectures in TensorFlow with full VitisAI compatibility for FPGA deployment. ImageNet-pretrained weights included." />
+<meta name="twitter:description" property="og:description" content="Reimplemented 12 CNN architectures in TensorFlow with full VitisAI compatibility for FPGA deployment. ImageNet-pretrained weights included." />
+<link rel="canonical" href="https://www.gabrieldax.de/projects/modeldb" />
+<meta property="og:url" content="https://www.gabrieldax.de/projects/modeldb" />
+<meta property="og:site_name" content="Gabriel Dax — ML Research Engineer" />
+<meta property="og:image" content="https://www.gabrieldax.de/images/cnn.svg" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2021-07-01T00:00:00+00:00" />
+<meta property="article:modified_time" content="2021-07-01T00:00:00+00:00" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:image" content="https://www.gabrieldax.de/images/cnn.svg" />
+<meta name="twitter:title" content="FPGA-Deployable CNN Model Library" />
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"BlogPosting","dateModified":"2021-07-01T00:00:00+00:00","datePublished":"2021-07-01T00:00:00+00:00","description":"Reimplemented 12 CNN architectures in TensorFlow with full VitisAI compatibility for FPGA deployment. ImageNet-pretrained weights included.","headline":"FPGA-Deployable CNN Model Library","image":"https://www.gabrieldax.de/images/cnn.svg","mainEntityOfPage":{"@type":"WebPage","@id":"https://www.gabrieldax.de/projects/modeldb"},"url":"https://www.gabrieldax.de/projects/modeldb"}</script>
+<!-- End Jekyll SEO tag -->
+
+  <meta content='text/html; charset=utf-8' http-equiv='Content-Type'>
+<meta http-equiv='X-UA-Compatible' content='IE=edge'>
+<meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0'>
+
+
+<meta property="og:description" content="
+" />
+
+<meta name="author" content="Gabriel Dax" />
+
+
+
+<meta property="og:title" content="FPGA-Deployable CNN Model Library" />
+<meta property="twitter:title" content="FPGA-Deployable CNN Model Library" />
+
+
+
+<meta property="og:image" content="https://www.gabrieldax.de/images/cnn.svg"/>
+<meta property="twitter:image" content="https://www.gabrieldax.de/images/cnn.svg"/>
+
+
+  <link rel="stylesheet" href="/assets/style.css">
+  <link rel="icon" type="image/png" sizes="32x32" href="/images/favicon.jpg">
+  <link rel="canonical" href="https://www.gabrieldax.de/projects/modeldb">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  
+
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div>
+      <a href="/" class="site-name">Gabriel Dax</a>
+      <span class="site-tagline">ML Research Engineer</span>
+    </div>
+    <nav>
+      <a href="/" >Home</a>
+      <a href="/projects" class="active">Projects</a>
+      <a href="/publications" >Publications</a>
+      <a href="/bio" >CV</a>
+    </nav>
+  </div>
+</header>
+
+<main class="main-content">
+  <div class="container">
+    <article class="post detailed">
+  <h1>FPGA-Deployable CNN Model Library</h1>
+
+  <div>
+<!--    <p class="author_title">  ·  July  1, 2021</p> -->
+    
+
+    
+    <div class="post-tags">
+      
+      
+    </div>
+  </div>
+    
+  <div class="entry">
+    <p><img src="/images/vgg16.png" alt="My helpful screenshot" /></p>
+
+<p><em>This figure visualizes the architecture of the convolutional neural network VGG16.</em></p>
+
+<p>Deep learning can be deployed to a wide range of hardware products, such as CPUs or GPUs using libraries like TensorFlow.
+In order to deploy convolutional neural network like VGG16 to custom hardware, such as FPGAs (e.g. Xilinx ZCU102), it is
+important that the framework of the fpga does support all used layers. Currently, the use out of the box models from TensorFlow on
+Xilinx FPGAs using Vitis AI is not directly supported.</p>
+
+<p>In this project, we are reimplementing all frequently used convolutional neural network using TensorFlow. The created models
+are able to be deployed on an FPGA with the framework Vitis AI.</p>
+
+<p>The following networks are currently implemented:</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Model List</th>
+      <th>Weights</th>
+      <th>ImageNet Accuracy [%]</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>VGG16</td>
+      <td>ImageNet</td>
+      <td>71.3</td>
+    </tr>
+    <tr>
+      <td>VGG19</td>
+      <td>ImageNet</td>
+      <td>71.3</td>
+    </tr>
+    <tr>
+      <td>MobileNet</td>
+      <td>ImageNet</td>
+      <td>70.6</td>
+    </tr>
+    <tr>
+      <td>ResNet34</td>
+      <td> </td>
+      <td> </td>
+    </tr>
+    <tr>
+      <td>ResNet50</td>
+      <td>ImageNet</td>
+      <td>74.9</td>
+    </tr>
+    <tr>
+      <td>ResNet101</td>
+      <td>ImageNet</td>
+      <td>76.4</td>
+    </tr>
+    <tr>
+      <td>ResNet152</td>
+      <td>ImageNet</td>
+      <td>76.6</td>
+    </tr>
+    <tr>
+      <td>DenseNet121</td>
+      <td>ImageNet</td>
+      <td>75.0</td>
+    </tr>
+    <tr>
+      <td>DenseNet161</td>
+      <td> </td>
+      <td> </td>
+    </tr>
+    <tr>
+      <td>DenseNet169</td>
+      <td>ImageNet</td>
+      <td>76.2</td>
+    </tr>
+    <tr>
+      <td>DenseNet201</td>
+      <td>ImageNet</td>
+      <td>77.3</td>
+    </tr>
+    <tr>
+      <td>InceptionV3</td>
+      <td>ImageNet</td>
+      <td>77.9</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>The following steps are currently under development:</p>
+<ul>
+  <li>Implementation of the missing networks (which are listed in the TensorFlow API)</li>
+  <li>U-Net support of the models (pix2pix)</li>
+</ul>
+
+<p><strong>Published</strong>: Currently, in progress.</p>
+
+  </div>
+
+  <!--
+  <div>
+    <p><span class="share-box">Share:</span> <a href="http://twitter.com/share?text=FPGA-Deployable CNN Model Library&url=https://www.gabrieldax.de/projects/modeldb" target="_blank">Twitter</a>, <a href="https://www.facebook.com/sharer.php?u=https://www.gabrieldax.de/projects/modeldb" target="_blank">Facebook</a></p>
+  </div>
+  -->
+  <!--<div class="date">
+    Written on July  1, 2021
+  </div>-->
+
+
+</article>
+
+  </div>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <div class="footer-links">
+      <a href="https://github.com/g4br1el">GitHub</a>
+      <a href="https://www.linkedin.com/in/gadax">LinkedIn</a>
+      <a href="mailto:gdax.science@gmail.com">Email</a>
+      <a href="/files/CV-Gabriel_Dax.pdf">Resume ↓</a>
+    </div>
+    <p class="footer-copyright">© 2026 Gabriel Dax</p>
+  </div>
+</footer>
+
+
+
+</body>
+</html>

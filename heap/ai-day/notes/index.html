@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Teaching Notes — Gabriel Dax</title>
+  <!-- Begin Jekyll SEO tag v2.9.0 -->
+<meta name="generator" content="Jekyll v4.4.1" />
+<meta property="og:title" content="Teaching Notes" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="User profile Dr. Gabriel Dax, ML Research Engineer, Fraunhofer IIS Munich PhD TUM: Algorithmic Information Theory in Spatial ML Strong: PyTorch DDP/FSDP2, NCCL, AMP, TensorRT, CUDA kernels, HPC profiling, model compression, distributed training Moderate: Quantization (INT8, FP16/BF16), TensorFlow, VitisAI/FPGA inference Weak: LLM internals, TensorRT-LLM, RLHF/alignment, Physical AI, world models No experience: JAX, Cosmos, GR00T, Isaac Sim, Omniverse" />
+<meta name="twitter:description" property="og:description" content="User profile Dr. Gabriel Dax, ML Research Engineer, Fraunhofer IIS Munich PhD TUM: Algorithmic Information Theory in Spatial ML Strong: PyTorch DDP/FSDP2, NCCL, AMP, TensorRT, CUDA kernels, HPC profiling, model compression, distributed training Moderate: Quantization (INT8, FP16/BF16), TensorFlow, VitisAI/FPGA inference Weak: LLM internals, TensorRT-LLM, RLHF/alignment, Physical AI, world models No experience: JAX, Cosmos, GR00T, Isaac Sim, Omniverse" />
+<link rel="canonical" href="https://www.gabrieldax.de/heap/ai-day/notes/" />
+<meta property="og:url" content="https://www.gabrieldax.de/heap/ai-day/notes/" />
+<meta property="og:site_name" content="Gabriel Dax — ML Research Engineer" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2026-06-24T07:37:12+00:00" />
+<meta property="article:modified_time" content="2026-06-24T07:37:12+00:00" />
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:title" content="Teaching Notes" />
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"BlogPosting","dateModified":"2026-06-24T07:37:12+00:00","datePublished":"2026-06-24T07:37:12+00:00","description":"User profile Dr. Gabriel Dax, ML Research Engineer, Fraunhofer IIS Munich PhD TUM: Algorithmic Information Theory in Spatial ML Strong: PyTorch DDP/FSDP2, NCCL, AMP, TensorRT, CUDA kernels, HPC profiling, model compression, distributed training Moderate: Quantization (INT8, FP16/BF16), TensorFlow, VitisAI/FPGA inference Weak: LLM internals, TensorRT-LLM, RLHF/alignment, Physical AI, world models No experience: JAX, Cosmos, GR00T, Isaac Sim, Omniverse","headline":"Teaching Notes","mainEntityOfPage":{"@type":"WebPage","@id":"https://www.gabrieldax.de/heap/ai-day/notes/"},"url":"https://www.gabrieldax.de/heap/ai-day/notes/"}</script>
+<!-- End Jekyll SEO tag -->
+
+  <meta content='text/html; charset=utf-8' http-equiv='Content-Type'>
+<meta http-equiv='X-UA-Compatible' content='IE=edge'>
+<meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0'>
+
+
+<meta property="og:description" content="User profile
+
+  Dr. Gabriel Dax, ML Research Engineer, Fraunhofer IIS Munich
+  PhD TUM: Algorithmic Information Theory in Spatial ML
+  Strong: PyTorch DDP/FSDP2, NCCL, AMP, TensorRT, CUDA kernels, HPC profiling, model compression, distributed training
+  Moderate: Quantization (INT8, FP16/BF16), TensorFlow, VitisAI/FPGA inference
+  Weak: LLM internals, TensorRT-LLM, RLHF/alignment, Physical AI, world models
+  No experience: JAX, Cosmos, GR00T, Isaac Sim, Omniverse
+
+" />
+
+<meta name="author" content="Gabriel Dax" />
+
+
+
+<meta property="og:title" content="Teaching Notes" />
+<meta property="twitter:title" content="Teaching Notes" />
+
+
+
+<meta property="og:image" content="https://www.gabrieldax.de/images/self.png"/>
+<meta property="twitter:image" content="https://www.gabrieldax.de/images/self.png"/>
+
+
+  <link rel="stylesheet" href="/assets/style.css">
+  <link rel="icon" type="image/png" sizes="32x32" href="/images/favicon.jpg">
+  <link rel="canonical" href="https://www.gabrieldax.de/heap/ai-day/notes/">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  
+
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div>
+      <a href="/" class="site-name">Gabriel Dax</a>
+      <span class="site-tagline">ML Research Engineer</span>
+    </div>
+    <nav>
+      <a href="/" >Home</a>
+      <a href="/projects" >Projects</a>
+      <a href="/publications" >Publications</a>
+      <a href="/bio" >CV</a>
+    </nav>
+  </div>
+</header>
+
+<main class="main-content">
+  <div class="container">
+    <div class="tutorial-wrapper">
+
+    <nav class="tutorial-breadcrumb">
+        <a href="/heap/">← All Tutorials</a>
+        
+        <span class="tutorial-position">Notes</span>
+        
+    </nav>
+
+    <article class="tutorial-article">
+        
+
+        <h1>Teaching Notes</h1>
+
+        <h2 id="user-profile">User profile</h2>
+<ul>
+  <li>Dr. Gabriel Dax, ML Research Engineer, Fraunhofer IIS Munich</li>
+  <li>PhD TUM: Algorithmic Information Theory in Spatial ML</li>
+  <li>Strong: PyTorch DDP/FSDP2, NCCL, AMP, TensorRT, CUDA kernels, HPC profiling, model compression, distributed training</li>
+  <li>Moderate: Quantization (INT8, FP16/BF16), TensorFlow, VitisAI/FPGA inference</li>
+  <li>Weak: LLM internals, TensorRT-LLM, RLHF/alignment, Physical AI, world models</li>
+  <li>No experience: JAX, Cosmos, GR00T, Isaac Sim, Omniverse</li>
+</ul>
+
+<h2 id="preferences">Preferences</h2>
+<ul>
+  <li>Explicit over clever</li>
+  <li>Type hints, modern C++ idioms</li>
+  <li>Wants to impress managers / recruiters — outcome-oriented</li>
+  <li>Native German, fluent English — workshop likely in English</li>
+</ul>
+
+<h2 id="teaching-strategy-for-this-mission">Teaching strategy for this mission</h2>
+<ul>
+  <li>FLUENCY mode: dense narrative lessons, not spaced repetition</li>
+  <li>Each lesson maps 1:1 to a workshop talk</li>
+  <li>Include “signal questions” — pre-crafted questions that demonstrate depth</li>
+  <li>Connect every topic back to the JR1980206 role requirements</li>
+  <li>Highlight where Gabriel’s existing skills intersect with the topic (his “bridge”)</li>
+</ul>
+
+<h2 id="job-posting-key-signals-jr1980206">Job posting key signals (JR1980206)</h2>
+<p>The role cares about:</p>
+<ol>
+  <li>Cross-domain DL implementation (CV, NLP/LLMs, ASR, RecSys)</li>
+  <li>New SW features: graph compilation, reduced precision training</li>
+  <li>Profiling and optimization on SOTA HW/SW</li>
+  <li>Large-scale HPC workloads</li>
+  <li>DevOps/MLOps for DL</li>
+  <li>CUDA is “a plus” — Gabriel has this</li>
+</ol>
+
+<p>Gabriel’s strongest overlap: profiling, HPC, CUDA, distributed training, PyTorch expertise
+Gabriel’s gap to close at workshop: LLM knowledge, inference optimization for LLMs specifically</p>
+
+
+        
+    </article>
+
+</div>
+  </div>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <div class="footer-links">
+      <a href="https://github.com/g4br1el">GitHub</a>
+      <a href="https://www.linkedin.com/in/gadax">LinkedIn</a>
+      <a href="mailto:gdax.science@gmail.com">Email</a>
+      <a href="/files/CV-Gabriel_Dax.pdf">Resume ↓</a>
+    </div>
+    <p class="footer-copyright">© 2026 Gabriel Dax</p>
+  </div>
+</footer>
+
+
+
+</body>
+</html>

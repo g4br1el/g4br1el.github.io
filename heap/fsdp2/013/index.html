@@ -1,0 +1,859 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Advanced Policies: CPU Offload, Per-Parameter Strategies — Gabriel Dax</title>
+  <!-- Begin Jekyll SEO tag v2.9.0 -->
+<meta name="generator" content="Jekyll v4.4.1" />
+<meta property="og:title" content="Advanced Policies: CPU Offload, Per-Parameter Strategies" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="Extreme memory optimization and fine-grained control — when standard FSDP2 isn&#39;t enough." />
+<meta name="twitter:description" property="og:description" content="Extreme memory optimization and fine-grained control — when standard FSDP2 isn&#39;t enough." />
+<link rel="canonical" href="https://www.gabrieldax.de/heap/fsdp2/013/" />
+<meta property="og:url" content="https://www.gabrieldax.de/heap/fsdp2/013/" />
+<meta property="og:site_name" content="Gabriel Dax — ML Research Engineer" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2026-06-24T07:37:12+00:00" />
+<meta property="article:modified_time" content="2026-06-24T07:37:12+00:00" />
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:title" content="Advanced Policies: CPU Offload, Per-Parameter Strategies" />
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"BlogPosting","dateModified":"2026-06-24T07:37:12+00:00","datePublished":"2026-06-24T07:37:12+00:00","description":"Extreme memory optimization and fine-grained control — when standard FSDP2 isn&#39;t enough.","headline":"Advanced Policies: CPU Offload, Per-Parameter Strategies","mainEntityOfPage":{"@type":"WebPage","@id":"https://www.gabrieldax.de/heap/fsdp2/013/"},"url":"https://www.gabrieldax.de/heap/fsdp2/013/"}</script>
+<!-- End Jekyll SEO tag -->
+
+  <meta content='text/html; charset=utf-8' http-equiv='Content-Type'>
+<meta http-equiv='X-UA-Compatible' content='IE=edge'>
+<meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0'>
+
+
+<meta property="og:description" content="Extreme memory optimization and fine-grained control — when standard FSDP2 isn't enough." />
+
+<meta name="author" content="Gabriel Dax" />
+
+
+
+<meta property="og:title" content="Advanced Policies: CPU Offload, Per-Parameter Strategies" />
+<meta property="twitter:title" content="Advanced Policies: CPU Offload, Per-Parameter Strategies" />
+
+
+
+<meta property="og:image" content="https://www.gabrieldax.de/images/self.png"/>
+<meta property="twitter:image" content="https://www.gabrieldax.de/images/self.png"/>
+
+
+  <link rel="stylesheet" href="/assets/style.css">
+  <link rel="icon" type="image/png" sizes="32x32" href="/images/favicon.jpg">
+  <link rel="canonical" href="https://www.gabrieldax.de/heap/fsdp2/013/">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  
+
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div>
+      <a href="/" class="site-name">Gabriel Dax</a>
+      <span class="site-tagline">ML Research Engineer</span>
+    </div>
+    <nav>
+      <a href="/" >Home</a>
+      <a href="/projects" >Projects</a>
+      <a href="/publications" >Publications</a>
+      <a href="/bio" >CV</a>
+    </nav>
+  </div>
+</header>
+
+<main class="main-content">
+  <div class="container">
+    <div class="tutorial-wrapper">
+
+    <nav class="tutorial-breadcrumb">
+        <a href="/heap/">← All Tutorials</a>
+        
+        <span class="tutorial-position">Lesson 13 / 18</span>
+        
+    </nav>
+
+    <article class="tutorial-article">
+        
+        <div class="tutorial-lesson-header">
+            <span class="tutorial-tag">Lesson 013</span>
+            
+            <span class="tutorial-tag tutorial-tag--secondary">Advanced</span>
+            
+            <span class="tutorial-tag tutorial-tag--secondary">Policies</span>
+            
+        </div>
+        
+
+        <h1>Advanced Policies: CPU Offload, Per-Parameter Strategies</h1>
+
+        <p><em>Extreme memory optimization and fine-grained control — when standard FSDP2 isn't enough.</em></p>
+
+<h2>When You Need Advanced Policies</h2>
+
+<p>Standard FSDP2 (per-block sharding, fp16 compute, activation checkpointing) handles most cases. You need advanced policies when:</p>
+
+<ul>
+    <li>The model <strong>still doesn't fit</strong> even with full sharding + AC (multi-billion param models on V100-32GB)</li>
+    <li>You want to <strong>selectively shard</strong> — some layers replicated (small/fast-access), others sharded (large/memory-heavy)</li>
+    <li>You need to <strong>freeze large portions</strong> of the model (fine-tuning) and avoid sharding frozen parameters</li>
+    <li>You're pushing <strong>maximum batch size</strong> and need every last GB freed from model state</li>
+</ul>
+
+<h2>CPU Offloading: The Last Resort for Memory</h2>
+
+<p>CPU offloading moves optimizer states (and optionally parameters) to CPU RAM, freeing GPU memory at the cost of PCIe transfer latency:</p>
+
+<pre><code class="language-python">from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy, CPUOffloadPolicy
+
+# CPU offload policy
+offload_policy = CPUOffloadPolicy(
+    pin_memory=True,  # Use pinned (page-locked) CPU memory for faster transfers
+)
+
+# Apply with offloading
+for block in model.blocks:
+    fully_shard(
+        block,
+        mesh=mesh,
+        mp_policy=mp_policy,
+        offload_policy=offload_policy,
+    )
+fully_shard(model, mesh=mesh, mp_policy=mp_policy, offload_policy=offload_policy)
+</code></pre>
+
+<h3>What Gets Offloaded</h3>
+
+<div class="diagram">
+    Without CPU Offload (standard FSDP2):
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    GPU Memory:
+    ├── Master weight shard (fp32)     ← always on GPU
+    ├── Gradient shard (fp32)          ← on GPU after reduce-scatter
+    ├── Adam m shard (fp32)            ← on GPU
+    ├── Adam v shard (fp32)            ← on GPU
+    ├── Unsharded block (transient fp16)
+    └── Activations
+
+    CPU Memory:
+    └── (nothing)
+
+
+    With CPU Offload:
+    ━━━━━━━━━━━━━━━━━
+
+    GPU Memory:
+    ├── Unsharded block (transient fp16) ← only during compute
+    ├── Gradient shard (transient)       ← briefly before offload
+    └── Activations
+
+    CPU Memory (pinned):
+    ├── Master weight shard (fp32)     ← offloaded
+    ├── Adam m shard (fp32)            ← offloaded
+    └── Adam v shard (fp32)            ← offloaded
+
+    Transfer:
+    GPU → CPU: gradients after reduce-scatter
+    CPU → GPU: parameters before all-gather (for next step)
+    Optimizer step: runs on CPU!
+</div>
+    </code></pre>
+
+    <div class="callout warning">
+        <strong>Critical trade-off:</strong> CPU offloading moves the optimizer step to CPU. Adam on CPU is 10–50× slower than on GPU. For ViT-Huge (632M params, sharded across 4 GPUs → 158M params/rank): CPU Adam step takes ~2-5 seconds vs ~50ms on GPU. This is acceptable only when GPU memory is the binding constraint.
+    </div>
+
+    <h3>Memory Savings from CPU Offload</h3>
+
+    <table>
+        <thead>
+        <tr><th>Component</th><th>Standard FSDP2 (4 GPUs)</th><th>With CPU Offload</th><th>Savings</th></tr>
+        </thead>
+        <tbody>
+        <tr>
+            <td>Master weights (fp32)</td>
+            <td>632 MB on GPU</td>
+            <td>0 MB on GPU (CPU pinned)</td>
+            <td>632 MB freed</td>
+        </tr>
+        <tr>
+            <td>Adam m (fp32)</td>
+            <td>632 MB on GPU</td>
+            <td>0 MB on GPU</td>
+            <td>632 MB freed</td>
+        </tr>
+        <tr>
+            <td>Adam v (fp32)</td>
+            <td>632 MB on GPU</td>
+            <td>0 MB on GPU</td>
+            <td>632 MB freed</td>
+        </tr>
+        <tr>
+            <td>Gradient shard (fp32)</td>
+            <td>632 MB on GPU</td>
+            <td>~0 (transferred to CPU quickly)</td>
+            <td>~632 MB freed</td>
+        </tr>
+        <tr>
+            <td><strong>Total GPU savings</strong></td>
+            <td></td>
+            <td></td>
+            <td><strong>~2.4 GB</strong></td>
+        </tr>
+        </tbody>
+    </table>
+
+    <p>For ViT-Huge on 4× V100-32GB: standard FSDP2 uses 2.4 GB model-prop memory per GPU. With CPU offload, this drops to nearly zero — the GPU holds only the transiently-unsharded block (~38 MB) and activations.</p>
+
+    <h3>When CPU Offload Is Justified</h3>
+
+    <pre><code class="language-python"># Decision logic for CPU offloading:
+
+def should_use_cpu_offload(
+    param_count: int,
+    num_gpus: int,
+    gpu_memory_gb: float,
+    target_batch_size: int,
+    activation_mem_per_sample_gb: float,
+    use_activation_checkpointing: bool = True,
+) -> bool:
+    """
+    Use CPU offload only when GPU memory is insufficient without it.
+    """
+    # Model-proportional memory per GPU
+    model_prop_gb = param_count * 16 / num_gpus / 1e9
+
+    # Activation memory
+    if use_activation_checkpointing:
+        # With AC: ~1 block's worth + boundary tensors
+        act_mem_gb = activation_mem_per_sample_gb * target_batch_size * 0.07  # ~7% of full
+    else:
+        act_mem_gb = activation_mem_per_sample_gb * target_batch_size
+
+    # NCCL + overhead
+    overhead_gb = 1.5
+
+    total_needed = model_prop_gb + act_mem_gb + overhead_gb
+
+    fits_without_offload = total_needed < gpu_memory_gb * 0.9  # 90% safety margin
+
+    if not fits_without_offload:
+        print(f"  Need {total_needed:.1f} GB, have {gpu_memory_gb} GB → CPU offload needed")
+        return True
+    else:
+        print(f"  Need {total_needed:.1f} GB, have {gpu_memory_gb} GB → offload unnecessary")
+        return False
+
+# For ViT-Huge, 4 GPUs, batch=32, AC enabled:
+# model_prop = 2.4 GB, act = ~2.5 GB, overhead = 1.5 GB → total = 6.4 GB
+# 6.4 GB << 32 GB → offload NOT needed
+
+# For a 3B param model, 4 GPUs, batch=8, AC enabled:
+# model_prop = 3B × 16 / 4 / 1e9 = 12 GB, act = ~3 GB, overhead = 1.5 GB → total = 16.5 GB
+# 16.5 GB < 32 GB → offload still not needed
+
+# For a 6B param model, 4 GPUs, batch=8, AC enabled:
+# model_prop = 6B × 16 / 4 / 1e9 = 24 GB, act = ~3 GB, overhead = 1.5 GB → total = 28.5 GB
+# 28.5 GB ≈ 32 GB → TIGHT. Offload recommended.
+</code></pre>
+
+    <div class="callout">
+        <strong>For your V100-32GB cluster with ViT-Huge:</strong> CPU offloading is NOT needed. You have ample headroom (6-8 GB peak vs 32 GB available). CPU offload becomes relevant if you move to 2B+ parameter models on V100, or if you need extreme batch sizes (batch=200+) for specific experiments. Know the mechanism; don't apply it prematurely.
+    </div>
+
+    <h3>Mitigating the CPU Optimizer Step Cost</h3>
+
+    <pre><code class="language-python"># The main cost of CPU offload: optimizer.step() runs on CPU
+# For 158M params/rank with Adam: ~2-5 seconds on CPU vs ~50ms on GPU
+#
+# Mitigation strategies:
+
+# 1. Overlap CPU optimizer with GPU forward of NEXT step
+#    (Advanced — requires careful synchronization)
+#    The idea: while GPU runs forward on batch N+1, CPU updates weights for batch N
+#    Then before backward of batch N+1, transfer updated weights GPU←CPU
+#    This is what DeepSpeed ZeRO-Offload does. FSDP2 supports partial overlap.
+
+# 2. Use a CPU-optimized optimizer
+#    PyTorch's fused Adam implementations are faster on CPU:
+optimizer = torch.optim.AdamW(
+    model.parameters(),
+    lr=1e-4,
+    fused=True,  # Uses fused CPU kernel — ~2× faster than default
+)
+
+# 3. Reduce optimizer state size
+#    Use 8-bit Adam (bitsandbytes) to halve m and v memory:
+#    Not directly supported in FSDP2's offload path, but possible with custom optimizer
+
+# 4. Gradient accumulation to amortize the optimizer step
+#    Accumulate N micro-batches before stepping → optimizer runs once per N forwards
+#    Total training time: N × forward_bwd + 1 × cpu_optim_step
+#    If N=4 and forward_bwd=400ms, cpu_step=3000ms:
+#      Without accum: 4 × (400ms + 3000ms) = 13.6s for 4 batches
+#      With accum:    4 × 400ms + 3000ms = 4.6s for 4 batches
+#    → 3× faster!
+</code></pre>
+
+    <h2>reshard_after_forward: Fine-Grained Memory/Speed Trade-Off</h2>
+
+    <p>By default, FSDP2 frees (reshards) unsharded parameters after each FSDP unit's forward pass. You can change this behavior:</p>
+
+    <pre><code class="language-python">from torch.distributed._composable.fsdp import fully_shard
+
+# Default behavior: reshard after forward (saves memory, costs 2nd all-gather in backward)
+fully_shard(block, mesh=mesh, mp_policy=mp_policy)
+# Equivalent to: reshard_after_forward=True
+
+# Alternative: keep parameters unsharded between forward and backward
+# Saves the backward all-gather, but keeps full params in memory longer
+fully_shard(block, mesh=mesh, mp_policy=mp_policy, reshard_after_forward=False)
+</code></pre>
+
+    <h3>The Trade-Off Visualized</h3>
+
+    <div class="diagram">
+        reshard_after_forward=True (default):
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+        Forward:   AG → compute → FREE (back to shard)
+        Backward:  AG → compute → RS
+
+        Memory: Only 1 block unsharded at a time
+        Comms:  2 all-gathers per block per step (forward + backward)
+
+
+        reshard_after_forward=False:
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+        Forward:   AG → compute → KEEP unsharded
+        Backward:  (no AG needed!) → compute → RS → FREE
+
+        Memory: ALL forward-computed blocks stay unsharded until their backward runs
+        → at backward start: all 32 blocks unsharded = FULL MODEL in memory!
+        Comms:  Only 1 all-gather per block per step (forward only)
+        50% communication reduction!
+    </div>
+        </code></pre>
+
+        <div class="callout warning">
+            <strong>reshard_after_forward=False defeats FSDP2's memory savings!</strong> If all blocks keep their unsharded params between forward and backward, you're effectively storing the full model in fp16 on each GPU — just like DDP. The only savings come from sharded optimizer states. Use this ONLY for very small models or specific layers where the communication cost is unacceptable.
+        </div>
+
+        <h3>Per-Unit reshard_after_forward</h3>
+
+        <p>The power move: apply different strategies to different FSDP units:</p>
+
+        <pre><code class="language-python">def apply_mixed_reshard_strategy(model, mesh, mp_policy):
+    """
+    Example: keep the first and last blocks unsharded (they're accessed in
+    both forward and backward close together), reshard the middle ones.
+
+    This is a micro-optimization that saves 2 all-gathers for the selected
+    blocks at the cost of their memory persisting. Only useful when:
+    1. You have memory headroom
+    2. Those specific blocks are communication-bottlenecked
+    """
+    for i, block in enumerate(model.blocks):
+        if i == 0 or i == len(model.blocks) - 1:
+            # First/last blocks: keep unsharded (tiny memory cost, saves 1 AG each)
+            fully_shard(block, mesh=mesh, mp_policy=mp_policy,
+                       reshard_after_forward=False)
+        else:
+            # Middle blocks: standard behavior (reshard after forward)
+            fully_shard(block, mesh=mesh, mp_policy=mp_policy,
+                       reshard_after_forward=True)
+
+    fully_shard(model, mesh=mesh, mp_policy=mp_policy)
+</code></pre>
+
+        <div class="callout">
+            <strong>In practice:</strong> the per-unit reshard control is rarely needed for transformers with uniform block sizes. It becomes relevant for heterogeneous architectures (e.g., a small projection head that's called multiple times, or a shared embedding layer accessed in both encoder and decoder). For your ViT-Huge training, the default (reshard=True everywhere) is correct.
+        </div>
+
+        <h2>Per-Parameter Sharding Strategies</h2>
+
+        <p>FSDP2 shards all parameters in an FSDP unit uniformly. But what if you want to replicate some parameters (small biases, LayerNorm weights) while sharding others (large weight matrices)?</p>
+
+        <h3>Why Replicate Small Parameters?</h3>
+
+        <pre><code class="language-python"># Consider LayerNorm parameters in ViT-Huge:
+#   gamma: [1280] → 1280 × 4 bytes = 5 KB
+#   beta:  [1280] → 5 KB
+#
+# Sharding 5 KB across 4 GPUs:
+#   Each rank holds 1.25 KB (320 elements)
+#   All-gather for 5 KB: dominated by latency (~5-10μs), not bandwidth
+#   The collective LAUNCH overhead exceeds the data transfer time!
+#
+# Replicating 5 KB:
+#   Each rank holds full 5 KB (negligible memory)
+#   No all-gather needed for these params
+#   Gradient: all-reduce instead of reduce-scatter (same cost for tiny tensors)
+#
+# Net: replicating tiny params saves communication latency without
+# measurable memory cost. But FSDP2 currently shards everything
+# in an FSDP unit uniformly.
+</code></pre>
+
+        <h3>Solution: Separate FSDP Units for Small Parameters</h3>
+
+        <pre><code class="language-python"># FSDP2's granularity is per-module. To get per-parameter behavior,
+# restructure your model so small/large params are in separate modules.
+
+# Approach 1: Don't shard the root (which contains embedding, head, norms)
+# Instead, only shard the heavy transformer blocks:
+
+def apply_fsdp2_selective(model, mesh, mp_policy):
+    """
+    Only shard transformer blocks. Leave root params (pos_embed, cls_token,
+    patch_embed, head) unsharded — they're small relative to the blocks.
+    """
+    # Shard blocks (heavy: ~20M params each)
+    for block in model.blocks:
+        fully_shard(block, mesh=mesh, mp_policy=mp_policy)
+
+    # Root: fully_shard with reshard_after_forward=False
+    # This means root params are gathered once and stay gathered
+    # Root params for ViT-Huge: ~3M params = ~12 MB fp32 → negligible
+    fully_shard(model, mesh=mesh, mp_policy=mp_policy, reshard_after_forward=False)
+
+    return model
+</code></pre>
+
+        <pre><code class="language-python"># Approach 2: For fine-grained control, use DTensor directly
+# This bypasses FSDP2 for specific parameters:
+
+from torch.distributed._tensor import DTensor, Replicate, distribute_tensor
+
+def replicate_small_params(model, mesh):
+    """
+    Manually set small parameters (biases, norms) to Replicate placement.
+    Must be called BEFORE fully_shard (which would override placements).
+
+    WARNING: This is an advanced pattern that interacts with FSDP2's internals.
+    Only use if you've profiled and confirmed small-param all-gathers are a bottleneck.
+    """
+    for name, param in model.named_parameters():
+        if param.numel() < 10000:  # < 10K elements → replicate
+            # Replace with a Replicate DTensor
+            replicated = distribute_tensor(param.data, mesh, placements=[Replicate()])
+            param.data = replicated
+            # Note: this param will NOT be sharded by fully_shard
+            # because it's already a DTensor with explicit placement
+</code></pre>
+
+        <div class="callout warning">
+            <strong>The second approach is fragile.</strong> FSDP2's <code>fully_shard()</code> will override DTensor placements for parameters it manages. The interaction between pre-placed DTensors and <code>fully_shard()</code> is not fully stable across PyTorch versions. Approach 1 (structural separation via FSDP unit boundaries) is more robust and recommended.
+        </div>
+
+        <h2>Freezing Parameters with FSDP2</h2>
+
+        <p>For fine-tuning scenarios where most of the model is frozen:</p>
+
+        <pre><code class="language-python">def setup_finetuning_fsdp2(model, mesh, mp_policy, num_trainable_blocks=4):
+    """
+    Fine-tune only the last N blocks + head.
+    Frozen blocks still need sharding (they're too large to replicate),
+    but their optimizer states can be eliminated.
+    """
+    total_blocks = len(model.blocks)
+
+    # Freeze early blocks
+    for i, block in enumerate(model.blocks):
+        if i < total_blocks - num_trainable_blocks:
+            for param in block.parameters():
+                param.requires_grad = False
+
+    # Freeze embeddings
+    for param in model.patch_embed.parameters():
+        param.requires_grad = False
+    model.pos_embed.requires_grad = False
+    model.cls_token.requires_grad = False
+
+    # Apply FSDP2 to ALL blocks (frozen ones still need sharding for memory)
+    for block in model.blocks:
+        fully_shard(block, mesh=mesh, mp_policy=mp_policy)
+    fully_shard(model, mesh=mesh, mp_policy=mp_policy)
+
+    # Optimizer: only on trainable params
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable_params, lr=1e-5, weight_decay=0.01)
+
+    return model, optimizer
+
+
+# Memory impact of freezing:
+# - Frozen params: still sharded (saves GPU memory for the params themselves)
+#   BUT no optimizer states (m, v) for frozen params → saves 2/3 of their memory cost
+# - For ViT-Huge, freeze 28/32 blocks:
+#   Full training: 632M × 16 bytes / 4 GPUs = 2.4 GB/GPU model-prop
+#   Fine-tuning:   632M × 4 bytes / 4 (params only, no opt states for frozen)
+#                  + 80M × 16 bytes / 4 (4 trainable blocks + head, full states)
+#                  = 0.6 GB + 0.3 GB = 0.9 GB/GPU ← significant savings
+</code></pre>
+
+        <div class="callout success">
+            <strong>Frozen parameters in FSDP2:</strong> Setting <code>requires_grad=False</code> before <code>fully_shard()</code> means FSDP2 will still shard and all-gather these parameters (needed for forward compute), but the optimizer won't allocate states for them. This saves 8 bytes/param (Adam m + v) for every frozen parameter. For fine-tuning ViT-Huge with only 4 trainable blocks: ~60% model-proportional memory reduction.
+        </div>
+
+        <h3>Communication Implications of Freezing</h3>
+
+        <pre><code class="language-python"># Frozen parameters still participate in forward all-gather:
+#   - They're needed for forward compute → must be unsharded
+#   - But no backward all-gather needed (no gradients computed)
+#   - No reduce-scatter needed (no gradients to scatter)
+#
+# Communication savings for fine-tuning (freeze 28/32 blocks):
+#   Forward: all blocks still need all-gather (32 AGs) ← unchanged
+#   Backward: only trainable blocks need AG + RS (4 AGs + 4 RSs)
+#   vs full training: 32 AGs + 32 RSs in backward
+#
+# Net: backward communication reduced by ~87.5% (4/32 blocks)
+# This significantly speeds up the backward pass for fine-tuning.
+</code></pre>
+
+        <h2>Gradient Accumulation Revisited: The FSDP2-Aware Pattern</h2>
+
+        <pre><code class="language-python">def train_with_gradient_accumulation_v2(
+    model, dataloader, optimizer, local_rank,
+    accumulation_steps: int = 4,
+    max_grad_norm: float = 1.0,
+):
+    """
+    Gradient accumulation with FSDP2.
+
+    Key insight: we cannot skip forward all-gathers (params are sharded,
+    compute is impossible without them). But we CAN skip the gradient
+    reduce-scatter on intermediate micro-batches by setting
+    requires_gradient_sync=False.
+
+    HOWEVER: skipping reduce-scatter means gradients accumulate as FULL-SIZE
+    (unshard) tensors on each rank → uses MORE memory, not less.
+
+    The realistic pattern: just run forward+backward normally for each
+    micro-batch (communication happens), accumulate the sharded gradients,
+    and step once every N micro-batches.
+    """
+    model.train()
+    optimizer.zero_grad()
+
+    for batch_idx, (images, labels) in enumerate(dataloader):
+        images = images.to(local_rank, non_blocking=True)
+        labels = labels.to(local_rank, non_blocking=True)
+
+        # Forward + backward (triggers all-gather + reduce-scatter as normal)
+        outputs = model(images)
+        loss = nn.functional.cross_entropy(outputs, labels) / accumulation_steps
+        loss.backward()
+        # Gradients are sharded and ACCUMULATED in the parameter's .grad field
+
+        # Step every N micro-batches
+        if (batch_idx + 1) % accumulation_steps == 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+            optimizer.step()
+            optimizer.zero_grad()
+</code></pre>
+
+        <div class="callout">
+            <strong>Why divide loss by accumulation_steps?</strong> Each backward accumulates gradients (sums them). If you run 4 micro-batches of size 8 to simulate batch=32, the accumulated gradient is 4× larger than a single batch=32 gradient (because it's a sum, not average, of 4 micro-batches). Dividing loss by N makes the accumulated gradient equivalent to a single forward on the full batch.
+        </div>
+
+        <h2>Combining Policies: The Full Configuration Space</h2>
+
+        <pre><code class="language-python">"""
+Comprehensive configuration showing all FSDP2 policy knobs.
+Most of these are unnecessary for standard training — shown for completeness.
+"""
+from torch.distributed._composable.fsdp import (
+    fully_shard,
+    MixedPrecisionPolicy,
+    CPUOffloadPolicy,
+)
+
+
+def build_fully_configured_model(mesh, scenario: str = "standard"):
+    """
+    Three scenarios showing different policy combinations.
+    """
+    model = timm.create_model("vit_huge_patch14_224", pretrained=False, num_classes=1000)
+    model.set_grad_checkpointing(enable=True)
+
+    if scenario == "standard":
+        # ─── Standard: what you should use for ViT-Huge on V100 ───
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype=torch.float16,
+            reduce_dtype=torch.float32,
+        )
+        for block in model.blocks:
+            fully_shard(block, mesh=mesh, mp_policy=mp_policy)
+        fully_shard(model, mesh=mesh, mp_policy=mp_policy)
+
+    elif scenario == "memory_extreme":
+        # ─── Extreme memory: for models that barely fit ───
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype=torch.float16,
+            reduce_dtype=torch.float32,
+        )
+        offload_policy = CPUOffloadPolicy(pin_memory=True)
+
+        for block in model.blocks:
+            fully_shard(
+                block, mesh=mesh,
+                mp_policy=mp_policy,
+                offload_policy=offload_policy,
+            )
+        fully_shard(
+            model, mesh=mesh,
+            mp_policy=mp_policy,
+            offload_policy=offload_policy,
+        )
+
+    elif scenario == "finetune":
+        # ─── Fine-tuning: freeze most, train last 4 blocks + head ───
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype=torch.float16,
+            reduce_dtype=torch.float32,
+        )
+
+        # Freeze early blocks
+        for block in model.blocks[:-4]:
+            for p in block.parameters():
+                p.requires_grad = False
+
+        for block in model.blocks:
+            fully_shard(block, mesh=mesh, mp_policy=mp_policy)
+        fully_shard(model, mesh=mesh, mp_policy=mp_policy)
+
+    elif scenario == "speed_optimized":
+        # ─── Speed: sacrifice some memory for less communication ───
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype=torch.float16,
+            reduce_dtype=torch.float32,
+        )
+
+        # First 2 blocks: keep unsharded (frequent access in early forward/late backward)
+        for block in model.blocks[:2]:
+            fully_shard(block, mesh=mesh, mp_policy=mp_policy,
+                       reshard_after_forward=False)
+
+        # Remaining blocks: standard
+        for block in model.blocks[2:]:
+            fully_shard(block, mesh=mesh, mp_policy=mp_policy)
+
+        fully_shard(model, mesh=mesh, mp_policy=mp_policy)
+
+    return model
+</code></pre>
+
+        <h2>Policy Decision Matrix</h2>
+
+        <table>
+            <thead>
+            <tr><th>Your situation</th><th>mp_policy</th><th>offload</th><th>reshard_after_forward</th><th>AC</th><th>Notes</th></tr>
+            </thead>
+            <tbody>
+            <tr>
+                <td>Standard training (fits in GPU)</td>
+                <td>fp16/fp32</td>
+                <td>No</td>
+                <td>True</td>
+                <td>If needed for batch</td>
+                <td>Default — use this</td>
+            </tr>
+            <tr>
+                <td>Large batch needed</td>
+                <td>fp16/fp32</td>
+                <td>No</td>
+                <td>True</td>
+                <td><strong>Yes</strong></td>
+                <td>AC frees activation memory for batch</td>
+            </tr>
+            <tr>
+                <td>Model barely fits</td>
+                <td>fp16/fp32</td>
+                <td><strong>Yes</strong></td>
+                <td>True</td>
+                <td>Yes</td>
+                <td>Offload optimizer; accept slower step</td>
+            </tr>
+            <tr>
+                <td>Fine-tuning (freeze most)</td>
+                <td>fp16/fp32</td>
+                <td>No</td>
+                <td>True</td>
+                <td>Optional</td>
+                <td>Freeze → no optimizer states for frozen</td>
+            </tr>
+            <tr>
+                <td>Communication-bound (small batch)</td>
+                <td>fp16/fp32</td>
+                <td>No</td>
+                <td><strong>False for selected</strong></td>
+                <td>No (need memory for unsharded params)</td>
+                <td>Trade memory for fewer all-gathers</td>
+            </tr>
+            <tr>
+                <td>Multi-billion params on V100</td>
+                <td>fp16/fp32</td>
+                <td>Yes</td>
+                <td>True</td>
+                <td>Yes</td>
+                <td>All optimizations stacked</td>
+            </tr>
+            </tbody>
+        </table>
+
+        <h2>Interaction with torch.compile</h2>
+
+        <pre><code class="language-python"># CPU offload + torch.compile:
+#   Works, but the optimizer step (on CPU) is NOT compiled.
+#   Only GPU compute is compiled. The offload transfer is eager.
+#   Net: compile speedup applies only to forward/backward, not optimizer.
+
+# reshard_after_forward=False + torch.compile:
+#   Works. Parameters that stay unsharded are just regular tensors
+#   from the compiler's perspective — no different from Replicate.
+
+# Frozen parameters + torch.compile:
+#   Works well. Frozen blocks with no backward become simpler graphs
+#   for the compiler — potentially FASTER compilation.
+#   The compiler can optimize the frozen forward as a pure function.
+</code></pre>
+
+        <h2 id="quiz">Check Your Understanding</h2>
+
+        <div class="quiz">
+            <h3>Q1: You're training a 6B parameter model on 4× V100-32GB. Standard FSDP2 + AC gives a model-prop memory of 24 GB/GPU. What's the correct action?</h3>
+            <button onclick="checkAnswer(this, false)">Use reshard_after_forward=False to reduce communication and hope the saved time compensates for the memory pressure</button>
+            <button onclick="checkAnswer(this, false)">Switch to 1-D mesh with 32 GPUs (8 nodes) to reduce per-GPU model-prop to 3 GB</button>
+            <button onclick="checkAnswer(this, true)">Enable CPU offloading to move optimizer states (~18 GB of the 24 GB) to CPU, leaving only ~6 GB model-prop on GPU for params + transient grads</button>
+            <button onclick="checkAnswer(this, false)">Use gradient accumulation with accumulation_steps=8 to reduce memory usage by spreading it across more steps</button>
+            <div class="explanation">
+                <strong>Correct.</strong> With 24 GB model-prop + activations, you'd exceed 32 GB. CPU offloading moves optimizer states (Adam m + v + master weights = 3/4 of model-prop = ~18 GB) to CPU RAM, leaving only gradients (~6 GB, transient) on GPU. This frees enough GPU memory for activations. Option B (32 GPUs) would also work (3 GB/GPU) but requires 8 nodes — the question implies 4 GPUs. Option D (gradient accumulation) doesn't reduce peak memory — each micro-batch still needs full model-prop memory.
+            </div>
+        </div>
+
+        <div class="quiz">
+            <h3>Q2: Setting reshard_after_forward=False on all FSDP units effectively makes FSDP2 behave like which ZeRO stage?</h3>
+            <button onclick="checkAnswer(this, false)">ZeRO Stage 1 (shard optimizer states only)</button>
+            <button onclick="checkAnswer(this, true)">ZeRO Stage 2 (shard optimizer states + gradients, but parameters are replicated during forward→backward)</button>
+            <button onclick="checkAnswer(this, false)">ZeRO Stage 3 (shard everything) — the reshard setting doesn't change the fundamental strategy</button>
+            <button onclick="checkAnswer(this, false)">DDP (no sharding at all) — keeping params unsharded is equivalent to full replication</button>
+            <div class="explanation">
+                <strong>Correct.</strong> With reshard_after_forward=False, parameters are all-gathered in forward and stay unsharded through backward. Only gradients are reduce-scattered (sharded) at the end of backward. Optimizer states remain sharded. This matches ZeRO Stage 2: optimizer states + gradients are sharded, but parameters exist in full on each GPU during the forward-backward window. Memory savings come only from sharded optimizer states (not 16× per param, but ~12×). Note: it's not quite DDP (answer D) because optimizer states ARE still sharded.
+            </div>
+        </div>
+
+        <div class="quiz">
+            <h3>Q3: You're fine-tuning ViT-Huge with only the last 4 blocks trainable. Compared to full training, how does backward communication change?</h3>
+            <button onclick="checkAnswer(this, false)">Identical — all blocks still need all-gather in backward for gradient computation through the frozen layers</button>
+            <button onclick="checkAnswer(this, true)">Only the 4 trainable blocks need backward all-gather + reduce-scatter; frozen blocks have no backward communication</button>
+            <button onclick="checkAnswer(this, false)">All 32 blocks need reduce-scatter (gradients flow through all layers) but only 4 need all-gather</button>
+            <button onclick="checkAnswer(this, false)">Zero backward communication — frozen layers stop gradient flow entirely, so backward only reaches the head</button>
+            <div class="explanation">
+                <strong>Correct.</strong> Frozen parameters (requires_grad=False) mean autograd doesn't compute gradients for those layers. No gradient → no need to all-gather those params in backward (no grad computation to do) → no reduce-scatter (no gradient to scatter). Only the 4 trainable blocks need both backward all-gather (for grad computation) and reduce-scatter (to shard the resulting gradient). Forward all-gathers still happen for all 32 blocks (needed for forward compute regardless of frozen status). Note: answer D is wrong because gradients DO flow through frozen layers (they're just not computed w.r.t. frozen params — the chain rule still propagates to trainable downstream params).
+            </div>
+        </div>
+
+        <div class="quiz">
+            <h3>Q4: With CPU offloading enabled, why does gradient accumulation (accumulation_steps=4) help throughput more than without offloading?</h3>
+            <button onclick="checkAnswer(this, false)">Gradient accumulation reduces the number of all-gathers by 4×, which matters more when PCIe transfers compete with NCCL</button>
+            <button onclick="checkAnswer(this, true)">The CPU optimizer step (~3s) is amortized over 4 forward/backward passes instead of 1, making its per-sample cost 4× lower</button>
+            <button onclick="checkAnswer(this, false)">CPU memory bandwidth is the bottleneck, and accumulating larger gradient buffers gives better burst transfer efficiency</button>
+            <button onclick="checkAnswer(this, false)">Without accumulation, the CPU optimizer blocks GPU compute; with accumulation, the GPU runs 4 passes concurrently with one CPU step</button>
+            <div class="explanation">
+                <strong>Correct.</strong> With CPU offload, the optimizer step is the dominant cost (~3s on CPU vs ~400ms per forward+backward on GPU). Without accumulation: each step = 400ms GPU + 3000ms CPU = 3400ms per batch. With accumulation_steps=4: 4×400ms + 3000ms = 4600ms for 4 batches = 1150ms per batch. That's 3× faster per sample. The GPU forward/backward still incurs full FSDP2 communication each micro-batch, but the expensive CPU step happens only once per 4 micro-batches.
+            </div>
+        </div>
+
+        <h2>Key Takeaways</h2>
+        <ol>
+            <li><strong>CPU offloading is a last resort.</strong> It moves optimizer states to CPU, freeing ~75% of model-proportional GPU memory. The cost: optimizer step runs on CPU (10-50× slower). Mitigate with gradient accumulation.</li>
+            <li><strong>reshard_after_forward=False</strong> keeps parameters unsharded between forward and backward, eliminating the backward all-gather. Cost: full model in GPU memory during forward→backward. Effectively ZeRO Stage 2. Rarely useful for transformers.</li>
+            <li><strong>Per-unit policies:</strong> apply different reshard/offload settings to different FSDP units. Enables hybrid strategies (replicate small root params, shard heavy blocks).</li>
+            <li><strong>Frozen parameters</strong> still need sharding (for forward memory) and forward all-gathers (for compute), but eliminate backward communication and optimizer states for those layers. Significant memory + communication savings for fine-tuning.</li>
+            <li><strong>For your ViT-Huge on V100:</strong> standard policies (Lesson 003-010) are sufficient. These advanced policies become relevant at 2B+ parameters or for fine-tuning workflows.</li>
+            <li><strong>Gradient accumulation with offloading:</strong> amortizes the slow CPU optimizer step across N micro-batches. Critical for making offloading practical.</li>
+        </ol>
+
+        <h2>Primary Source</h2>
+        <p>Study the <a href="https://github.com/pytorch/pytorch/blob/main/torch/distributed/_composable/fsdp/fully_shard.py">fully_shard() source code</a> — specifically the function signature and its docstring which documents all policy arguments. Also examine the <a href="https://github.com/pytorch/pytorch/blob/main/torch/distributed/_composable/fsdp/_fsdp_collectives.py">_fsdp_collectives.py</a> to see how reshard_after_forward changes the communication pattern. For CPU offloading details, see the <a href="https://github.com/pytorch/pytorch/blob/main/torch/distributed/_composable/fsdp/_fsdp_state.py">FSDPState._offload_params()</a> implementation.</p>
+
+
+        <script>
+            function checkAnswer(btn, correct) {
+                const quiz = btn.closest('.quiz');
+                const buttons = quiz.querySelectorAll('button');
+                const explanation = quiz.querySelector('.explanation');
+                buttons.forEach(b => { b.disabled = true; b.classList.remove('correct', 'incorrect'); });
+                if (correct) {
+                    btn.classList.add('correct');
+                } else {
+                    btn.classList.add('incorrect');
+                    buttons.forEach(b => { if (b.getAttribute('onclick').includes('true')) b.classList.add('correct'); });
+                }
+                explanation.style.display = 'block';
+            }
+        </script>
+
+
+        
+        <!-- _includes/tutorial-nav.html -->
+
+
+
+
+
+
+
+
+
+
+
+
+<nav class="tutorial-nav" aria-label="Lesson navigation">
+    
+    <a href="/heap/fsdp2/012/" class="tutorial-nav-btn tutorial-nav-prev">
+        <span class="tutorial-nav-label">← Previous</span>
+        <span class="tutorial-nav-title">012 — Profiling & Debugging FSDP2: Memory, NCCL, Bottlenecks</span>
+    </a>
+    
+
+    
+    <a href="/heap/fsdp2/0014/" class="tutorial-nav-btn tutorial-nav-next">
+        <span class="tutorial-nav-label">Next →</span>
+        <span class="tutorial-nav-title">014 — Migrating an Existing DDP Pipeline to FSDP2</span>
+    </a>
+    
+</nav>
+        
+    </article>
+
+</div>
+  </div>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <div class="footer-links">
+      <a href="https://github.com/g4br1el">GitHub</a>
+      <a href="https://www.linkedin.com/in/gadax">LinkedIn</a>
+      <a href="mailto:gdax.science@gmail.com">Email</a>
+      <a href="/files/CV-Gabriel_Dax.pdf">Resume ↓</a>
+    </div>
+    <p class="footer-copyright">© 2026 Gabriel Dax</p>
+  </div>
+</footer>
+
+
+
+</body>
+</html>

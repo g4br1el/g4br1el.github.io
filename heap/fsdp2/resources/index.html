@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FSDP2 Resources — Gabriel Dax</title>
+  <!-- Begin Jekyll SEO tag v2.9.0 -->
+<meta name="generator" content="Jekyll v4.4.1" />
+<meta property="og:title" content="FSDP2 Resources" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="Knowledge" />
+<meta name="twitter:description" property="og:description" content="Knowledge" />
+<link rel="canonical" href="https://www.gabrieldax.de/heap/fsdp2/resources/" />
+<meta property="og:url" content="https://www.gabrieldax.de/heap/fsdp2/resources/" />
+<meta property="og:site_name" content="Gabriel Dax — ML Research Engineer" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2026-06-24T07:37:12+00:00" />
+<meta property="article:modified_time" content="2026-06-24T07:37:12+00:00" />
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:title" content="FSDP2 Resources" />
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"BlogPosting","dateModified":"2026-06-24T07:37:12+00:00","datePublished":"2026-06-24T07:37:12+00:00","description":"Knowledge","headline":"FSDP2 Resources","mainEntityOfPage":{"@type":"WebPage","@id":"https://www.gabrieldax.de/heap/fsdp2/resources/"},"url":"https://www.gabrieldax.de/heap/fsdp2/resources/"}</script>
+<!-- End Jekyll SEO tag -->
+
+  <meta content='text/html; charset=utf-8' http-equiv='Content-Type'>
+<meta http-equiv='X-UA-Compatible' content='IE=edge'>
+<meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0'>
+
+
+<meta property="og:description" content="Knowledge
+" />
+
+<meta name="author" content="Gabriel Dax" />
+
+
+
+<meta property="og:title" content="FSDP2 Resources" />
+<meta property="twitter:title" content="FSDP2 Resources" />
+
+
+
+<meta property="og:image" content="https://www.gabrieldax.de/images/self.png"/>
+<meta property="twitter:image" content="https://www.gabrieldax.de/images/self.png"/>
+
+
+  <link rel="stylesheet" href="/assets/style.css">
+  <link rel="icon" type="image/png" sizes="32x32" href="/images/favicon.jpg">
+  <link rel="canonical" href="https://www.gabrieldax.de/heap/fsdp2/resources/">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  
+
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div>
+      <a href="/" class="site-name">Gabriel Dax</a>
+      <span class="site-tagline">ML Research Engineer</span>
+    </div>
+    <nav>
+      <a href="/" >Home</a>
+      <a href="/projects" >Projects</a>
+      <a href="/publications" >Publications</a>
+      <a href="/bio" >CV</a>
+    </nav>
+  </div>
+</header>
+
+<main class="main-content">
+  <div class="container">
+    <div class="tutorial-wrapper">
+
+    <nav class="tutorial-breadcrumb">
+        <a href="/heap/">← All Tutorials</a>
+        
+        <span class="tutorial-position">Mission</span>
+        
+    </nav>
+
+    <article class="tutorial-article">
+        
+
+        <h1>FSDP2 Resources</h1>
+
+        <h2 id="knowledge">Knowledge</h2>
+
+<ul>
+  <li>
+    <p><a href="https://pytorch.org/docs/stable/distributed.html">PyTorch FSDP2 Tutorial — Official Docs (torch.distributed)</a>
+Canonical API reference. Use for: <code class="language-plaintext highlighter-rouge">fully_shard</code>, <code class="language-plaintext highlighter-rouge">MixedPrecisionPolicy</code>, <code class="language-plaintext highlighter-rouge">CPUOffloadPolicy</code> signatures.</p>
+  </li>
+  <li>
+    <p><a href="https://pytorch.org/blog/fully-sharded-data-parallel-faster-ai-training-with-fewer-resources/">PyTorch Blog: “Fully Sharded Data Parallel: faster AI training with fewer GPUs”</a>
+High-level FSDP1 motivation. Use for: understanding the ZeRO lineage and why sharding works.</p>
+  </li>
+  <li>
+    <p><a href="https://github.com/pytorch/pytorch/blob/main/torch/distributed/_composable/fsdp/README.md">PyTorch RFC / Design Doc: Composable FSDP (FSDP2)</a>
+Internal design doc for FSDP2. Use for: DTensor integration, why FlatParamHandle was removed, composability goals.</p>
+  </li>
+  <li>
+    <p><a href="https://arxiv.org/abs/1910.02054">ZeRO: Memory Optimizations Toward Training Trillion Parameter Models — Rajbhandari et al. 2020</a>
+The foundational paper. Use for: understanding Stage 1/2/3 sharding and their memory/communication trade-offs.</p>
+  </li>
+  <li>
+    <p><a href="https://github.com/pytorch/pytorch/blob/main/torch/distributed/_tensor/README.md">PyTorch DTensor RFC and docs</a>
+DTensor is the substrate of FSDP2. Use for: placement specs (Shard, Replicate), DeviceMesh semantics.</p>
+  </li>
+  <li>
+    <p><a href="https://pytorch.org/docs/stable/distributed.checkpoint.html">PyTorch Distributed Checkpoint (DCP)</a>
+Use for: saving/loading sharded model state without gathering to rank 0.</p>
+  </li>
+  <li>
+    <p><a href="https://github.com/pytorch/pytorch/tree/main/torch/distributed/_composable/fsdp">Source code: torch/distributed/_composable/fsdp/</a>
+The actual implementation. Use for: understanding FSDPState, pre-forward/post-forward hooks, communication scheduling.</p>
+  </li>
+  <li>
+    <p><a href="https://github.com/pytorch/torchtitan">torchtitan — PyTorch reference training loop</a>
+Official reference for large-scale training with FSDP2 + compile + async TP. Use for: production patterns.</p>
+  </li>
+</ul>
+
+<h2 id="wisdom-communities">Wisdom (Communities)</h2>
+
+<ul>
+  <li>
+    <p><a href="https://github.com/pytorch/pytorch/discussions/categories/distributed">PyTorch Distributed GitHub Discussions</a>
+Core devs (Andrew Gu, Wanchao Liang) respond here. Best for: debugging edge cases.</p>
+  </li>
+  <li>
+    <p><a href="https://dev-discuss.pytorch.org/c/distributed/7">PyTorch Dev Forums — Distributed category</a>
+Design discussions and RFC feedback. Best for: understanding why decisions were made.</p>
+  </li>
+</ul>
+
+<h2 id="gaps">Gaps</h2>
+
+<ul>
+  <li>No single comprehensive tutorial covers FSDP2 end-to-end with V100-specific considerations</li>
+  <li>Limited benchmarking data for FSDP2 on V100 NVLink clusters (most public benchmarks are A100/H100)</li>
+  <li>Interaction between FSDP2 and custom CUDA kernels (e.g., user’s pybind11 extensions) — unclear documentation</li>
+</ul>
+
+
+        
+    </article>
+
+</div>
+  </div>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <div class="footer-links">
+      <a href="https://github.com/g4br1el">GitHub</a>
+      <a href="https://www.linkedin.com/in/gadax">LinkedIn</a>
+      <a href="mailto:gdax.science@gmail.com">Email</a>
+      <a href="/files/CV-Gabriel_Dax.pdf">Resume ↓</a>
+    </div>
+    <p class="footer-copyright">© 2026 Gabriel Dax</p>
+  </div>
+</footer>
+
+
+
+</body>
+</html>

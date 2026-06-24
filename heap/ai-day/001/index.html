@@ -1,0 +1,683 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>From Pre-training to Alignment: The Full LLM Lifecycle — Gabriel Dax</title>
+  <!-- Begin Jekyll SEO tag v2.9.0 -->
+<meta name="generator" content="Jekyll v4.4.1" />
+<meta property="og:title" content="From Pre-training to Alignment: The Full LLM Lifecycle" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="1. Context: Why NVIDIA Cares About the Full Lifecycle" />
+<meta name="twitter:description" property="og:description" content="1. Context: Why NVIDIA Cares About the Full Lifecycle" />
+<link rel="canonical" href="https://www.gabrieldax.de/heap/ai-day/001/" />
+<meta property="og:url" content="https://www.gabrieldax.de/heap/ai-day/001/" />
+<meta property="og:site_name" content="Gabriel Dax — ML Research Engineer" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2026-06-24T07:37:12+00:00" />
+<meta property="article:modified_time" content="2026-06-24T07:37:12+00:00" />
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:title" content="From Pre-training to Alignment: The Full LLM Lifecycle" />
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"BlogPosting","dateModified":"2026-06-24T07:37:12+00:00","datePublished":"2026-06-24T07:37:12+00:00","description":"1. Context: Why NVIDIA Cares About the Full Lifecycle","headline":"From Pre-training to Alignment: The Full LLM Lifecycle","mainEntityOfPage":{"@type":"WebPage","@id":"https://www.gabrieldax.de/heap/ai-day/001/"},"url":"https://www.gabrieldax.de/heap/ai-day/001/"}</script>
+<!-- End Jekyll SEO tag -->
+
+  <meta content='text/html; charset=utf-8' http-equiv='Content-Type'>
+<meta http-equiv='X-UA-Compatible' content='IE=edge'>
+<meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0'>
+
+
+<meta property="og:description" content="1. Context: Why NVIDIA Cares About the Full Lifecycle" />
+
+<meta name="author" content="Gabriel Dax" />
+
+
+
+<meta property="og:title" content="From Pre-training to Alignment: The Full LLM Lifecycle" />
+<meta property="twitter:title" content="From Pre-training to Alignment: The Full LLM Lifecycle" />
+
+
+
+<meta property="og:image" content="https://www.gabrieldax.de/images/self.png"/>
+<meta property="twitter:image" content="https://www.gabrieldax.de/images/self.png"/>
+
+
+  <link rel="stylesheet" href="/assets/style.css">
+  <link rel="icon" type="image/png" sizes="32x32" href="/images/favicon.jpg">
+  <link rel="canonical" href="https://www.gabrieldax.de/heap/ai-day/001/">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  
+
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div>
+      <a href="/" class="site-name">Gabriel Dax</a>
+      <span class="site-tagline">ML Research Engineer</span>
+    </div>
+    <nav>
+      <a href="/" >Home</a>
+      <a href="/projects" >Projects</a>
+      <a href="/publications" >Publications</a>
+      <a href="/bio" >CV</a>
+    </nav>
+  </div>
+</header>
+
+<main class="main-content">
+  <div class="container">
+    <div class="tutorial-wrapper">
+
+    <nav class="tutorial-breadcrumb">
+        <a href="/heap/">← All Tutorials</a>
+        
+        <span class="tutorial-position">Lesson 1 / 5</span>
+        
+    </nav>
+
+    <article class="tutorial-article">
+        
+        <div class="tutorial-lesson-header">
+            <span class="tutorial-tag">Lesson 001</span>
+            
+            <span class="tutorial-tag tutorial-tag--secondary">LLM</span>
+            
+        </div>
+        
+
+        <h1>From Pre-training to Alignment: The Full LLM Lifecycle</h1>
+
+        <h2>1. Context: Why NVIDIA Cares About the Full Lifecycle</h2>
+
+<p>
+    NVIDIA doesn't just sell GPUs — it sells the <strong>platform</strong> for building LLMs end-to-end.
+    The speaker, Giuseppe Fiameni, is a Solution Architect at NVIDIA who helps enterprise customers
+    train and align LLMs using NVIDIA's software stack. His talk will almost certainly walk through the
+    pipeline as implemented in <strong>NeMo Framework</strong> and <strong>Megatron-LM</strong> — NVIDIA's
+    flagship tools for large-scale LLM development.
+</p>
+
+<p>
+    Understanding this pipeline matters for you because the
+    <a href="../CAREERS AT NVIDIA.pdf">JR1980206 role</a> requires implementing DL models across domains
+    including NLP/LLMs, and profiling their performance on NVIDIA hardware. You don't need to be an
+    alignment researcher — you need to understand what the pipeline <em>does</em> at each stage so you
+    can profile, optimize, and benchmark it.
+</p>
+
+<div class="bridge">
+    <strong>Your existing mental model</strong>: You already understand distributed training (DDP, FSDP2, NCCL),
+    mixed-precision (FP16/BF16), and scaling to multi-node. LLM pre-training is essentially this — but with
+    additional parallelism dimensions (tensor, pipeline, sequence, expert) because models don't fit on one GPU.
+    Post-training (SFT, RLHF, DPO) is what's genuinely new to you.
+</div>
+
+<h2>2. Stage 1: Pre-training</h2>
+
+<h3>2.1 Objective</h3>
+
+<p>
+    Pre-training produces a <strong>base model</strong>: a next-token predictor trained on trillions of tokens.
+    The training objective is causal language modeling — predict the next token given all previous tokens.
+    This is self-supervised: no human labels needed, just raw text.
+</p>
+
+<p>
+    The loss function is cross-entropy over the vocabulary at each position:
+</p>
+
+<pre><code>L = -∑ₜ log P(xₜ | x₁, ..., xₜ₋₁; θ)</code></pre>
+
+<p>
+    A base model (e.g., Llama-3 base, GPT-4 base) is <em>not</em> a chatbot. It's a completion engine.
+    If you prompt it with "What is the capital of France?", it might continue with "What is the capital of Germany?
+    What is the capital of Italy?" — because that's the most likely continuation in its training distribution.
+    Making it actually <em>answer</em> questions is what post-training achieves.
+</p>
+
+<div class="concept-box">
+    <h4>Key Insight</h4>
+    Pre-training is where 99%+ of total compute is spent. A typical frontier model (e.g., Llama-3 405B)
+    uses ~30 million GPU-hours for pre-training vs. ~thousands of GPU-hours for post-training.
+    This is why NVIDIA's parallelism engineering (Megatron-LM) matters so much.
+</div>
+
+<h3>2.2 Data</h3>
+
+<p>
+    Modern pre-training corpora are 10–15 trillion tokens, curated from web crawls (Common Crawl),
+    books, code (GitHub), scientific papers, and curated datasets. Data quality dominates model quality
+    — the field has shifted from "more data" to "better data" (see: Llama-3's emphasis on filtering
+    and deduplication, <a href="https://arxiv.org/abs/2407.21783">Llama 3 paper, Section 3</a>).
+</p>
+
+<p>Key data engineering concerns:</p>
+<ul>
+    <li><strong>Deduplication</strong> — exact and near-duplicate removal (MinHash, suffix arrays)</li>
+    <li><strong>Quality filtering</strong> — perplexity-based scoring, classifier-based filtering</li>
+    <li><strong>Data mixing</strong> — ratio of web/code/books/scientific text matters enormously</li>
+    <li><strong>Tokenization</strong> — BPE (Byte-Pair Encoding) with vocabulary sizes of 32k–128k tokens</li>
+</ul>
+
+<div class="bridge">
+    <strong>Connection to your work</strong>: This is analogous to your data pipeline work with NVIDIA DALI
+    and WebDataset — but at a much larger scale. The bottleneck is often I/O and preprocessing, not GPU
+    compute. NVIDIA's approach uses NeMo Data Curator for this stage.
+</div>
+
+<h3>2.3 Parallelism Strategies (Megatron-LM)</h3>
+
+<p>
+    A 70B-parameter model in FP16 requires ~140 GB just for weights — it doesn't fit on a single 80 GB
+    GPU. A 405B model needs ~810 GB. This necessitates <strong>model parallelism</strong> beyond what
+    DDP provides. Megatron-LM implements a multi-dimensional parallelism strategy:
+</p>
+
+<table>
+    <thead>
+    <tr>
+        <th>Parallelism</th>
+        <th>What's Split</th>
+        <th>Communication</th>
+        <th>When to Use</th>
+    </tr>
+    </thead>
+    <tbody>
+    <tr>
+        <td><strong>Data Parallel (DP)</strong></td>
+        <td>Batch across replicas</td>
+        <td>All-reduce gradients</td>
+        <td>Always (outer dimension)</td>
+    </tr>
+    <tr>
+        <td><strong>Tensor Parallel (TP)</strong></td>
+        <td>Weight matrices within a layer</td>
+        <td>All-reduce per layer (intra-node)</td>
+        <td>Within a single node (NVLink bandwidth)</td>
+    </tr>
+    <tr>
+        <td><strong>Pipeline Parallel (PP)</strong></td>
+        <td>Layers across GPUs</td>
+        <td>Point-to-point (inter-node OK)</td>
+        <td>When TP alone can't fit the model</td>
+    </tr>
+    <tr>
+        <td><strong>Sequence Parallel (SP)</strong></td>
+        <td>Sequence dim for LayerNorm/Dropout</td>
+        <td>Minimal (reuses TP comm group)</td>
+        <td>Reduces activation memory</td>
+    </tr>
+    <tr>
+        <td><strong>Context Parallel (CP)</strong></td>
+        <td>Sequence dim for attention</td>
+        <td>All-to-all within CP group</td>
+        <td>Very long sequences (128k+ tokens)</td>
+    </tr>
+    <tr>
+        <td><strong>Expert Parallel (EP)</strong></td>
+        <td>MoE experts across GPUs</td>
+        <td>All-to-all for token routing</td>
+        <td>Mixture-of-Experts models</td>
+    </tr>
+    </tbody>
+</table>
+
+<p>
+    In practice, these are composed: e.g., Llama-3 405B training used TP=8 (within node) × PP=16 (across nodes)
+    × DP=many. The total GPU count for frontier models is 16,000–32,000 H100s.
+</p>
+
+<div class="concept-box">
+    <h4>TP vs. FSDP/ZeRO</h4>
+    You know FSDP2 (ZeRO-3), which shards weights/gradients/optimizer states across GPUs but reconstructs
+    them for computation. This is <em>memory-efficient data parallelism</em> — each GPU still processes
+    the full model per forward pass. Tensor Parallelism is fundamentally different: each GPU only ever computes
+    a <em>shard</em> of each layer. TP requires much higher bandwidth (NVLink) but achieves true model
+    parallelism without reconstruction overhead.
+    <br><br>
+    In Megatron-LM, you typically use TP within a node (where NVLink gives 900 GB/s) and DP/PP across nodes
+    (where InfiniBand gives ~400 GB/s per link). FSDP is an alternative to Megatron's DP but
+    <strong>Megatron's distributed optimizer</strong> achieves similar memory savings with better overlap.
+</div>
+
+<div class="bridge">
+    <strong>Your leverage point</strong>: Your experience with DDP/FSDP2/NCCL and scaling to 32 GPUs / 8 nodes
+    maps directly to understanding these parallelism strategies. The difference is <em>degree</em>
+    (16k GPUs vs. 32) and <em>dimensionality</em> (5D parallelism vs. data-parallel only). When the speaker
+    mentions Megatron-LM parallelism, you can map it to your mental model of collective operations
+    and bandwidth constraints.
+</div>
+
+<h3>2.4 Training Infrastructure Details</h3>
+
+<p>Key engineering concerns during pre-training that NVIDIA solves:</p>
+
+<ul>
+    <li><strong>Checkpointing</strong>: Distributed checkpointing at scale (TBs of state). NeMo uses async
+        checkpointing to avoid blocking training.</li>
+    <li><strong>Fault tolerance</strong>: At 16k GPUs, hardware failures happen hourly. Elastic training,
+        automatic restart from checkpoint.</li>
+    <li><strong>Mixed precision</strong>: BF16 for computation, FP32 master weights, loss scaling.
+        On Hopper: FP8 forward pass (E4M3) with FP8 gradients (E5M2) via Transformer Engine.</li>
+    <li><strong>Communication overlap</strong>: Overlapping gradient all-reduce with backward pass computation
+        (you already do this with DDP — Megatron extends it to TP/PP communication).</li>
+    <li><strong>Activation checkpointing</strong>: Selective recomputation of activations to reduce memory
+        at the cost of ~33% more compute.</li>
+</ul>
+
+<h3>2.5 Scaling Laws</h3>
+
+<p>
+    Chinchilla scaling laws (<a href="https://arxiv.org/abs/2203.15556">Hoffmann et al., 2022</a>) established
+    that for compute-optimal training, model size and dataset size should scale equally. For a compute
+    budget C, optimal model size N and token count D satisfy: N ∝ C^0.5, D ∝ C^0.5.
+</p>
+
+<p>
+    However, the field has moved beyond strict Chinchilla-optimality toward <strong>inference-optimal</strong>
+    training: deliberately over-training smaller models (more tokens than Chinchilla suggests) because
+    a smaller model is cheaper to serve. Llama-3 8B was trained on 15T tokens — far beyond Chinchilla-optimal
+    — because inference cost dominates total cost of ownership.
+</p>
+
+<div class="concept-box">
+    <h4>Why This Matters for Your Role</h4>
+    The JR1980206 role involves profiling training runs. Understanding scaling laws tells you what's
+    <em>expected</em> performance: if you're profiling a 70B model on 256 GPUs and the MFU
+    (Model FLOPs Utilization) is below 40%, you know something is wrong. Frontier models achieve
+    40–55% MFU on H100 clusters. This is the performance target.
+</div>
+
+<h2>3. Stage 2: Supervised Fine-Tuning (SFT)</h2>
+
+<p>
+    After pre-training, the base model is a raw completion engine. SFT transforms it into an
+    instruction-following assistant by training on curated (instruction, response) pairs:
+</p>
+
+<pre><code># SFT data format (simplified)
+{"instruction": "Summarize the following article in 3 bullet points.",
+ "input": "The European Central Bank announced...",
+ "output": "• ECB raised rates by 25bp\n• Inflation forecast revised to...\n• Markets reacted..."}
+</code></pre>
+
+<p>
+    SFT is standard supervised learning — same cross-entropy loss as pre-training, but only computed on
+    the <strong>response tokens</strong> (the instruction tokens are masked from the loss). Dataset sizes
+    are small: 10k–100k high-quality examples are sufficient.
+</p>
+
+<p>Key engineering points:</p>
+<ul>
+    <li>Learning rate is much lower than pre-training (typically 1e-5 to 2e-5)</li>
+    <li>Training is short: 1–5 epochs over the SFT dataset</li>
+    <li>Data quality > quantity: a single bad example can teach harmful patterns</li>
+    <li>Chat template formatting matters (special tokens for turns: <code>&lt;|user|&gt;</code>, <code>&lt;|assistant|&gt;</code>)</li>
+</ul>
+
+<div class="concept-box">
+    <h4>SFT vs. Full Fine-tuning vs. LoRA</h4>
+    SFT can be done as full fine-tuning (all parameters updated) or parameter-efficient fine-tuning
+    (LoRA/QLoRA — only low-rank adapter weights updated). At NVIDIA's scale, they typically do
+    full fine-tuning because they have the compute. LoRA is more relevant for customers fine-tuning
+    on limited hardware. NeMo supports both.
+</div>
+
+<h2>4. Stage 3: Alignment (RLHF and DPO)</h2>
+
+<p>
+    SFT gets you an instruction-following model, but it still has problems: it may be verbose, hallucinate
+    confidently, produce harmful content, or fail to refuse unsafe requests. <strong>Alignment</strong>
+    steers the model's behavior toward human preferences beyond just "follow instructions correctly."
+</p>
+
+<h3>4.1 RLHF: Reinforcement Learning from Human Feedback</h3>
+
+<p>The classic RLHF pipeline (InstructGPT, <a href="https://arxiv.org/abs/2203.02155">Ouyang et al., 2022</a>) has three stages:</p>
+
+<p><strong>Step 1: Train a Reward Model (RM)</strong></p>
+<p>
+    Human annotators rank multiple model outputs for the same prompt (e.g., "Response A is better than
+    Response B"). A reward model is trained to predict these rankings:
+</p>
+
+<pre><code># Bradley-Terry preference model
+# Given prompt x, preferred response y_w, rejected response y_l:
+L_RM = -log(σ(r(x, y_w) - r(x, y_l)))
+
+# Where r(x, y) is the scalar reward score
+# σ is the sigmoid function
+# This loss pushes r(preferred) > r(rejected)</code></pre>
+
+<p>
+    The reward model is typically initialized from the SFT model (same architecture, but with the
+    language modeling head replaced by a scalar output head).
+</p>
+
+<p><strong>Step 2: Optimize Policy with PPO</strong></p>
+<p>
+    The SFT model is the initial "policy" (in RL terminology). We optimize it to maximize reward
+    while staying close to the SFT model (via a KL divergence penalty):
+</p>
+
+<pre><code># PPO objective for LLM alignment
+maximize  E[r(x, y)] - β · KL(π_θ || π_SFT)
+
+# π_θ: current policy (model being optimized)
+# π_SFT: reference policy (SFT model, frozen)
+# β: KL penalty coefficient
+# r(x, y): reward model score
+
+# The KL term prevents "reward hacking" — the model finding
+# degenerate outputs that score high on the RM but are nonsensical</code></pre>
+
+<p>
+    PPO is computationally expensive because it requires:
+</p>
+<ul>
+    <li>4 models in memory simultaneously: policy, reference policy, reward model, value function (critic)</li>
+    <li>Multiple forward passes per training step (generation + scoring + value estimation)</li>
+    <li>Careful hyperparameter tuning (clipping ratio, GAE λ, minibatch size)</li>
+</ul>
+
+<div class="concept-box">
+    <h4>Why RLHF is Hard (Engineering Perspective)</h4>
+    RLHF is an <em>online</em> algorithm: the model generates new outputs, they get scored, and gradients
+    are computed — all within one training step. This creates a complex dependency between generation
+    (autoregressive, memory-bound) and training (compute-bound). It's much harder to keep GPUs utilized
+    compared to standard supervised training. This is where NVIDIA's <strong>NeMo-Aligner</strong> comes
+    in — it handles the orchestration of these interleaved generation and training phases.
+</div>
+
+<h3>4.2 DPO: Direct Preference Optimization</h3>
+
+<p>
+    <a href="https://arxiv.org/abs/2305.18290">Rafailov et al. (2023)</a> showed you can skip the reward
+    model entirely. The key insight: the optimal policy under the RLHF objective has a closed-form
+    relationship to the reward function. This lets you reparameterize the reward in terms of the policy
+    itself:
+</p>
+
+<pre><code># DPO loss (directly on preference pairs)
+L_DPO = -log σ(β · [log(π_θ(y_w|x)/π_ref(y_w|x)) - log(π_θ(y_l|x)/π_ref(y_l|x))])
+
+# No reward model needed!
+# π_θ: policy being trained
+# π_ref: reference policy (SFT model, frozen)
+# y_w: preferred response, y_l: rejected response
+# β: temperature parameter</code></pre>
+
+<p>Advantages of DPO over RLHF:</p>
+
+<table>
+    <thead>
+    <tr><th>Aspect</th><th>RLHF (PPO)</th><th>DPO</th></tr>
+    </thead>
+    <tbody>
+    <tr><td>Models in memory</td><td>4 (policy, ref, RM, critic)</td><td>2 (policy, ref)</td></tr>
+    <tr><td>Training stability</td><td>Sensitive to hyperparams</td><td>Much more stable</td></tr>
+    <tr><td>Compute cost</td><td>High (online generation)</td><td>Lower (offline, like SFT)</td></tr>
+    <tr><td>Data requirements</td><td>Can generate new data online</td><td>Fixed preference dataset</td></tr>
+    <tr><td>Performance ceiling</td><td>Potentially higher (explores)</td><td>Limited by offline data quality</td></tr>
+    </tbody>
+</table>
+
+<div class="concept-box">
+    <h4>Industry State (2025–2026)</h4>
+    In practice, most labs now use <strong>DPO variants</strong> (or hybrid approaches) rather than pure PPO.
+    Notable developments:
+    <ul>
+        <li><strong>GRPO</strong> (Group Relative Policy Optimization, DeepSeek, 2024) — removes the need for a
+            separate critic model by using group-level reward baselines</li>
+        <li><strong>Online DPO / Iterative DPO</strong> — generates new preference data each iteration,
+            combining DPO's simplicity with PPO's exploration</li>
+        <li><strong>RLVR</strong> (RL with Verifiable Rewards) — for math/code, use automated verification
+            instead of human preference (no RM at all)</li>
+        <li><strong>Constitutional AI</strong> (Anthropic) — self-critique against principles, generating
+            preference data without humans</li>
+    </ul>
+    Fiameni will likely mention DPO as the practical default and RLHF/PPO as the conceptual foundation.
+</div>
+
+<h3>4.3 The Full Pipeline Summarized</h3>
+
+<pre><code>┌─────────────────────────────────────────────────────────────────────┐
+│                        LLM LIFECYCLE                                 │
+│                                                                      │
+│  ┌──────────┐     ┌─────────┐     ┌──────────────────────────────┐  │
+│  │PRE-TRAIN │────▶│   SFT   │────▶│  ALIGNMENT (RLHF or DPO)    │  │
+│  │          │     │         │     │                              │  │
+│  │ Next-tok │     │Instruct │     │ Preference learning:         │  │
+│  │ predict  │     │pairs    │     │ Safety, helpfulness,         │  │
+│  │ on ~15T  │     │10k-100k │     │ style, refusals              │  │
+│  │ tokens   │     │examples │     │                              │  │
+│  └──────────┘     └─────────┘     └──────────────────────────────┘  │
+│                                                                      │
+│  Compute: ████████████████████░  █░                █░               │
+│           ~99% of total FLOPS    ~0.5%             ~0.5%            │
+│                                                                      │
+│  NVIDIA Stack:                                                       │
+│  Megatron-LM (parallelism)  ──▶  NeMo Framework  ──▶  NeMo-Aligner │
+│  NeMo Data Curator (data)        (training loop)      (RLHF/DPO)   │
+└─────────────────────────────────────────────────────────────────────┘</code></pre>
+
+<h2>5. NVIDIA's Software Stack</h2>
+
+<p>
+    Fiameni will almost certainly frame the lifecycle through NVIDIA's tools. Here's the mapping:
+</p>
+
+<table>
+    <thead>
+    <tr><th>Stage</th><th>NVIDIA Tool</th><th>What It Does</th></tr>
+    </thead>
+    <tbody>
+    <tr>
+        <td>Data curation</td>
+        <td><a href="https://docs.nvidia.com/nemo-framework/user-guide/latest/datacuration/index.html">NeMo Data Curator</a></td>
+        <td>GPU-accelerated dedup, filtering, quality scoring, synthetic data gen</td>
+    </tr>
+    <tr>
+        <td>Pre-training</td>
+        <td><a href="https://github.com/NVIDIA/Megatron-LM">Megatron-LM</a> (via NeMo)</td>
+        <td>5D parallelism, distributed optimizer, comm overlap</td>
+    </tr>
+    <tr>
+        <td>Training framework</td>
+        <td><a href="https://docs.nvidia.com/nemo-framework/user-guide/latest/">NeMo Framework</a></td>
+        <td>End-to-end: data → training → eval → export. Config-driven (Hydra/OmegaConf)</td>
+    </tr>
+    <tr>
+        <td>Mixed precision</td>
+        <td><a href="https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/index.html">Transformer Engine</a></td>
+        <td>FP8 training on Hopper. Automatic per-tensor scaling. Drop-in replacement for nn.Linear</td>
+    </tr>
+    <tr>
+        <td>SFT</td>
+        <td>NeMo Framework (SFT recipe)</td>
+        <td>Full fine-tuning or PEFT (LoRA, P-tuning)</td>
+    </tr>
+    <tr>
+        <td>Alignment</td>
+        <td><a href="https://docs.nvidia.com/nemo-framework/user-guide/latest/modelalignment/index.html">NeMo-Aligner</a></td>
+        <td>PPO, DPO, SteerLM, SPIN. Handles multi-model orchestration</td>
+    </tr>
+    <tr>
+        <td>Evaluation</td>
+        <td>NeMo Evaluator</td>
+        <td>Benchmarks (MMLU, HumanEval, etc.), custom eval pipelines</td>
+    </tr>
+    <tr>
+        <td>Export to inference</td>
+        <td><a href="https://nvidia.github.io/TensorRT-LLM/">TensorRT-LLM</a></td>
+        <td>Optimized inference engine (covered in Talk 2)</td>
+    </tr>
+    </tbody>
+</table>
+
+<div class="bridge">
+    <strong>Your strongest connection</strong>: NeMo Framework uses PyTorch under the hood and runs on Slurm
+    clusters with NCCL — exactly your environment. The parallelism strategies in Megatron-LM are
+    orchestrated via the same NCCL process groups you already configure. If Fiameni shows a training config,
+    you'll recognize the infrastructure layer immediately. Your value-add in this role would be
+    <em>profiling and optimizing</em> these pipelines — finding the communication bottlenecks, measuring MFU,
+    identifying where TP all-reduce is the critical path.
+</div>
+
+<h2>6. Open Problems & Frontier (Where Good Questions Live)</h2>
+
+<p>These are areas where the field is actively unsettled — asking about these signals that you're tracking current research:</p>
+
+<ul>
+    <li><strong>Alignment tax on capabilities</strong>: RLHF/DPO can degrade raw capability (especially
+        on benchmarks). How much alignment is "too much"? Is there a Pareto frontier?</li>
+    <li><strong>Reward hacking at scale</strong>: Even with KL constraints, models find degenerate solutions
+        to reward models. Scaling RL makes this worse.</li>
+    <li><strong>Synthetic data for alignment</strong>: Can you replace human annotators entirely? Constitutional AI
+        and self-play (SPIN) suggest yes, but quality ceiling is debated.</li>
+    <li><strong>Multi-objective alignment</strong>: Helpfulness vs. safety vs. honesty are often in tension.
+        How do you optimize for all three without mode collapse?</li>
+    <li><strong>Scaling post-training compute</strong>: DeepSeek-R1 showed that scaling RL compute
+        (test-time and training-time) unlocks reasoning. Is this the future of alignment?</li>
+</ul>
+
+<h2>7. Signal Questions for This Talk</h2>
+
+<div class="question-box">
+    <p class="question">
+        "You showed the full lifecycle from pre-training to alignment. From a systems perspective,
+        the RLHF stage has fundamentally different compute characteristics — it interleaves autoregressive
+        generation (memory-bound) with gradient updates (compute-bound). How does NeMo-Aligner handle
+        GPU utilization during PPO training? Do you overlap generation with backward passes of other samples,
+        or is there a pipeline bubble issue similar to pipeline parallelism?"
+    </p>
+    <p class="rationale">
+        <strong>Why this works</strong>: It signals (1) you understand the compute characteristics of LLM inference
+        vs. training, (2) you're thinking about utilization/profiling — directly relevant to the job role,
+        (3) you connect it to pipeline parallelism concepts the speaker just covered. It's a question
+        only someone with HPC/profiling experience would ask.
+    </p>
+</div>
+
+<div class="question-box">
+    <p class="question">
+        "With the shift toward DPO and its variants replacing PPO in many production systems, is there
+        still a regime where NVIDIA recommends PPO over DPO? For instance, when the preference data
+        is limited or when the model needs to explore beyond the training distribution?"
+    </p>
+    <p class="rationale">
+        <strong>Why this works</strong>: Shows you understand the trade-off (offline vs. online RL), aren't just
+        following hype, and are thinking about practical deployment decisions. It invites the speaker to share
+        NVIDIA's internal perspective — people love sharing insider knowledge.
+    </p>
+</div>
+
+<div class="question-box">
+    <p class="question">
+        "You mentioned Transformer Engine for FP8 training. When you scale to thousands of GPUs with
+        5D parallelism, does the FP8 per-tensor scaling introduce any synchronization overhead in
+        the tensor-parallel communication? I'm curious whether the scaling factors need to be synchronized
+        across the TP group."
+    </p>
+    <p class="rationale">
+        <strong>Why this works</strong>: This is very specific and technical — it shows deep understanding of
+        both mixed-precision training and distributed communication. It's the kind of question someone in the
+        JR1980206 role would actually investigate. Even if the speaker doesn't have the full answer, it positions
+        you as someone who thinks at the hardware/software interface.
+    </p>
+</div>
+
+<h2>8. Corridor Conversation Anchors</h2>
+
+<p>
+    If you get a chance to speak with Fiameni or other NVIDIA engineers after the talk, here are
+    natural conversation openers that connect to your background:
+</p>
+
+<ul>
+    <li><em>"I work on distributed training at Fraunhofer — we scale to 32 GPUs on Slurm with FSDP2 and NCCL.
+        I'm curious how Megatron-LM's distributed optimizer compares to ZeRO-3 in practice at your scale.
+        Is the communication pattern fundamentally different?"</em></li>
+    <li><em>"I've built profiling tools for measuring scaling efficiency in multi-node training. At 16k GPUs,
+        what's the primary bottleneck you see — is it still communication, or does fault recovery dominate?"</em></li>
+    <li><em>"I saw the Senior DL Performance Engineer role — it mentions graph compilation and reduced precision
+        training. Is that team working specifically on profiling NeMo/Megatron workloads, or is it broader
+        across all NVIDIA AI services?"</em> (This directly asks about the role.)</li>
+</ul>
+
+<h2>9. Primary Source Recommendation</h2>
+
+<p>
+    <strong>Read before the workshop</strong>:
+    <a href="https://arxiv.org/abs/2407.21783">The Llama 3 Herd of Models (Meta, 2024)</a> — Sections 1–3 (Overview, Pre-training, Post-training).
+    This is the most complete public description of a frontier LLM lifecycle. It covers exactly what
+    Fiameni will talk about, but from Meta's perspective. Reading Meta's approach will let you compare
+    it to NVIDIA's stack during the talk.
+</p>
+
+<p>
+    <strong>If you have more time</strong>:
+    <a href="https://docs.nvidia.com/nemo-framework/user-guide/latest/">NeMo Framework User Guide</a> —
+    skim the "Large Language Models" → "Pre-training" and "Model Alignment" sections. This is what
+    the speaker built. Being familiar with the config structure and terminology will make you instantly
+    credible.
+</p>
+
+
+
+        
+        <!-- _includes/tutorial-nav.html -->
+
+
+
+
+
+
+
+
+
+
+
+
+<nav class="tutorial-nav" aria-label="Lesson navigation">
+    
+    <a href="/heap/fsdp2/" class="tutorial-nav-btn tutorial-nav-prev">
+        <span class="tutorial-nav-label">← Back</span>
+        <span class="tutorial-nav-title">Tutorial Overview</span>
+    </a>
+    
+
+    
+    <a href="/heap/ai-day/002/" class="tutorial-nav-btn tutorial-nav-next">
+        <span class="tutorial-nav-label">Next →</span>
+        <span class="tutorial-nav-title">002 — Scaling Inference with Optimization and Compression</span>
+    </a>
+    
+</nav>
+        
+    </article>
+
+</div>
+  </div>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <div class="footer-links">
+      <a href="https://github.com/g4br1el">GitHub</a>
+      <a href="https://www.linkedin.com/in/gadax">LinkedIn</a>
+      <a href="mailto:gdax.science@gmail.com">Email</a>
+      <a href="/files/CV-Gabriel_Dax.pdf">Resume ↓</a>
+    </div>
+    <p class="footer-copyright">© 2026 Gabriel Dax</p>
+  </div>
+</footer>
+
+
+
+</body>
+</html>

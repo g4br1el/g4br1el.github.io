@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NVIDIA Workshop Prep Glossary — Gabriel Dax</title>
+  <!-- Begin Jekyll SEO tag v2.9.0 -->
+<meta name="generator" content="Jekyll v4.4.1" />
+<meta property="og:title" content="NVIDIA Workshop Prep Glossary" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="Terminology used across all lessons for the NVIDIA pre-AI-Day workshop (June 2026). Covers LLM lifecycle, inference optimization, and Physical AI." />
+<meta name="twitter:description" property="og:description" content="Terminology used across all lessons for the NVIDIA pre-AI-Day workshop (June 2026). Covers LLM lifecycle, inference optimization, and Physical AI." />
+<link rel="canonical" href="https://www.gabrieldax.de/heap/ai-day/glossary/" />
+<meta property="og:url" content="https://www.gabrieldax.de/heap/ai-day/glossary/" />
+<meta property="og:site_name" content="Gabriel Dax — ML Research Engineer" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2026-06-24T07:37:12+00:00" />
+<meta property="article:modified_time" content="2026-06-24T07:37:12+00:00" />
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:title" content="NVIDIA Workshop Prep Glossary" />
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"BlogPosting","dateModified":"2026-06-24T07:37:12+00:00","datePublished":"2026-06-24T07:37:12+00:00","description":"Terminology used across all lessons for the NVIDIA pre-AI-Day workshop (June 2026). Covers LLM lifecycle, inference optimization, and Physical AI.","headline":"NVIDIA Workshop Prep Glossary","mainEntityOfPage":{"@type":"WebPage","@id":"https://www.gabrieldax.de/heap/ai-day/glossary/"},"url":"https://www.gabrieldax.de/heap/ai-day/glossary/"}</script>
+<!-- End Jekyll SEO tag -->
+
+  <meta content='text/html; charset=utf-8' http-equiv='Content-Type'>
+<meta http-equiv='X-UA-Compatible' content='IE=edge'>
+<meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0'>
+
+
+<meta property="og:description" content="Terminology used across all lessons for the NVIDIA pre-AI-Day workshop (June 2026). Covers LLM lifecycle, inference optimization, and Physical AI.
+" />
+
+<meta name="author" content="Gabriel Dax" />
+
+
+
+<meta property="og:title" content="NVIDIA Workshop Prep Glossary" />
+<meta property="twitter:title" content="NVIDIA Workshop Prep Glossary" />
+
+
+
+<meta property="og:image" content="https://www.gabrieldax.de/images/self.png"/>
+<meta property="twitter:image" content="https://www.gabrieldax.de/images/self.png"/>
+
+
+  <link rel="stylesheet" href="/assets/style.css">
+  <link rel="icon" type="image/png" sizes="32x32" href="/images/favicon.jpg">
+  <link rel="canonical" href="https://www.gabrieldax.de/heap/ai-day/glossary/">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  
+
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div>
+      <a href="/" class="site-name">Gabriel Dax</a>
+      <span class="site-tagline">ML Research Engineer</span>
+    </div>
+    <nav>
+      <a href="/" >Home</a>
+      <a href="/projects" >Projects</a>
+      <a href="/publications" >Publications</a>
+      <a href="/bio" >CV</a>
+    </nav>
+  </div>
+</header>
+
+<main class="main-content">
+  <div class="container">
+    <div class="tutorial-wrapper">
+
+    <nav class="tutorial-breadcrumb">
+        <a href="/heap/">← All Tutorials</a>
+        
+        <span class="tutorial-position">Glossary</span>
+        
+    </nav>
+
+    <article class="tutorial-article">
+        
+
+        <h1>NVIDIA Workshop Prep Glossary</h1>
+
+        <p>Terminology used across all lessons for the NVIDIA pre-AI-Day workshop (June 2026). Covers LLM lifecycle, inference optimization, and Physical AI.</p>
+
+<h2 id="terms">Terms</h2>
+
+<h3 id="llm-training--alignment">LLM Training &amp; Alignment</h3>
+
+<p><strong>Pre-training</strong>:
+Self-supervised training of an LLM on massive text corpora using next-token prediction, producing a base model with broad language capability but no instruction-following behavior.
+<em>Avoid</em>: Training (too ambiguous), foundation model training</p>
+
+<p><strong>SFT (Supervised Fine-Tuning)</strong>:
+Post-training stage where a pre-trained base model is fine-tuned on curated (instruction, response) pairs to produce an instruction-following model.
+<em>Avoid</em>: Fine-tuning (too generic), RLHF step 1</p>
+
+<p><strong>RLHF (Reinforcement Learning from Human Feedback)</strong>:
+Post-training alignment method: train a reward model on human preference data, then optimize the policy (LLM) against it using PPO or similar RL algorithms.
+<em>Avoid</em>: Human feedback training</p>
+
+<p><strong>DPO (Direct Preference Optimization)</strong>:
+Alignment method that skips explicit reward model training by directly optimizing the LLM on preference pairs using a classification-style loss derived from the Bradley-Terry model.
+<em>Avoid</em>: Simplified RLHF</p>
+
+<p><strong>Reward Model (RM)</strong>:
+A model trained on human preference rankings to score LLM outputs, used as the optimization signal in RLHF.
+<em>Avoid</em>: Preference model, scoring model</p>
+
+<p><strong>Tensor Parallelism (TP)</strong>:
+Splitting individual weight matrices across multiple GPUs so each GPU computes a shard of every layer. Requires all-reduce communication per layer.
+<em>Avoid</em>: Model parallelism (ambiguous — could mean pipeline parallelism)</p>
+
+<p><strong>Pipeline Parallelism (PP)</strong>:
+Splitting model layers across GPUs sequentially; each GPU holds a subset of layers. Requires micro-batching to hide pipeline bubbles.
+<em>Avoid</em>: Layer parallelism, stage parallelism</p>
+
+<p><strong>Sequence Parallelism (SP)</strong>:
+Distributing the sequence dimension across GPUs for operations like LayerNorm and Dropout that don’t require the full hidden dimension. Reduces activation memory.
+<em>Avoid</em>: Context parallelism (related but different)</p>
+
+<p><strong>Expert Parallelism (EP)</strong>:
+In Mixture-of-Experts models, distributing different experts across GPUs. Each token is routed to a subset of experts.
+<em>Avoid</em>: MoE parallelism</p>
+
+<h3 id="inference-optimization">Inference Optimization</h3>
+
+<p><strong>KV-Cache</strong>:
+Stored key and value tensors from previously generated tokens in autoregressive decoding, avoiding redundant recomputation. Memory grows linearly with sequence length.
+<em>Avoid</em>: Attention cache, context cache</p>
+
+<p><strong>Paged Attention</strong>:
+Memory management technique (from vLLM) that stores KV-cache in non-contiguous pages, reducing fragmentation and enabling dynamic memory allocation during serving.
+<em>Avoid</em>: Virtual memory attention</p>
+
+<p><strong>In-Flight Batching (Continuous Batching)</strong>:
+Serving technique where new requests are inserted into a running batch as soon as any existing request completes, maximizing GPU utilization.
+<em>Avoid</em>: Dynamic batching (ambiguous — could mean padding-based)</p>
+
+<p><strong>Speculative Decoding</strong>:
+Inference acceleration where a small draft model generates candidate tokens that the large model verifies in parallel, trading compute for latency reduction.
+<em>Avoid</em>: Draft-verify decoding</p>
+
+<p><strong>FP8 (E4M3 / E5M2)</strong>:
+8-bit floating point formats on Hopper+. E4M3 (4-bit exponent, 3-bit mantissa) for forward pass; E5M2 (5-bit exponent, 2-bit mantissa) for gradients. ~2× throughput vs FP16 with minimal accuracy loss.
+<em>Avoid</em>: INT8 (different — integer vs float)</p>
+
+<p><strong>FP4</strong>:
+4-bit floating point on Blackwell. Doubles compute density vs FP8. Requires careful calibration; currently inference-only.
+<em>Avoid</em>: INT4 (integer quantization, different trade-offs)</p>
+
+<p><strong>AWQ (Activation-Aware Weight Quantization)</strong>:
+Weight-only quantization that identifies salient weights by observing activation magnitudes and protects them, enabling aggressive (INT4/FP4) quantization with minimal accuracy loss.
+<em>Avoid</em>: GPTQ (related but different algorithm)</p>
+
+<p><strong>SmoothQuant</strong>:
+Quantization technique that migrates quantization difficulty from activations to weights via mathematically equivalent per-channel scaling, enabling INT8 weight+activation quantization.
+<em>Avoid</em>: Weight smoothing</p>
+
+<h3 id="physical-ai--world-models">Physical AI &amp; World Models</h3>
+
+<p><strong>World Foundation Model (WFM)</strong>:
+A model trained to predict future states of a physical environment given past observations and actions, enabling simulation, planning, and policy learning for embodied agents.
+<em>Avoid</em>: World simulator, environment model</p>
+
+<p><strong>Cosmos</strong>:
+NVIDIA’s world foundation model platform (2025). Includes pre-trained video generation models conditioned on actions/text, tokenizers, and guardrails for Physical AI development.
+<em>Avoid</em>: Omniverse (different layer — Omniverse is the simulation platform)</p>
+
+<p><strong>GR00T</strong>:
+NVIDIA’s foundation model for humanoid robots. Ingests multimodal input (language, video) and outputs robot actions. Trained in simulation (Isaac Sim), deployed on physical robots.
+<em>Avoid</em>: Isaac (Isaac is the simulation platform, GR00T is the model)</p>
+
+<p><strong>Isaac Sim</strong>:
+NVIDIA’s GPU-accelerated robotics simulation built on Omniverse/USD. Provides synthetic data generation, domain randomization, and sim-to-real transfer for robot learning.
+<em>Avoid</em>: Omniverse (Isaac Sim runs on Omniverse but is a specific application)</p>
+
+<p><strong>Omniverse</strong>:
+NVIDIA’s platform for building 3D simulation environments using Universal Scene Description (USD). The infrastructure layer under Isaac Sim, Cosmos data generation, and digital twins.
+<em>Avoid</em>: Metaverse (marketing term)</p>
+
+<p><strong>Sim-to-Real Transfer</strong>:
+Training policies in simulation and deploying them on physical hardware. Requires domain randomization and/or fine-tuning to bridge the reality gap.
+<em>Avoid</em>: Transfer learning (too generic)</p>
+
+<p><strong>Domain Randomization</strong>:
+Training technique where simulation parameters (textures, lighting, physics, camera) are randomly varied each episode, making the learned policy robust to real-world variation.
+<em>Avoid</em>: Data augmentation (related concept but applies to perception; domain randomization applies to the full environment)</p>
+
+<p><strong>Imitation Learning</strong>:
+Supervised learning from expert demonstrations: given (observation, action) pairs from a demonstrator, learn a policy that reproduces the behavior.
+<em>Avoid</em>: Behavioral cloning (a specific, naive form of imitation learning), reinforcement learning (different — no demonstrations, just reward)</p>
+
+<p><strong>DiT (Diffusion Transformer)</strong>:
+Transformer-based architecture for diffusion models, replacing the U-Net used in earlier diffusion models (Stable Diffusion 1-2). Used in Sora, Cosmos, SD3.
+<em>Avoid</em>: ViT (different purpose — classification, not generation)</p>
+
+<p><strong>USD (Universal Scene Description)</strong>:
+Open-source 3D scene format (Pixar) used as the standard representation in Omniverse. Describes geometry, materials, physics, animations in a composable hierarchy.
+<em>Avoid</em>: URDF (robot-specific format), glTF (web 3D format)</p>
+
+<p><strong>Jetson Thor</strong>:
+NVIDIA’s next-generation SoC for humanoid robots, featuring Blackwell GPU architecture (~800 TOPS INT8) in a ~100W power envelope.
+<em>Avoid</em>: Jetson Orin (previous generation), AGX (broader product family)</p>
+
+
+        
+    </article>
+
+</div>
+  </div>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <div class="footer-links">
+      <a href="https://github.com/g4br1el">GitHub</a>
+      <a href="https://www.linkedin.com/in/gadax">LinkedIn</a>
+      <a href="mailto:gdax.science@gmail.com">Email</a>
+      <a href="/files/CV-Gabriel_Dax.pdf">Resume ↓</a>
+    </div>
+    <p class="footer-copyright">© 2026 Gabriel Dax</p>
+  </div>
+</footer>
+
+
+
+</body>
+</html>

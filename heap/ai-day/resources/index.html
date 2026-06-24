@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NVIDIA Workshop Prep Resources — Gabriel Dax</title>
+  <!-- Begin Jekyll SEO tag v2.9.0 -->
+<meta name="generator" content="Jekyll v4.4.1" />
+<meta property="og:title" content="NVIDIA Workshop Prep Resources" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="Knowledge" />
+<meta name="twitter:description" property="og:description" content="Knowledge" />
+<link rel="canonical" href="https://www.gabrieldax.de/heap/ai-day/resources/" />
+<meta property="og:url" content="https://www.gabrieldax.de/heap/ai-day/resources/" />
+<meta property="og:site_name" content="Gabriel Dax — ML Research Engineer" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2026-06-24T07:37:12+00:00" />
+<meta property="article:modified_time" content="2026-06-24T07:37:12+00:00" />
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:title" content="NVIDIA Workshop Prep Resources" />
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"BlogPosting","dateModified":"2026-06-24T07:37:12+00:00","datePublished":"2026-06-24T07:37:12+00:00","description":"Knowledge","headline":"NVIDIA Workshop Prep Resources","mainEntityOfPage":{"@type":"WebPage","@id":"https://www.gabrieldax.de/heap/ai-day/resources/"},"url":"https://www.gabrieldax.de/heap/ai-day/resources/"}</script>
+<!-- End Jekyll SEO tag -->
+
+  <meta content='text/html; charset=utf-8' http-equiv='Content-Type'>
+<meta http-equiv='X-UA-Compatible' content='IE=edge'>
+<meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0'>
+
+
+<meta property="og:description" content="Knowledge
+" />
+
+<meta name="author" content="Gabriel Dax" />
+
+
+
+<meta property="og:title" content="NVIDIA Workshop Prep Resources" />
+<meta property="twitter:title" content="NVIDIA Workshop Prep Resources" />
+
+
+
+<meta property="og:image" content="https://www.gabrieldax.de/images/self.png"/>
+<meta property="twitter:image" content="https://www.gabrieldax.de/images/self.png"/>
+
+
+  <link rel="stylesheet" href="/assets/style.css">
+  <link rel="icon" type="image/png" sizes="32x32" href="/images/favicon.jpg">
+  <link rel="canonical" href="https://www.gabrieldax.de/heap/ai-day/resources/">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  
+
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div>
+      <a href="/" class="site-name">Gabriel Dax</a>
+      <span class="site-tagline">ML Research Engineer</span>
+    </div>
+    <nav>
+      <a href="/" >Home</a>
+      <a href="/projects" >Projects</a>
+      <a href="/publications" >Publications</a>
+      <a href="/bio" >CV</a>
+    </nav>
+  </div>
+</header>
+
+<main class="main-content">
+  <div class="container">
+    <div class="tutorial-wrapper">
+
+    <nav class="tutorial-breadcrumb">
+        <a href="/heap/">← All Tutorials</a>
+        
+        <span class="tutorial-position">Resources</span>
+        
+    </nav>
+
+    <article class="tutorial-article">
+        
+
+        <h1>NVIDIA Workshop Prep Resources</h1>
+
+        <h2 id="knowledge">Knowledge</h2>
+
+<h3 id="talk-1-llm-lifecycle-pre-training-to-alignment">Talk 1: LLM Lifecycle (Pre-training to Alignment)</h3>
+<ul>
+  <li><a href="https://huyenchip.com/2023/05/02/rlhf.html">Blog: “RLHF: Reinforcement Learning from Human Feedback” — Chip Huyen (2023)</a>
+Best single-article overview of the RLHF pipeline. Use for: understanding post-training alignment conceptually.</li>
+  <li><a href="https://arxiv.org/abs/2203.02155">Paper: “Training language models to follow instructions with human feedback” — Ouyang et al. (2022)</a>
+The InstructGPT paper. Foundational for understanding SFT → RM → PPO pipeline.</li>
+  <li><a href="https://arxiv.org/abs/2305.18290">Paper: “Direct Preference Optimization” — Rafailov et al. (2023)</a>
+DPO as simpler alternative to PPO. NVIDIA likely uses this. Use for: understanding modern alignment without RL.</li>
+  <li><a href="https://docs.nvidia.com/nemo-framework/user-guide/latest/">NVIDIA NeMo Framework Documentation</a>
+NVIDIA’s end-to-end LLM training framework. The speaker (Fiameni) likely references this.</li>
+  <li><a href="https://developer.nvidia.com/megatron-lm">Blog: “Megatron-LM: Training Multi-Billion Parameter Language Models” — NVIDIA (2024)</a>
+NVIDIA’s parallelism strategies (tensor, pipeline, sequence, expert). Use for: understanding NVIDIA’s pre-training stack.</li>
+  <li><a href="https://arxiv.org/abs/2309.01041">Paper: “Scaling LLM Training to Thousands of GPUs with NeMo” — NVIDIA (2024)</a>
+NeMo + Megatron integration. Directly relevant to Gabriel’s DDP/FSDP experience.</li>
+</ul>
+
+<h3 id="talk-2-inference-optimization--compression">Talk 2: Inference Optimization &amp; Compression</h3>
+<ul>
+  <li><a href="https://nvidia.github.io/TensorRT-LLM/">NVIDIA TensorRT-LLM Documentation</a>
+Primary reference for LLM-specific inference optimization. Use for: understanding KV-cache, in-flight batching, paged attention.</li>
+  <li><a href="https://developer.nvidia.com/blog/nvidia-tensorrt-llm-supercharges-large-language-model-inference-on-nvidia-h100-gpus/">Blog: “NVIDIA TensorRT-LLM Supercharges Large Language Model Inference” (2024)</a>
+High-level overview of TensorRT-LLM vs classic TensorRT. Use for: understanding the architectural differences.</li>
+  <li><a href="https://arxiv.org/abs/2309.06180">Paper: “Efficient Memory Management for Large Language Model Serving with PagedAttention” — Kwon et al. (2023)</a>
+vLLM paper. PagedAttention is now in TensorRT-LLM. Use for: understanding memory-bound LLM inference.</li>
+  <li><a href="https://nvidia.github.io/TensorRT-Model-Optimizer/">NVIDIA ModelOpt Documentation</a>
+PTQ and QAT for LLMs. Gabriel already knows ModelOpt — focus on LLM-specific quantization (FP8, AWQ, SmoothQuant).</li>
+  <li><a href="https://arxiv.org/abs/2209.05433">Paper: “FP8 Formats for Deep Learning” — Micikevicius et al. (NVIDIA, 2022)</a>
+Hopper FP8 format specification. Use for: understanding E4M3 vs E5M2 trade-offs.</li>
+  <li><a href="https://developer.nvidia.com/blog/nvidia-blackwell-architecture-technical-brief/">Blog: “NVIDIA Blackwell Architecture” (2024)</a>
+FP4 support, transformer engine updates. Use for: what’s coming next in reduced precision.</li>
+</ul>
+
+<h3 id="talk-3-physical-ai--world-foundation-models">Talk 3: Physical AI &amp; World Foundation Models</h3>
+<ul>
+  <li><a href="https://developer.nvidia.com/cosmos">NVIDIA Cosmos Documentation</a>
+NVIDIA’s world foundation model platform. Use for: understanding what “world model” means in NVIDIA’s stack.</li>
+  <li><a href="https://arxiv.org/abs/2501.03575">Paper: “Cosmos World Foundation Model Platform for Physical AI” — NVIDIA (2025)</a>
+The Cosmos technical report. Primary source for Talk 3.</li>
+  <li><a href="https://developer.nvidia.com/project-groot">NVIDIA GR00T Blueprint</a>
+Humanoid robot foundation model. Use for: understanding embodied AI in NVIDIA’s roadmap.</li>
+  <li><a href="https://developer.nvidia.com/isaac-sim">NVIDIA Isaac Sim Documentation</a>
+Simulation platform for robotics. Use for: understanding the sim-to-real pipeline.</li>
+  <li><a href="https://developer.nvidia.com/omniverse">NVIDIA Omniverse Documentation</a>
+USD-based 3D simulation platform underlying Isaac Sim and Cosmos. Use for: understanding the infrastructure layer.</li>
+  <li><a href="https://blogs.nvidia.com/blog/what-is-physical-ai/">Blog: “What Is Physical AI?” — NVIDIA (2025)</a>
+Jensen Huang’s framing of Physical AI as the next wave. Use for: understanding NVIDIA’s strategic narrative.</li>
+</ul>
+
+<h2 id="wisdom-communities">Wisdom (Communities)</h2>
+
+<ul>
+  <li><a href="https://forums.developer.nvidia.com/c/ai-deep-learning/tensorrt-llm/">NVIDIA Developer Forums — TensorRT-LLM</a>
+Active community for TensorRT-LLM issues. Use for: understanding real deployment pain points.</li>
+  <li><a href="https://reddit.com/r/LocalLLaMA">r/LocalLLaMA</a>
+Practical LLM inference optimization community. High signal on quantization trade-offs.</li>
+</ul>
+
+<h2 id="gaps">Gaps</h2>
+<ul>
+  <li>No public benchmarks comparing TensorRT-LLM FP8 vs FP4 on Blackwell for long-context (&gt;128k) workloads</li>
+  <li>Cosmos is very new (2025) — limited independent analysis exists</li>
+  <li>Speaker-specific publications for Habert and Mohan not yet identified</li>
+</ul>
+
+
+        
+    </article>
+
+</div>
+  </div>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <div class="footer-links">
+      <a href="https://github.com/g4br1el">GitHub</a>
+      <a href="https://www.linkedin.com/in/gadax">LinkedIn</a>
+      <a href="mailto:gdax.science@gmail.com">Email</a>
+      <a href="/files/CV-Gabriel_Dax.pdf">Resume ↓</a>
+    </div>
+    <p class="footer-copyright">© 2026 Gabriel Dax</p>
+  </div>
+</footer>
+
+
+
+</body>
+</html>

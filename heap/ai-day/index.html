@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MCML AI Day'26 Preparation — Gabriel Dax</title>
+  <!-- Begin Jekyll SEO tag v2.9.0 -->
+<meta name="generator" content="Jekyll v4.4.1" />
+<meta property="og:title" content="MCML AI Day’26 Preparation" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="This is a short overview and refresh to the topics LLM lifecycle, inference optimization and world models." />
+<meta name="twitter:description" property="og:description" content="This is a short overview and refresh to the topics LLM lifecycle, inference optimization and world models." />
+<link rel="canonical" href="https://www.gabrieldax.de/heap/ai-day/" />
+<meta property="og:url" content="https://www.gabrieldax.de/heap/ai-day/" />
+<meta property="og:site_name" content="Gabriel Dax — ML Research Engineer" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2026-06-24T07:37:12+00:00" />
+<meta property="article:modified_time" content="2026-06-24T07:37:12+00:00" />
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:title" content="MCML AI Day’26 Preparation" />
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"BlogPosting","dateModified":"2026-06-24T07:37:12+00:00","datePublished":"2026-06-24T07:37:12+00:00","description":"This is a short overview and refresh to the topics LLM lifecycle, inference optimization and world models.","headline":"MCML AI Day’26 Preparation","mainEntityOfPage":{"@type":"WebPage","@id":"https://www.gabrieldax.de/heap/ai-day/"},"url":"https://www.gabrieldax.de/heap/ai-day/"}</script>
+<!-- End Jekyll SEO tag -->
+
+  <meta content='text/html; charset=utf-8' http-equiv='Content-Type'>
+<meta http-equiv='X-UA-Compatible' content='IE=edge'>
+<meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0'>
+
+
+<meta property="og:description" content="
+  Mission
+  Glossary
+  Resources
+  Notes
+
+" />
+
+<meta name="author" content="Gabriel Dax" />
+
+
+
+<meta property="og:title" content="MCML AI Day'26 Preparation" />
+<meta property="twitter:title" content="MCML AI Day'26 Preparation" />
+
+
+
+<meta property="og:image" content="https://www.gabrieldax.de/images/self.png"/>
+<meta property="twitter:image" content="https://www.gabrieldax.de/images/self.png"/>
+
+
+  <link rel="stylesheet" href="/assets/style.css">
+  <link rel="icon" type="image/png" sizes="32x32" href="/images/favicon.jpg">
+  <link rel="canonical" href="https://www.gabrieldax.de/heap/ai-day/">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  
+
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div>
+      <a href="/" class="site-name">Gabriel Dax</a>
+      <span class="site-tagline">ML Research Engineer</span>
+    </div>
+    <nav>
+      <a href="/" >Home</a>
+      <a href="/projects" >Projects</a>
+      <a href="/publications" >Publications</a>
+      <a href="/bio" >CV</a>
+    </nav>
+  </div>
+</header>
+
+<main class="main-content">
+  <div class="container">
+    <article class="page">
+
+  <h1>MCML AI Day'26 Preparation</h1>
+
+  <div class="entry">
+    <div class="tutorial-detail-nav">
+  <a href="/heap/ai-day/mission/">Mission</a>
+  <a href="/heap/ai-day/glossary/">Glossary</a>
+  <a href="/heap/ai-day/resources/">Resources</a>
+  <a href="/heap/ai-day/notes/">Notes</a>
+</div>
+
+<ul class="lesson-list">
+
+<li class="lesson-list-item">
+  <a href="/heap/ai-day/001/">
+    <span class="lesson-list-number">001</span>
+    <span class="lesson-list-title">From Pre-training to Alignment: The Full LLM Lifecycle</span>
+    
+    <span class="lesson-list-tags">
+      
+      <span class="tutorial-tag tutorial-tag--secondary">LLM</span>
+      
+    </span>
+    
+  </a>
+</li>
+
+<li class="lesson-list-item">
+  <a href="/heap/ai-day/002/">
+    <span class="lesson-list-number">002</span>
+    <span class="lesson-list-title">Scaling Inference with Optimization and Compression</span>
+    
+    <span class="lesson-list-tags">
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Inference Optimization</span>
+      
+    </span>
+    
+  </a>
+</li>
+
+<li class="lesson-list-item">
+  <a href="/heap/ai-day/003/">
+    <span class="lesson-list-number">003</span>
+    <span class="lesson-list-title">Physical AI and World Foundation Models</span>
+    
+    <span class="lesson-list-tags">
+      
+      <span class="tutorial-tag tutorial-tag--secondary">World Models</span>
+      
+    </span>
+    
+  </a>
+</li>
+
+<li class="lesson-list-item">
+  <a href="/heap/ai-day/004/">
+    <span class="lesson-list-number">004</span>
+    <span class="lesson-list-title">Cheat Sheet</span>
+    
+    <span class="lesson-list-tags">
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Cheat Sheet</span>
+      
+    </span>
+    
+  </a>
+</li>
+
+<li class="lesson-list-item">
+  <a href="/heap/ai-day/005/">
+    <span class="lesson-list-number">005</span>
+    <span class="lesson-list-title">Mock Q&amp;A</span>
+    
+    <span class="lesson-list-tags">
+      
+      <span class="tutorial-tag tutorial-tag--secondary">Cheat Sheet</span>
+      
+    </span>
+    
+  </a>
+</li>
+
+</ul>
+
+  </div>
+</article>
+
+  </div>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <div class="footer-links">
+      <a href="https://github.com/g4br1el">GitHub</a>
+      <a href="https://www.linkedin.com/in/gadax">LinkedIn</a>
+      <a href="mailto:gdax.science@gmail.com">Email</a>
+      <a href="/files/CV-Gabriel_Dax.pdf">Resume ↓</a>
+    </div>
+    <p class="footer-copyright">© 2026 Gabriel Dax</p>
+  </div>
+</footer>
+
+
+
+</body>
+</html>

@@ -1,0 +1,670 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mock Q&A — Gabriel Dax</title>
+  <!-- Begin Jekyll SEO tag v2.9.0 -->
+<meta name="generator" content="Jekyll v4.4.1" />
+<meta property="og:title" content="Mock Q&amp;A" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="ML Research Engineer" />
+<meta name="twitter:description" property="og:description" content="ML Research Engineer" />
+<link rel="canonical" href="https://www.gabrieldax.de/heap/ai-day/005/" />
+<meta property="og:url" content="https://www.gabrieldax.de/heap/ai-day/005/" />
+<meta property="og:site_name" content="Gabriel Dax — ML Research Engineer" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2026-06-24T07:37:12+00:00" />
+<meta property="article:modified_time" content="2026-06-24T07:37:12+00:00" />
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:title" content="Mock Q&amp;A" />
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"BlogPosting","dateModified":"2026-06-24T07:37:12+00:00","datePublished":"2026-06-24T07:37:12+00:00","description":"ML Research Engineer","headline":"Mock Q&amp;A","mainEntityOfPage":{"@type":"WebPage","@id":"https://www.gabrieldax.de/heap/ai-day/005/"},"url":"https://www.gabrieldax.de/heap/ai-day/005/"}</script>
+<!-- End Jekyll SEO tag -->
+
+  <meta content='text/html; charset=utf-8' http-equiv='Content-Type'>
+<meta http-equiv='X-UA-Compatible' content='IE=edge'>
+<meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0'>
+
+
+<meta property="og:description" content="" />
+
+<meta name="author" content="Gabriel Dax" />
+
+
+
+<meta property="og:title" content="Mock Q&A" />
+<meta property="twitter:title" content="Mock Q&A" />
+
+
+
+<meta property="og:image" content="https://www.gabrieldax.de/images/self.png"/>
+<meta property="twitter:image" content="https://www.gabrieldax.de/images/self.png"/>
+
+
+  <link rel="stylesheet" href="/assets/style.css">
+  <link rel="icon" type="image/png" sizes="32x32" href="/images/favicon.jpg">
+  <link rel="canonical" href="https://www.gabrieldax.de/heap/ai-day/005/">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  
+
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div>
+      <a href="/" class="site-name">Gabriel Dax</a>
+      <span class="site-tagline">ML Research Engineer</span>
+    </div>
+    <nav>
+      <a href="/" >Home</a>
+      <a href="/projects" >Projects</a>
+      <a href="/publications" >Publications</a>
+      <a href="/bio" >CV</a>
+    </nav>
+  </div>
+</header>
+
+<main class="main-content">
+  <div class="container">
+    <div class="tutorial-wrapper">
+
+    <nav class="tutorial-breadcrumb">
+        <a href="/heap/">← All Tutorials</a>
+        
+        <span class="tutorial-position">Lesson 5 / 5</span>
+        
+    </nav>
+
+    <article class="tutorial-article">
+        
+        <div class="tutorial-lesson-header">
+            <span class="tutorial-tag">Lesson 005</span>
+            
+            <span class="tutorial-tag tutorial-tag--secondary">Cheat Sheet</span>
+            
+        </div>
+        
+
+        <h1>Mock Q&A</h1>
+
+        <head>
+
+    <style>
+        .speaker-response {
+            background: #f0f4e8;
+            border-left: 4px solid #4a7c10;
+            padding: 0.8rem 1.2rem;
+            margin: 0.8rem 0;
+            border-radius: 0 6px 6px 0;
+            font-size: 0.92rem;
+        }
+        @media (prefers-color-scheme: dark) {
+            .speaker-response { background: #1f2a14; }
+        }
+        .speaker-response::before {
+            content: '🎤 LIKELY SPEAKER RESPONSE:';
+            display: block;
+            font-size: 0.75rem;
+            font-weight: 700;
+            color: #4a7c10;
+            letter-spacing: 0.05em;
+            margin-bottom: 0.4rem;
+        }
+        .followup {
+            background: #e8f4fd;
+            border-left: 4px solid #1a6fb5;
+            padding: 0.8rem 1.2rem;
+            margin: 0.8rem 0;
+            border-radius: 0 6px 6px 0;
+            font-size: 0.92rem;
+        }
+        @media (prefers-color-scheme: dark) {
+            .followup { background: #142a3a; }
+        }
+        .followup::before {
+            content: '↩️ YOUR FOLLOW-UP:';
+            display: block;
+            font-size: 0.75rem;
+            font-weight: 700;
+            color: #1a6fb5;
+            letter-spacing: 0.05em;
+            margin-bottom: 0.4rem;
+        }
+        .reactive {
+            background: #fdf4e8;
+            border: 2px dashed #c77b00;
+            padding: 0.8rem 1.2rem;
+            margin: 1rem 0;
+            border-radius: 6px;
+            font-size: 0.92rem;
+        }
+        .reactive::before {
+            content: '⚡ REACTIVE — Use if the speaker says something like this:';
+            display: block;
+            font-size: 0.75rem;
+            font-weight: 700;
+            color: #c77b00;
+            letter-spacing: 0.05em;
+            margin-bottom: 0.4rem;
+        }
+        .trigger {
+            font-style: italic;
+            color: var(--muted);
+            margin-bottom: 0.5rem;
+        }
+        .tier-label {
+            display: inline-block;
+            font-size: 0.7rem;
+            font-weight: 700;
+            padding: 0.15rem 0.5rem;
+            border-radius: 3px;
+            margin-bottom: 0.3rem;
+            color: #fff;
+        }
+        .tier-1 { background: #76b900; }
+        .tier-2 { background: #4a7c10; }
+        .tier-3 { background: #666; }
+        .qnum {
+            font-family: var(--font-mono, monospace);
+            font-size: 0.8rem;
+            color: var(--muted);
+        }
+    </style>
+</head>
+<body>
+
+<!--<h1>Mock Q&A: Full Question Bank</h1>-->
+
+<p>
+    Questions are ranked into tiers:
+</p>
+<ul>
+    <li><span class="tier-label tier-1">TIER 1</span> — Maximum signal. Directly demonstrates JR1980206 fit. Use if you can only ask one question all day.</li>
+    <li><span class="tier-label tier-2">TIER 2</span> — Strong signal. Shows depth and systems thinking. Good backup.</li>
+    <li><span class="tier-label tier-3">TIER 3</span> — Solid. Shows you followed the talk closely. Lower risk, lower reward.</li>
+</ul>
+
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<h2>Talk 1: LLM Lifecycle — Dr. Giuseppe Fiameni</h2>
+
+<p><em>Fiameni will likely walk through: data curation → pre-training (Megatron parallelism) → SFT → alignment (DPO/RLHF) → evaluation → export to inference. He'll reference NeMo Framework throughout. Expect high-level architecture slides, maybe a live config snippet.</em></p>
+
+<!-- Q1.1 -->
+<h3><span class="qnum">Q1.1</span> <span class="tier-label tier-1">TIER 1</span> GPU Utilization in RLHF</h3>
+
+<div class="question-box">
+    <p class="question">"The RLHF stage has fundamentally different compute characteristics from pre-training — it interleaves autoregressive generation, which is memory-bandwidth-bound, with gradient updates, which are compute-bound. How does NeMo-Aligner handle GPU utilization during PPO training? Do you overlap generation with backward passes of other samples, or is there an inherent pipeline bubble?"</p>
+</div>
+
+<div class="speaker-response">
+    "Great question. Yes, this is one of the hardest systems challenges in alignment. In NeMo-Aligner, we actually separate the generation phase and the training phase into distinct steps rather than trying to overlap them — so there IS a utilization gap when switching between modes. We mitigate it by increasing the batch size during generation and by using tensor parallelism to reduce per-token latency. In newer versions, we're exploring asynchronous generation where a separate set of workers generates rollouts while the training workers process previous batches. But it's an active area — utilization during PPO is typically 30–40% lower than during pre-training."
+</div>
+
+<div class="followup">
+    "That's interesting — so the 30–40% utilization drop is essentially the 'alignment tax' at the infrastructure level, not just the model level. Have you measured whether switching to DPO recovers most of that utilization, since it eliminates the online generation phase entirely?"
+</div>
+
+<p><em>This follow-up is low-risk and shows you immediately grasped the implication. It also pivots to DPO, which they're likely promoting.</em></p>
+
+<!-- Q1.2 -->
+<h3><span class="qnum">Q1.2</span> <span class="tier-label tier-1">TIER 1</span> Megatron vs. FSDP at Scale</h3>
+
+<div class="question-box">
+    <p class="question">"I use FSDP2 with NCCL for distributed training on HPC clusters — scaling to 32 GPUs across 8 nodes. Megatron-LM's approach with tensor and pipeline parallelism is architecturally very different. At what scale does the Megatron approach become necessary over FSDP? Is there a model-size or cluster-size threshold where the communication overhead of FSDP's all-gather becomes prohibitive?"</p>
+</div>
+
+<div class="speaker-response">
+    "It depends on whether the model fits in a single GPU's memory. FSDP is excellent when the model fits — or nearly fits — per GPU after sharding optimizer state. The transition point is roughly when you need true model parallelism: the model is so large that even with ZeRO-3 sharding, you can't fit a reasonable micro-batch. For Llama-3 70B, you could use FSDP on 8 H100s, but you'd have very small micro-batches. With Megatron's TP=8 within a node, each GPU only holds 1/8 of each layer, so you can fit larger micro-batches and get better compute efficiency. At 405B, there's no question — you need Megatron-style parallelism. The threshold is usually around 30–40B parameters on H100 80GB nodes."
+</div>
+
+<div class="followup">
+    "Makes sense. So for the 30–40B range, do customers typically start with FSDP and migrate to Megatron when they need to scale further, or is NeMo's recommendation to start with Megatron from the beginning?"
+</div>
+
+<p><em>This follow-up positions you as a potential customer/user — exactly the person this role would support.</em></p>
+
+<!-- Q1.3 -->
+<h3><span class="qnum">Q1.3</span> <span class="tier-label tier-2">TIER 2</span> FP8 Pre-training at Scale</h3>
+
+<div class="question-box">
+    <p class="question">"You mentioned Transformer Engine for FP8 training on Hopper. When running 5D parallelism at scale, does the per-tensor FP8 scaling introduce synchronization overhead in the tensor-parallel communication? Specifically — after a TP all-reduce, do the scaling factors need to be re-computed for the fused tensor, or are they handled independently per shard?"</p>
+</div>
+
+<div class="speaker-response">
+    "The scaling factors are computed per-tensor, where 'tensor' here means the local shard on each GPU. After the TP all-reduce, the result is in higher precision — FP16 or BF16 — and then requantized to FP8 for the next layer's input with a new scaling factor. So the all-reduce itself happens in BF16 — you don't communicate FP8 values across the TP group. The overhead of computing scaling factors is negligible — it's essentially a max-abs reduction that piggybacks on the existing computation. The delayed scaling approach means we use last iteration's scale, so there's no synchronization point for the scale itself."
+</div>
+
+<div class="followup">
+    "Understood — so the TP communication is still in BF16, and FP8 is only used within each GPU's local computation. Does that mean the bandwidth savings of FP8 are mainly on the HBM access side rather than the inter-GPU communication side?"
+</div>
+
+<p><em>This shows you're reasoning through where FP8 actually helps vs. where it doesn't. Very strong systems signal.</em></p>
+
+<!-- Q1.4 -->
+<h3><span class="qnum">Q1.4</span> <span class="tier-label tier-2">TIER 2</span> Data Quality vs. Scale</h3>
+
+<div class="question-box">
+    <p class="question">"You showed the data curation pipeline with NeMo Data Curator. The field has shifted from 'more tokens is better' toward 'better tokens is better' — Llama-3 was trained on 15T tokens but with aggressive quality filtering. How does NVIDIA's guidance to customers balance this? Is there a framework for estimating the optimal quality-quantity trade-off for a given compute budget, or is it still largely empirical?"</p>
+</div>
+
+<div class="speaker-response">
+    "It's largely empirical, honestly. We have internal guidelines based on ablation studies, but there's no closed-form solution yet. What we do in NeMo Data Curator is provide the tools: perplexity filtering, deduplication, quality classifiers, and then customers run ablations at small scale to find their optimal mix. The general rule of thumb is: filter aggressively, then scale. Removing 60–80% of raw web data via quality filtering typically improves downstream performance even though you have fewer tokens. But the exact threshold depends on domain."
+</div>
+
+<div class="followup">
+    "That's consistent with what I see in computer vision — we always benefit from curating training data even at the cost of volume. Do you see customers using model-based quality scoring — like using a smaller language model's perplexity as a filter for training data for a larger model?"
+</div>
+
+<p><em>Connects CV experience to LLM data curation. Natural, not forced.</em></p>
+
+<!-- Q1.5 -->
+<h3><span class="qnum">Q1.5</span> <span class="tier-label tier-3">TIER 3</span> Evaluation and Alignment Measurement</h3>
+
+<div class="question-box">
+    <p class="question">"After alignment, how do you evaluate whether the model is actually better aligned versus just gaming the metrics? I imagine there's tension between benchmark scores like MT-Bench and real-world safety — a model could score well on helpfulness while still having failure modes. Does NeMo provide tooling for adversarial evaluation, or is that still manual?"</p>
+</div>
+
+<div class="speaker-response">
+    "NeMo Evaluator supports standard benchmarks — MMLU, HumanEval, MT-Bench. For safety specifically, we have NeMo Guardrails which can do adversarial testing at scale — red-teaming the model with jailbreak attempts. But you're right that comprehensive evaluation is still an open problem. We recommend customers define their own evaluation suites that reflect their specific use case and risk tolerance. It's not a solved problem."
+</div>
+
+<!-- Q1.6 - REACTIVE -->
+<div class="reactive">
+    <p class="trigger">Speaker mentions "scaling to thousands of GPUs" or shows a scaling curve...</p>
+    <p class="question"><strong>"What's the typical MFU you achieve at that scale? I profile distributed training runs and I'm curious what the practical ceiling is with 5D parallelism on H100 clusters — I've seen claims of 40–55% for pre-training, but is that before or after communication overlap?"</strong></p>
+    <p><em>Signals you know MFU, you profile training, and you have calibrated expectations. Directly relevant to the job.</em></p>
+</div>
+
+<div class="reactive">
+    <p class="trigger">Speaker mentions "NeMo is config-driven" or shows a YAML/Hydra config...</p>
+    <p class="question"><strong>"When you're tuning parallelism dimensions — choosing TP=8 vs TP=4×PP=2 for example — is there an auto-tuning mechanism in NeMo that profiles different configurations, or is it manual expert knowledge?"</strong></p>
+    <p><em>Implies you'd be the person doing that profiling if you joined the team.</em></p>
+</div>
+
+<div class="reactive">
+    <p class="trigger">Speaker mentions "post-training is much cheaper than pre-training"...</p>
+    <p class="question"><strong>"If post-training is only 0.5% of pre-training compute, what fraction of the Performance team's engineering effort goes into optimizing it versus pre-training? I imagine the optimization surface is very different — smaller batch sizes, online generation, multiple model interactions."</strong></p>
+    <p><em>Directly asks about the team structure and priorities. Opens a conversation about the role.</em></p>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<h2>Talk 2: Inference Optimization — Dr. Séverine Habert</h2>
+
+<p><em>Habert will likely cover: the latency/throughput challenge → quantization (FP8, FP4, AWQ) → KV-cache management → in-flight batching → speculative decoding → maybe disaggregated serving. She may show benchmarks comparing TensorRT-LLM vs. competitors (vLLM, etc.) on throughput/latency curves.</em></p>
+
+<!-- Q2.1 -->
+<h3><span class="qnum">Q2.1</span> <span class="tier-label tier-1">TIER 1</span> FP4 Shifting the Bottleneck</h3>
+
+<div class="question-box">
+    <p class="question">"With FP4 on Blackwell, weight loading cost drops by 4× versus FP16, which should push the decode phase closer to compute-bound territory — at least for reasonable batch sizes. Does that fundamentally change the optimization strategy? Specifically, does speculative decoding become less beneficial when decode is no longer purely memory-bandwidth-limited?"</p>
+</div>
+
+<div class="speaker-response">
+    "Excellent observation. Yes, with FP4 on Blackwell, at moderate batch sizes you can actually reach the compute-bound regime for decode — which is a regime shift that changes the optimization playbook. Speculative decoding is primarily a latency optimization for the bandwidth-bound regime. When you're compute-bound, the draft model's tokens don't come 'for free' — they compete for the same compute resources. So the benefit diminishes. However, for single-request latency at batch=1, even with FP4 on Blackwell, you're still bandwidth-bound because the arithmetic intensity is so low. The crossover depends on batch size. We're actively studying where that crossover point is for different model sizes on B200."
+</div>
+
+<div class="followup">
+    "That crossover point sounds like exactly what a roofline analysis would reveal — memory bandwidth ceiling versus compute ceiling as a function of batch size and quantization level. Is that how your team characterizes new hardware/model combinations internally?"
+</div>
+
+<p><em>This follow-up explicitly names roofline analysis — a core tool for the JR1980206 role — and asks about internal methodology. It invites them to describe the team's workflow, which is intelligence for your application.</em></p>
+
+<!-- Q2.2 -->
+<h3><span class="qnum">Q2.2</span> <span class="tier-label tier-1">TIER 1</span> CUDA Graphs vs. Dynamic Batching</h3>
+
+<div class="question-box">
+    <p class="question">"In-flight batching changes the active batch size every iteration, which conflicts with CUDA Graphs requiring static shapes. How does TensorRT-LLM handle this in practice — a pool of pre-captured graphs for discrete batch sizes with switching between them? And what's the graph-switching overhead relative to the decode step duration?"</p>
+</div>
+
+<div class="speaker-response">
+    "Yes, TensorRT-LLM maintains a set of CUDA Graphs captured at different 'bucket' batch sizes. When the actual batch size changes, we select the graph with the closest matching size — padding the batch if necessary. The graph switching overhead is minimal — tens of microseconds — because it's just updating the graph's input pointers. The real cost is the padding waste: if your graph buckets are [1, 4, 8, 16, 32] and you have 5 active requests, you run the batch=8 graph with 3 padded dummy entries. We have heuristics for choosing bucket sizes based on traffic patterns. Some deployments disable CUDA Graphs when batch sizes are very dynamic and the padding waste exceeds the launch overhead savings."
+</div>
+
+<div class="followup">
+    "Interesting — so there's a trade-off between graph granularity (more buckets = less padding waste, more memory for graphs) and graph capture cost. Is this something the JR1980206 performance team profiles per-deployment, or is there a universal optimal bucket configuration?"
+</div>
+
+<p><em>Directly names the job ID. Shows you've read the posting. Asks about the team's work. Bold but effective.</em></p>
+
+<!-- Q2.3 -->
+<h3><span class="qnum">Q2.3</span> <span class="tier-label tier-2">TIER 2</span> KV-Cache Quantization Accuracy</h3>
+
+<div class="question-box">
+    <p class="question">"For KV-cache quantization to FP8 or INT8 — how does accuracy degrade for long-context tasks? I'd expect quantization error to accumulate across attention layers as the same quantized KV entries are attended to repeatedly. Do you observe layer-position-dependent degradation, and if so, is there a strategy like mixed-precision KV — full precision for early layers, quantized for later ones?"</p>
+</div>
+
+<div class="speaker-response">
+    "We do see some sensitivity in the first few layers — the attention patterns in early layers tend to have sharper distributions where quantization noise matters more. For most models up to 32k context, FP8 KV-cache shows negligible degradation. Beyond 128k, we see measurable perplexity increase — around 0.1–0.2 points. The mixed-precision approach you suggest is something we've experimented with: keeping the first 2–4 layers in FP16 while quantizing the rest to FP8 gives you 95% of the memory savings with almost no accuracy loss. TensorRT-LLM supports this configuration but it's not the default yet — it requires per-model profiling to determine the right split point."
+</div>
+
+<div class="followup">
+    "The per-model profiling to find the split point — is that something ModelOpt automates, or is it manual experimentation? I ask because at Fraunhofer we faced a similar problem with layer-wise quantization sensitivity for CNNs on FPGA — we ended up building automated sensitivity analysis tooling."
+</div>
+
+<p><em>Connects directly to your VitisAI/FPGA work. Shows you've solved analogous problems. Signals you'd contribute immediately to automating this workflow.</em></p>
+
+<!-- Q2.4 -->
+<h3><span class="qnum">Q2.4</span> <span class="tier-label tier-2">TIER 2</span> Profiling Methodology</h3>
+
+<div class="question-box">
+    <p class="question">"When you're characterizing a new model on new hardware — say, a Mixture-of-Experts model on Blackwell — what's your profiling methodology for identifying the primary bottleneck? Do you use standard Nsight Systems/Compute traces and manually interpret them, or does the team have higher-level tooling that maps kernel-level metrics to application-level metrics like TTFT and TPS?"</p>
+</div>
+
+<div class="speaker-response">
+    "Both. We absolutely use Nsight Systems — it's our ground truth for understanding what's happening at the kernel level. But we also have internal profiling layers within TensorRT-LLM that report per-layer execution time, memory allocation, and communication overhead. For new hardware, we typically start with a roofline analysis: what's the theoretical peak throughput given the model's arithmetic intensity on this hardware? Then we measure actual throughput and trace the gap. The gap analysis tells us where to focus — is it kernel efficiency, memory bandwidth utilization, scheduling overhead, or communication? For MoE models specifically, the expert routing introduces load imbalance that's hard to see in standard traces — we've built custom visualization tools for that."
+</div>
+
+<div class="followup">
+    "The gap analysis approach is very close to how I profile distributed training — measuring theoretical scaling versus actual, then tracing the deficit to communication, memory, or compute. If I joined the team, would the methodology transfer, or is inference profiling a fundamentally different discipline from training profiling?"
+</div>
+
+<p><em>Extremely direct — "if I joined the team." Shows confidence and directly asks about transferability of your skills. Only use this if the conversation is warm.</em></p>
+
+<!-- Q2.5 -->
+<h3><span class="qnum">Q2.5</span> <span class="tier-label tier-2">TIER 2</span> Disaggregated Serving</h3>
+
+<div class="question-box">
+    <p class="question">"I've read about disaggregated serving — separating prefill and decode onto different GPU pools because they have different compute characteristics. Is TensorRT-LLM moving in this direction? It seems like it would require transferring the KV-cache between GPU pools after prefill, which could be expensive over the network."</p>
+</div>
+
+<div class="speaker-response">
+    "Yes, disaggregated serving is something we're actively working on. The KV-cache transfer is the key challenge — for a 70B model with 4k context, you're transferring about 10 GB of KV-cache from the prefill pool to the decode pool. Over InfiniBand at 400 Gb/s, that's about 200ms — which is comparable to the prefill time itself. So the benefit depends on the workload: for very long prompts with short outputs, disaggregation helps because prefill is the bottleneck. For short prompts with long outputs, the transfer overhead may not be worth it. We're looking at techniques like KV-cache streaming — start decode before the full KV-cache transfer is complete."
+</div>
+
+<div class="followup">
+    "The KV-cache streaming idea is elegant — essentially pipelining the transfer with early decode steps that only need the first few KV entries. Does that require changes to the attention kernel to handle partially-available KV-cache, or is it handled at the scheduler level?"
+</div>
+
+<p><em>Shows you immediately grasp the implication and think about implementation details. Strong systems signal.</em></p>
+
+<!-- Q2.6 -->
+<h3><span class="qnum">Q2.6</span> <span class="tier-label tier-3">TIER 3</span> 2:4 Sparsity in Practice</h3>
+
+<div class="question-box">
+    <p class="question">"You showed 2:4 structured sparsity giving 2× compute throughput with minimal accuracy loss. In practice, how well does this compose with quantization — can you do FP8 sparse, or FP4 sparse? Is the combined speedup multiplicative (4× from sparsity+quantization), or are there diminishing returns?"</p>
+</div>
+
+<div class="speaker-response">
+    "FP8 with 2:4 sparsity is supported on Hopper and gives close to multiplicative speedup — roughly 3.5–4× versus FP16 dense for GEMM operations. FP4 sparse is theoretically possible on Blackwell but we're still validating accuracy. The challenge is that both sparsity and quantization remove information — combining them aggressively can push below accuracy thresholds for sensitive tasks. For inference on well-trained models, FP8 sparse is very reliable. FP4 sparse is more experimental."
+</div>
+
+<!-- Q2.7 - REACTIVE -->
+<div class="reactive">
+    <p class="trigger">Speaker shows a latency vs. throughput benchmark graph comparing TensorRT-LLM to other engines...</p>
+    <p class="question"><strong>"Those benchmarks are impressive. When customers report different numbers than your benchmarks, what's typically the root cause? Is it misconfiguration — wrong batch size, suboptimal TP degree — or is it workload-specific factors like sequence length distribution?"</strong></p>
+    <p><em>Practical, grounded question. Shows you know that benchmarks don't always match reality. The Performance team deals with exactly this gap.</em></p>
+</div>
+
+<div class="reactive">
+    <p class="trigger">Speaker mentions "we support Llama, Mixtral, Falcon, GPT..." (long list of models)...</p>
+    <p class="question"><strong>"With so many model architectures to support, how does the team prioritize optimization effort? Is there a standard profiling pass that identifies the highest-impact optimization for each new model, or do you rely on architecture-level heuristics — like 'GQA models need different KV-cache sizing than MHA models'?"</strong></p>
+    <p><em>Asks about team workflow and prioritization. Intelligence for your application.</em></p>
+</div>
+
+<div class="reactive">
+    <p class="trigger">Speaker mentions "FlashAttention" or shows an attention kernel optimization...</p>
+    <p class="question"><strong>"FlashAttention's key insight is tiling attention computation to fit in SRAM — essentially the same principle as tiled matrix multiplication in CUDA. Is TensorRT-LLM using FlashAttention-3 with Hopper's TMA (Tensor Memory Accelerator) for asynchronous SRAM loading, and if so, what's the speedup over FlashAttention-2?"</strong></p>
+    <p><em>Shows deep CUDA knowledge (TMA is Hopper-specific hardware). Signals you read current GPU architecture papers.</em></p>
+</div>
+
+<div class="reactive">
+    <p class="trigger">Speaker mentions anything about "serving" or "production deployment"...</p>
+    <p class="question"><strong>"In production serving, how do you handle the long-tail latency problem? A single request with a very long context can temporarily consume most of the KV-cache budget and slow down all other requests. Is there a preemption mechanism — like swapping that request's KV to CPU and serving shorter requests first?"</strong></p>
+    <p><em>Shows you think about production systems, not just benchmarks. Exactly what an NVIDIA performance engineer deals with.</em></p>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<h2>Talk 3: Physical AI & World Models — Dr. Pallavi Mohan</h2>
+
+<p><em>Mohan will likely give a higher-level talk: the Physical AI vision → what world models are → Cosmos overview → demo videos → Isaac Sim → GR00T → applications (driving, robotics, factories). Less technical depth than Talks 1–2, more strategic/visionary. Your questions should bridge from your technical background into this vision.</em></p>
+
+<!-- Q3.1 -->
+<h3><span class="qnum">Q3.1</span> <span class="tier-label tier-1">TIER 1</span> Tokenizer Information Bottleneck</h3>
+
+<div class="question-box">
+    <p class="question">"My research background is in compression and spatial machine learning — specifically how lossy compression affects downstream ML performance. The Cosmos tokenizer applies 512× compression to video. I'm curious: is the tokenizer fidelity currently the accuracy bottleneck for physics prediction, or is it the world model itself? Can the tokenizer distinguish, for instance, between a rigid object sliding and a deformable object deforming?"</p>
+</div>
+
+<div class="speaker-response">
+    "That's a really interesting perspective — connecting compression theory to world models. The short answer is: it depends on the spatial scale. For large-scale dynamics — objects moving, gravity, collisions — the tokenizer preserves enough information. For fine-grained physics like deformation, fabric folding, or fluid splashes, we do see that the tokenizer is the limiting factor. The 8×8 spatial patches can't represent sub-patch deformation well. We're working on hierarchical tokenizers that use coarse tokens for global structure and fine-grained tokens for physics-critical regions. But yes, the tokenizer is often the bottleneck for fine-grained physics — not the world model."
+</div>
+
+<div class="followup">
+    "That's very consistent with what I found in my research — spatial compression below a critical threshold causes abrupt performance drops in downstream tasks, not gradual degradation. Have you characterized that critical threshold for the tokenizer? For example — is 4×4 spatial significantly better, or is there a sweet spot where physics fidelity plateaus?"
+</div>
+
+<p><em>Directly references your published findings. Demonstrates research depth. Positions you as someone with unique expertise relevant to their problem.</em></p>
+
+<!-- Q3.2 -->
+<h3><span class="qnum">Q3.2</span> <span class="tier-label tier-1">TIER 1</span> Training Data Pipeline at Scale</h3>
+
+<div class="question-box">
+    <p class="question">"Training on 20 million hours of video is one of the most demanding data pipeline challenges in ML. I work on GPU-accelerated data pipelines with NVIDIA DALI for image-heavy workloads. What does the Cosmos training data pipeline look like? Is video decoding and tokenization done on-the-fly on GPU, or are tokens pre-computed and stored — and what are the storage implications of pre-tokenization at that scale?"</p>
+</div>
+
+<div class="speaker-response">
+    "It's a hybrid approach. We pre-compute tokens for the most frequently used data — this avoids the cost of repeated video decoding and tokenization during training. But pre-tokenized storage is enormous: even at 512× compression, 20M hours of video generates petabytes of tokens. For less-used data or for data augmentation, we do on-the-fly tokenization using GPU-accelerated video decoding. The pipeline uses DALI for decoding and our custom tokenizer kernels. The I/O subsystem is actually the hardest engineering challenge — you need sustained multi-TB/s read throughput from distributed storage to feed thousands of GPUs."
+</div>
+
+<div class="followup">
+    "Multi-TB/s sustained I/O is exactly the challenge we face in HPC — we use Lustre with WebDataset sharding to keep GPU pipelines fed. At your scale, is it a similar parallel filesystem approach, or have you moved to object storage with prefetching?"
+</div>
+
+<p><em>Shows concrete HPC infrastructure knowledge. Signals you understand the systems-level challenge behind the research.</em></p>
+
+<!-- Q3.3 -->
+<h3><span class="qnum">Q3.3</span> <span class="tier-label tier-2">TIER 2</span> Sim-to-Real + Quantization Compound Gap</h3>
+
+<div class="question-box">
+    <p class="question">"You showed the sim-to-real transfer pipeline for robotics. In my experience deploying quantized models to edge hardware like FPGAs, there's always a deployment accuracy gap. For Physical AI, you have a compounding problem: sim-to-real gap PLUS compression gap when deploying to Jetson Thor. How does NVIDIA handle this — quantization-aware training in simulation, or is the policy robust enough that post-training quantization doesn't degrade control quality?"</p>
+</div>
+
+<div class="speaker-response">
+    "You're right that the gaps compound. In practice, robot control policies are actually quite robust to quantization — they tend to be smaller models (compared to LLMs) and the output space is continuous joint angles, which are tolerant to small numerical errors. We typically do PTQ to INT8 for Jetson deployment and see negligible performance degradation. The sim-to-real gap is much larger than the quantization gap. Where quantization hurts is in the perception stack — visual encoders that feed into the policy. Those require more careful quantization. For GR00T specifically, we quantize-aware-train the vision encoder but PTQ the action decoder."
+</div>
+
+<div class="followup">
+    "That layered approach — QAT for perception, PTQ for control — is elegant. Is TensorRT the deployment engine on Jetson Thor, and if so, does it use the same optimization stack we discussed in the previous talk, or is there a robotics-specific TensorRT configuration?"
+</div>
+
+<p><em>Connects all three talks together. Shows you see the full pipeline from model training to edge deployment.</em></p>
+
+<!-- Q3.4 -->
+<h3><span class="qnum">Q3.4</span> <span class="tier-label tier-2">TIER 2</span> Physics Validation of World Models</h3>
+
+<div class="question-box">
+    <p class="question">"World models learn physics implicitly from video statistics, while Isaac Sim implements physics explicitly via PhysX. Is there work on using the explicit simulator to validate or constrain the world model's predictions — like a physics-consistency loss during training? Or are these currently independent systems with no feedback loop?"</p>
+</div>
+
+<div class="speaker-response">
+    "This is an active research direction. Currently they're mostly independent — Cosmos is trained on video, Isaac Sim uses PhysX, and they complement each other for different tasks. But we're exploring what we call 'physics-guided world models' — using PhysX as a teacher signal. For example, running a scenario in both Cosmos and PhysX, and penalizing Cosmos when it violates physical conservation laws that PhysX respects. The challenge is that PhysX computes forces and accelerations, while Cosmos operates in pixel/token space — bridging those representations is non-trivial. It's one of our active research directions."
+</div>
+
+<div class="followup">
+    "The representation mismatch is interesting — it's essentially a domain gap between symbolic physics (forces, energy) and learned visual physics (pixels). Have you looked at intermediate representations — like predicting object 6-DOF poses from both systems and comparing in that space?"
+</div>
+
+<p><em>Research-level question. Shows you think creatively about bridging domains. High-risk (you might be wrong) but high-reward (positions you as a researcher, not just an engineer).</em></p>
+
+<!-- Q3.5 -->
+<h3><span class="qnum">Q3.5</span> <span class="tier-label tier-2">TIER 2</span> Cosmos as Training Data Generator</h3>
+
+<div class="question-box">
+    <p class="question">"One use case for world models is generating synthetic training data for perception models — like creating diverse driving scenarios. How do you ensure the generated data doesn't have distribution gaps that hurt downstream model training? In my defect detection work, synthetic data quality directly determines the real-world detector's recall on rare defect types."</p>
+</div>
+
+<div class="speaker-response">
+    "Distribution coverage is indeed the key challenge with synthetic data. For driving specifically, we validate by measuring coverage of a taxonomy — does the generated data include all road conditions, weather types, edge cases? Cosmos alone can't guarantee coverage of rare events because it's trained on the frequency distribution of internet video — where rare events are, by definition, rare. We address this by conditioning generation on specific scenarios: 'generate a rainy night scene with a pedestrian crossing unexpectedly.' The language conditioning lets you steer toward rare events that the model has learned to generate but wouldn't produce unprompted."
+</div>
+
+<div class="followup">
+    "The conditional generation for rare events is clever — it's essentially using the world model as a controllable data augmentation engine. At Fraunhofer we face the same challenge with manufacturing defects — rare defect types are underrepresented in real data. Could Cosmos-style world models be applied to industrial settings — generating synthetic defect scenarios?"
+</div>
+
+<p><em>Connects directly to your Fraunhofer work. Opens the door to discussing industrial applications — which is NVIDIA's enterprise market.</em></p>
+
+<!-- Q3.6 -->
+<h3><span class="qnum">Q3.6</span> <span class="tier-label tier-3">TIER 3</span> Long-Horizon Prediction Drift</h3>
+
+<div class="question-box">
+    <p class="question">"You showed world model predictions over several seconds. How does prediction quality degrade with time horizon? I'd expect autoregressive models to drift as errors compound — similar to how autoregressive LLM generation can go off-distribution. Is there a practical prediction horizon beyond which Cosmos outputs are no longer useful for planning?"</p>
+</div>
+
+<div class="speaker-response">
+    "Correct — autoregressive world models drift. For the current Cosmos models, predictions are reliable for about 4–8 seconds for structured environments (indoor, factory floor) and 2–4 seconds for dynamic outdoor scenes. Beyond that, the outputs are visually plausible but physically unreliable — objects might drift through walls, gravity might be inconsistent. The diffusion-based models are actually better for long-horizon because they don't compound errors — but they're slower. For robotics planning, we typically re-predict every few hundred milliseconds with updated observations, so the drift is less problematic in practice — you never rely on a prediction more than a few seconds old."
+</div>
+
+<!-- Q3.7 - REACTIVE -->
+<div class="reactive">
+    <p class="trigger">Speaker shows a demo video of a robot performing a task in simulation then in the real world...</p>
+    <p class="question"><strong>"Impressive transfer. How many GPU-hours of simulation training does a task like that require, and how does it scale — is it linear with task complexity, or do harder manipulation tasks require super-linear simulation time?"</strong></p>
+    <p><em>HPC-flavored question. Shows you think about compute costs and scaling. Relevant to the Performance team's job of optimizing these workloads.</em></p>
+</div>
+
+<div class="reactive">
+    <p class="trigger">Speaker mentions "Isaac Lab" or "thousands of parallel environments"...</p>
+    <p class="question"><strong>"Running 4096 parallel physics environments on a single GPU sounds like a very specific CUDA optimization challenge — memory management for 4096 scene states, batched collision detection across environments. Is this where the Performance SW team also contributes, or is Isaac Lab optimization handled by a separate group?"</strong></p>
+    <p><em>Directly asks about whether the JR1980206 role touches Isaac Lab. Intelligence for your application.</em></p>
+</div>
+
+<div class="reactive">
+    <p class="trigger">Speaker mentions "open-weight" or "Cosmos is available on Hugging Face"...</p>
+    <p class="question"><strong>"With Cosmos being open-weight, do you see research groups fine-tuning it on domain-specific video — like factory floors or surgical environments? And would TensorRT-LLM be the deployment path for those fine-tuned world models, or is there a separate inference stack for video generation?"</strong></p>
+    <p><em>Connects Cosmos to TensorRT-LLM (Talk 2). Shows you see the full stack. Also explores whether the role would touch world model inference optimization.</em></p>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<h2>General Strategy: How to Ask Questions Well</h2>
+
+<h3>Mechanics</h3>
+<ol>
+    <li><strong>Stand up</strong> (if seated). It commands attention and the speaker will face you.</li>
+    <li><strong>State name and affiliation first</strong>: "Gabriel Dax, Fraunhofer IIS —" then pause 1 second.</li>
+    <li><strong>Frame before asking</strong>: Give a 1-sentence context so the speaker (and audience) understands where you're coming from. E.g., "I work on profiling distributed training on HPC clusters, so I'm curious about..."</li>
+    <li><strong>Ask ONE thing</strong>. Don't bundle two questions. If your question has "and also" — cut the second part.</li>
+    <li><strong>Keep it under 20 seconds</strong>. Anything longer and you've lost the room.</li>
+    <li><strong>End with a clear question mark</strong>. Don't trail off into a statement. End with "...so my question is: X?"</li>
+</ol>
+
+<h3>If You Don't Understand the Answer</h3>
+<p>
+    Say: "That's helpful, thank you. Let me process that." Do NOT ask a confused follow-up. You can
+    approach the speaker privately during the break for clarification — that's actually better for building
+    a personal connection.
+</p>
+
+<h3>If Someone Else Asks Your Question First</h3>
+<p>
+    Switch to your backup. If both are taken, use a reactive question that builds on what the speaker
+    just said in response to the other person. Prefix with: "Building on that previous question —"
+</p>
+
+<h3>If There's No Q&A Time</h3>
+<p>
+    Approach the speaker during the break or after the final talk. Say: "I had a question about your talk
+    if you have a moment —" This is actually BETTER for recruitment because you get a private 1-on-1
+    conversation rather than a public Q&A exchange.
+</p>
+
+<h3>Body Language</h3>
+<ul>
+    <li>Eye contact with the speaker while asking</li>
+    <li>Nod when they're answering (shows you're following)</li>
+    <li>Don't look at notes while asking — memorize the core of your question</li>
+    <li>Smile briefly after they finish (shows you appreciated the answer)</li>
+</ul>
+
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<h2>Decision Matrix: Which Question to Pick</h2>
+
+<table>
+    <thead>
+    <tr><th>If...</th><th>Then ask...</th><th>Why</th></tr>
+    </thead>
+    <tbody>
+    <tr>
+        <td>You can only ask ONE question all day</td>
+        <td>Q2.1 (FP4 bottleneck shift)</td>
+        <td>Most directly demonstrates JR1980206 thinking. Talk 2 is your talk.</td>
+    </tr>
+    <tr>
+        <td>You want maximum personal connection</td>
+        <td>Q3.1 (tokenizer + your PhD)</td>
+        <td>Nobody else will connect compression theory to Cosmos. Memorable.</td>
+    </tr>
+    <tr>
+        <td>You want to learn about the role specifically</td>
+        <td>Q2.4 (profiling methodology)</td>
+        <td>Directly asks "how does your team work" — intelligence for your application.</td>
+    </tr>
+    <tr>
+        <td>The audience is very technical</td>
+        <td>Q1.3 (FP8 TP scaling factors) or Q2.2 (CUDA Graphs)</td>
+        <td>Very specific. Only someone with CUDA/distributed experience would ask this.</td>
+    </tr>
+    <tr>
+        <td>The audience is mostly non-technical</td>
+        <td>Q1.4 (data quality) or Q3.5 (synthetic data)</td>
+        <td>Accessible to all, still shows depth. Lower risk of audience glazing over.</td>
+    </tr>
+    <tr>
+        <td>You want to start a private conversation</td>
+        <td>Q2.4 (profiling methodology) → then approach privately after</td>
+        <td>The answer will be brief in public. You have an excuse to continue in the corridor.</td>
+    </tr>
+    </tbody>
+</table>
+
+
+
+        
+        <!-- _includes/tutorial-nav.html -->
+
+
+
+
+
+
+
+
+
+
+
+
+<nav class="tutorial-nav" aria-label="Lesson navigation">
+    
+    <a href="/heap/ai-day/004/" class="tutorial-nav-btn tutorial-nav-prev">
+        <span class="tutorial-nav-label">← Previous</span>
+        <span class="tutorial-nav-title">004 — Cheat Sheet</span>
+    </a>
+    
+
+    
+</nav>
+        
+    </article>
+
+</div>
+  </div>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <div class="footer-links">
+      <a href="https://github.com/g4br1el">GitHub</a>
+      <a href="https://www.linkedin.com/in/gadax">LinkedIn</a>
+      <a href="mailto:gdax.science@gmail.com">Email</a>
+      <a href="/files/CV-Gabriel_Dax.pdf">Resume ↓</a>
+    </div>
+    <p class="footer-copyright">© 2026 Gabriel Dax</p>
+  </div>
+</footer>
+
+
+
+</body>
+</html>

@@ -1,0 +1,697 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DeviceMesh: Topology Construction & Multi-Dimensional Meshes — Gabriel Dax</title>
+  <!-- Begin Jekyll SEO tag v2.9.0 -->
+<meta name="generator" content="Jekyll v4.4.1" />
+<meta property="og:title" content="DeviceMesh: Topology Construction &amp; Multi-Dimensional Meshes" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="The bridge between your physical GPU topology and FSDP2&#39;s logical sharding strategy." />
+<meta name="twitter:description" property="og:description" content="The bridge between your physical GPU topology and FSDP2&#39;s logical sharding strategy." />
+<link rel="canonical" href="https://www.gabrieldax.de/heap/fsdp2/005/" />
+<meta property="og:url" content="https://www.gabrieldax.de/heap/fsdp2/005/" />
+<meta property="og:site_name" content="Gabriel Dax — ML Research Engineer" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2026-06-24T07:37:12+00:00" />
+<meta property="article:modified_time" content="2026-06-24T07:37:12+00:00" />
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:title" content="DeviceMesh: Topology Construction &amp; Multi-Dimensional Meshes" />
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"BlogPosting","dateModified":"2026-06-24T07:37:12+00:00","datePublished":"2026-06-24T07:37:12+00:00","description":"The bridge between your physical GPU topology and FSDP2&#39;s logical sharding strategy.","headline":"DeviceMesh: Topology Construction &amp; Multi-Dimensional Meshes","mainEntityOfPage":{"@type":"WebPage","@id":"https://www.gabrieldax.de/heap/fsdp2/005/"},"url":"https://www.gabrieldax.de/heap/fsdp2/005/"}</script>
+<!-- End Jekyll SEO tag -->
+
+  <meta content='text/html; charset=utf-8' http-equiv='Content-Type'>
+<meta http-equiv='X-UA-Compatible' content='IE=edge'>
+<meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0'>
+
+
+<meta property="og:description" content="The bridge between your physical GPU topology and FSDP2's logical sharding strategy." />
+
+<meta name="author" content="Gabriel Dax" />
+
+
+
+<meta property="og:title" content="DeviceMesh: Topology Construction & Multi-Dimensional Meshes" />
+<meta property="twitter:title" content="DeviceMesh: Topology Construction & Multi-Dimensional Meshes" />
+
+
+
+<meta property="og:image" content="https://www.gabrieldax.de/images/self.png"/>
+<meta property="twitter:image" content="https://www.gabrieldax.de/images/self.png"/>
+
+
+  <link rel="stylesheet" href="/assets/style.css">
+  <link rel="icon" type="image/png" sizes="32x32" href="/images/favicon.jpg">
+  <link rel="canonical" href="https://www.gabrieldax.de/heap/fsdp2/005/">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  
+
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div>
+      <a href="/" class="site-name">Gabriel Dax</a>
+      <span class="site-tagline">ML Research Engineer</span>
+    </div>
+    <nav>
+      <a href="/" >Home</a>
+      <a href="/projects" >Projects</a>
+      <a href="/publications" >Publications</a>
+      <a href="/bio" >CV</a>
+    </nav>
+  </div>
+</header>
+
+<main class="main-content">
+  <div class="container">
+    <div class="tutorial-wrapper">
+
+    <nav class="tutorial-breadcrumb">
+        <a href="/heap/">← All Tutorials</a>
+        
+        <span class="tutorial-position">Lesson 5 / 18</span>
+        
+    </nav>
+
+    <article class="tutorial-article">
+        
+        <div class="tutorial-lesson-header">
+            <span class="tutorial-tag">Lesson 005</span>
+            
+            <span class="tutorial-tag tutorial-tag--secondary">Core</span>
+            
+            <span class="tutorial-tag tutorial-tag--secondary">Infrastructure</span>
+            
+        </div>
+        
+
+        <h1>DeviceMesh: Topology Construction & Multi-Dimensional Meshes</h1>
+
+        <p><em>The bridge between your physical GPU topology and FSDP2's logical sharding strategy.</em></p>
+
+<h2>Why DeviceMesh Matters</h2>
+
+<p>DeviceMesh is not just a convenience wrapper around process groups — it's the <strong>single source of truth</strong> for how your GPUs relate to each other. Get it wrong, and FSDP2 will:</p>
+<ul>
+    <li>Route all-gathers over InfiniBand instead of NVLink (2–10× slower)</li>
+    <li>Create process groups that span physical boundaries inefficiently</li>
+    <li>Miss HSDP opportunities entirely (sharding across slow links when it should replicate)</li>
+</ul>
+
+<p>On your V100 cluster (4 GPUs/node, NVLink intra-node, InfiniBand inter-node), the mesh construction directly determines whether FSDP2 exploits the bandwidth hierarchy.</p>
+
+<h2>1-D Mesh: The Simple Case</h2>
+
+<pre><code class="language-python">from torch.distributed.device_mesh import init_device_mesh
+
+# All GPUs in one flat shard group — the simplest topology
+# Appropriate when: single node, or you want maximum sharding regardless of link speed
+mesh_1d = init_device_mesh("cuda", (world_size,))
+
+# What this creates internally:
+# - One ProcessGroup containing ALL ranks
+# - DTensors with Shard(0) will shard across ALL GPUs in this group
+# - All collectives (all-gather, reduce-scatter) use this single group
+</code></pre>
+
+<p>On <strong>one node with 4× V100 NVLink</strong>: this is optimal. All communication is intra-node over NVLink (~300 GB/s bidirectional). No reason to complicate things.</p>
+
+<p>On <strong>2+ nodes</strong>: this is suboptimal. All-gathers and reduce-scatters now span InfiniBand (~12.5 GB/s per link), mixed with NVLink. The collective treats all ranks equally even though some pairs are 24× faster to communicate with.</p>
+
+<h2>2-D Mesh: Exploiting the Bandwidth Hierarchy</h2>
+
+<p>A 2-D mesh encodes two levels of the topology. For your cluster:</p>
+
+<pre><code class="language-python"># 2-node × 4-GPU configuration
+# Mesh shape: (num_replicas, shard_group_size)
+# Convention: mesh dimensions are ordered outer → inner
+#   dim 0 (outer): slow link — inter-node InfiniBand — REPLICATE here
+#   dim 1 (inner): fast link — intra-node NVLink — SHARD here
+
+mesh_2d = init_device_mesh(
+    "cuda",
+    (2, 4),  # 2 replica groups, 4 GPUs per shard group
+    mesh_dim_names=("replicate", "shard"),
+)
+</code></pre>
+
+<h3>How Ranks Map to Mesh Coordinates</h3>
+
+<div class="diagram">
+    Physical Cluster:
+    ┌─── Node 0 (NVLink) ───┐   ┌─── Node 1 (NVLink) ───┐
+    │ GPU0  GPU1  GPU2  GPU3 │   │ GPU4  GPU5  GPU6  GPU7 │
+    └────────────────────────┘   └────────────────────────┘
+    ◀──── InfiniBand ────▶
+
+    DeviceMesh("cuda", (2, 4), mesh_dim_names=("replicate", "shard")):
+
+    Mesh coordinates [replica_idx, shard_idx]:
+
+    [0,0]=GPU0  [0,1]=GPU1  [0,2]=GPU2  [0,3]=GPU3   ← Replica group 0 (Node 0)
+    [1,0]=GPU4  [1,1]=GPU5  [1,2]=GPU6  [1,3]=GPU7   ← Replica group 1 (Node 1)
+    ↕            ↕            ↕            ↕
+    replicate    replicate    replicate    replicate    ← Communication across dim 0
+    (IB)         (IB)         (IB)         (IB)           uses InfiniBand
+
+    ◀──── shard (NVLink within each row) ────▶         ← Communication across dim 1
+    uses NVLink
+</div>
+    </code></pre>
+
+    <div class="callout">
+        <strong>Critical insight:</strong> <code>init_device_mesh</code> assigns ranks to mesh coordinates in <strong>row-major (C) order</strong>. Rank 0,1,2,3 fill the first row; rank 4,5,6,7 fill the second row. Since your nodes assign local_rank 0–3 to the 4 GPUs within a node, this naturally maps rows to nodes. If your cluster used a different rank assignment scheme, you'd need to verify this mapping.
+    </div>
+
+    <h3>Process Groups Derived from the Mesh</h3>
+
+    <p>A 2-D mesh of shape (2, 4) internally creates <strong>multiple process groups</strong>:</p>
+
+    <table>
+        <thead>
+        <tr><th>Mesh dimension</th><th>Name</th><th>Groups created</th><th>Members</th><th>Physical link</th></tr>
+        </thead>
+        <tbody>
+        <tr>
+            <td>dim 1 ("shard")</td>
+            <td>Intra-replica shard groups</td>
+            <td>2 groups (one per replica)</td>
+            <td>Group 0: [GPU0,1,2,3]<br>Group 1: [GPU4,5,6,7]</td>
+            <td>NVLink</td>
+        </tr>
+        <tr>
+            <td>dim 0 ("replicate")</td>
+            <td>Cross-replica sync groups</td>
+            <td>4 groups (one per shard position)</td>
+            <td>Group 0: [GPU0,GPU4]<br>Group 1: [GPU1,GPU5]<br>Group 2: [GPU2,GPU6]<br>Group 3: [GPU3,GPU7]</td>
+            <td>InfiniBand</td>
+        </tr>
+        </tbody>
+    </table>
+
+    <pre><code class="language-python"># Accessing sub-meshes programmatically:
+shard_mesh = mesh_2d["shard"]      # 1-D sub-mesh for this rank's shard group
+replicate_mesh = mesh_2d["replicate"]  # 1-D sub-mesh for this rank's replica group
+
+# On rank 0:
+#   shard_mesh contains ranks [0, 1, 2, 3]
+#   replicate_mesh contains ranks [0, 4]
+
+# On rank 5:
+#   shard_mesh contains ranks [4, 5, 6, 7]
+#   replicate_mesh contains ranks [1, 5]
+</code></pre>
+
+    <h2>How FSDP2 Uses the 2-D Mesh (HSDP)</h2>
+
+    <p>When you pass a 2-D mesh to <code>fully_shard()</code>, FSDP2 automatically implements HSDP:</p>
+
+    <pre><code class="language-python"># HSDP setup:
+mesh_2d = init_device_mesh("cuda", (2, 4), mesh_dim_names=("replicate", "shard"))
+
+for block in model.blocks:
+    fully_shard(block, mesh=mesh_2d, mp_policy=mp_policy)
+fully_shard(model, mesh=mesh_2d, mp_policy=mp_policy)
+
+# Result:
+# - Parameters at rest: placements = (Replicate(), Shard(0))
+#     Replicate on dim 0 → same shards on both nodes
+#     Shard(0) on dim 1 → partitioned across 4 GPUs within each node
+#
+# - Forward all-gather: operates on dim 1 ("shard") only → NVLink!
+#     Within each node: all-gather across 4 GPUs via NVLink
+#     No inter-node communication for all-gather
+#
+# - Backward reduce-scatter: operates on dim 1 ("shard") only → NVLink!
+#     Within each node: reduce-scatter across 4 GPUs via NVLink
+#
+# - Gradient sync across replicas: operates on dim 0 ("replicate") → InfiniBand
+#     all-reduce of sharded gradients across the 2 nodes
+#     Each rank only all-reduces its OWN shard (P/4 data, not full P)
+</code></pre>
+
+    <div class="callout success">
+        <strong>HSDP's bandwidth advantage:</strong> The expensive per-layer collectives (all-gather, reduce-scatter) run exclusively over NVLink. Only the gradient sync (one all-reduce per step) crosses InfiniBand — and it moves only P/4 data (each rank's shard), not the full model. Compare to 1-D mesh where ALL collectives cross InfiniBand for half the ranks.
+    </div>
+
+    <h2>Communication Volume Analysis: 1-D vs 2-D</h2>
+
+    <p>Let's quantify for ViT-Huge (632M params, fp16 = 1.2 GB) on 8 GPUs across 2 nodes:</p>
+
+    <table>
+        <thead>
+        <tr><th>Strategy</th><th>All-gather (per step)</th><th>Reduce-scatter (per step)</th><th>Replica sync</th><th>InfiniBand traffic</th></tr>
+        </thead>
+        <tbody>
+        <tr>
+            <td><strong>1-D Mesh (8 GPUs flat)</strong></td>
+            <td>2 × P × 7/8 = 2.1 GB<br>(fwd + bwd, mixed NVLink/IB)</td>
+            <td>P × 7/8 = 1.05 GB<br>(mixed NVLink/IB)</td>
+            <td>None</td>
+            <td>~1.6 GB (half of all traffic crosses nodes)</td>
+        </tr>
+        <tr>
+            <td><strong>2-D HSDP (2×4)</strong></td>
+            <td>2 × P × 3/4 = 1.8 GB<br>(NVLink only!)</td>
+            <td>P × 3/4 = 0.9 GB<br>(NVLink only!)</td>
+            <td>P/4 × 2 = 0.6 GB<br>(all-reduce, IB)</td>
+            <td><strong>0.6 GB</strong> (only replica sync)</td>
+        </tr>
+        </tbody>
+    </table>
+
+    <div class="callout">
+        <strong>Result:</strong> HSDP reduces InfiniBand traffic from ~1.6 GB to ~0.6 GB per step — a <strong>2.7× reduction</strong> in cross-node communication. On your InfiniBand-limited cluster, this directly translates to higher throughput when scaling beyond one node. The trade-off: each node must fit the model sharded across only 4 GPUs (P/4 per GPU) instead of 8 (P/8 per GPU). For ViT-Huge, P/4 = ~300 MB model-proportional memory — trivially fits on V100-32GB.
+    </div>
+
+    <h2>When to Use 1-D vs 2-D Mesh</h2>
+
+    <table>
+        <thead>
+        <tr><th>Use case</th><th>Recommendation</th><th>Rationale</th></tr>
+        </thead>
+        <tbody>
+        <tr>
+            <td>Single node (4 GPUs)</td>
+            <td>1-D mesh, size 4</td>
+            <td>Only NVLink available. No hierarchy to exploit.</td>
+        </tr>
+        <tr>
+            <td>2 nodes, model fits in 1/4 per GPU</td>
+            <td><strong>2-D HSDP (2, 4)</strong></td>
+            <td>Minimize InfiniBand traffic. Model-proportional mem (P/4) easily fits.</td>
+        </tr>
+        <tr>
+            <td>2 nodes, model ONLY fits in 1/8 per GPU</td>
+            <td>1-D mesh, size 8</td>
+            <td>Must shard across all 8 GPUs. Cannot afford to only shard within-node.</td>
+        </tr>
+        <tr>
+            <td>8 nodes (32 GPUs), model fits in 1/4 per GPU</td>
+            <td>2-D HSDP (8, 4)</td>
+            <td>8 replicas, 4-way shard. Replica sync moves only P/4 over IB.</td>
+        </tr>
+        <tr>
+            <td>8 nodes, model needs 1/32 per GPU</td>
+            <td>1-D mesh, size 32</td>
+            <td>Forced full sharding. Or consider 2-D (4, 8) to shard across 2 nodes via IB but limit IB traffic.</td>
+        </tr>
+        <tr>
+            <td>8 nodes, model fits in 1/4 per GPU, very large batch</td>
+            <td>2-D HSDP (8, 4)</td>
+            <td>Effective batch = per_gpu_batch × 4 × 8. HSDP gives DDP-like scaling with FSDP memory savings.</td>
+        </tr>
+        </tbody>
+    </table>
+
+    <div class="callout warning">
+        <strong>The decision criterion is simple:</strong> Can you fit P × 16 / shard_group_size per GPU (for model-proportional memory)? If yes with shard_group_size = GPUs_per_node → use HSDP. If not → must shard across nodes (larger shard group or full 1-D mesh). For ViT-Huge (9.6 GB total model-prop), shard_group=4 → 2.4 GB per GPU. Easily fits on V100-32GB.
+    </div>
+
+    <h2>Constructing the Mesh in Multi-Node Slurm</h2>
+
+    <pre><code class="language-python">import os
+import torch.distributed as dist
+from torch.distributed.device_mesh import init_device_mesh
+
+
+def create_mesh_for_cluster() -> "DeviceMesh":
+    """
+    Auto-detect topology and create appropriate mesh.
+
+    Assumptions:
+    - torchrun sets LOCAL_RANK, RANK, WORLD_SIZE
+    - Ranks are assigned contiguously per node (torchrun default)
+    - All nodes have the same number of GPUs
+    """
+    world_size = dist.get_world_size()
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", torch.cuda.device_count()))
+    num_nodes = world_size // local_world_size
+
+    if num_nodes == 1:
+        # Single node: simple 1-D shard
+        mesh = init_device_mesh("cuda", (world_size,))
+        if dist.get_rank() == 0:
+            print(f"Mesh: 1-D flat shard, {world_size} GPUs")
+    else:
+        # Multi-node: HSDP with intra-node sharding
+        mesh = init_device_mesh(
+            "cuda",
+            (num_nodes, local_world_size),
+            mesh_dim_names=("replicate", "shard"),
+        )
+        if dist.get_rank() == 0:
+            print(f"Mesh: 2-D HSDP, {num_nodes} replicas × "
+                  f"{local_world_size} shards/replica")
+
+    return mesh
+</code></pre>
+
+    <div class="callout">
+        <strong>Rank ordering assumption:</strong> <code>init_device_mesh</code> fills the mesh in row-major order from rank 0. <code>torchrun</code> assigns ranks contiguously per node: node 0 gets ranks 0..3, node 1 gets ranks 4..7. This means row 0 of the mesh = node 0, row 1 = node 1 — exactly what we want. If you use a different launcher that doesn't guarantee this ordering, you'd need to pass a custom rank-to-coordinate mapping.
+    </div>
+
+    <h2>Slurm Multi-Node Launch</h2>
+
+    <pre><code class="language-bash">#!/bin/bash
+#SBATCH --job-name=fsdp2_hsdp
+#SBATCH --nodes=2
+#SBATCH --ntasks-per-node=1       # One task per node (torchrun spawns processes)
+#SBATCH --gpus-per-node=4
+#SBATCH --cpus-per-task=32        # 8 CPUs per GPU × 4 GPUs
+#SBATCH --mem=128G
+#SBATCH --time=02:00:00
+#SBATCH --partition=gpu
+
+# Get master address from first node
+export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n1)
+export MASTER_PORT=29500
+
+# torchrun on each node (via srun)
+srun torchrun \
+    --nnodes=$SLURM_NNODES \
+    --nproc_per_node=4 \
+    --rdzv_id=$SLURM_JOB_ID \
+    --rdzv_backend=c10d \
+    --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
+    train_fsdp2.py
+</code></pre>
+
+    <div class="callout warning">
+        <strong>Common Slurm pitfall:</strong> Using <code>--ntasks-per-node=4</code> + <code>srun python train.py</code> (without torchrun) creates 4 processes per node but doesn't set <code>LOCAL_RANK</code> or <code>LOCAL_WORLD_SIZE</code> correctly for DeviceMesh. Always use <code>--ntasks-per-node=1</code> with torchrun, which handles the per-node process spawning itself.
+    </div>
+
+    <h2>DeviceMesh Internals: What Happens Under the Hood</h2>
+
+    <pre><code class="language-python"># What init_device_mesh("cuda", (2, 4), mesh_dim_names=("replicate", "shard")) does:
+
+# 1. Creates the mesh tensor:
+#    [[0, 1, 2, 3],    ← replica group 0
+#     [4, 5, 6, 7]]   ← replica group 1
+
+# 2. For EACH mesh dimension, creates ProcessGroups by slicing along that dim:
+#
+#    dim 1 ("shard"): slice along rows → groups [0,1,2,3] and [4,5,6,7]
+#    dim 0 ("replicate"): slice along columns → groups [0,4], [1,5], [2,6], [3,7]
+
+# 3. Each rank stores references to its own groups:
+#    Rank 2: shard_group=[0,1,2,3], replicate_group=[2,6]
+#    Rank 5: shard_group=[4,5,6,7], replicate_group=[1,5]
+
+# 4. When FSDP2 calls all-gather for sharded params:
+#    It uses the "shard" dimension's ProcessGroup → NVLink within-node group
+
+# 5. When FSDP2 calls all-reduce for gradient sync across replicas:
+#    It uses the "replicate" dimension's ProcessGroup → InfiniBand cross-node group
+</code></pre>
+
+    <h2>3-D Mesh (Advanced — For Awareness)</h2>
+
+    <p>If you ever combine FSDP with Tensor Parallelism (TP), you'd use a 3-D mesh:</p>
+
+    <pre><code class="language-python"># 3-D: (data_parallel, shard, tensor_parallel)
+# Example: 4 nodes × 4 GPUs, with 2-way TP within each node
+mesh_3d = init_device_mesh(
+    "cuda",
+    (4, 2, 2),  # 4 DP replicas × 2 FSDP shards × 2 TP ranks
+    mesh_dim_names=("dp", "fsdp", "tp"),
+)
+# This is what torchtitan uses for LLaMA-405B scale.
+# Out of scope for this course but good to know the extension point.
+</code></pre>
+
+    <p>For your current needs (ViT-Huge, up to 32 GPUs), 1-D or 2-D meshes are sufficient. TP becomes relevant only when a single layer's parameters don't fit on one GPU — not the case for ViT-Huge where the largest layer is ~8M params.</p>
+
+    <h2>Verifying Your Mesh</h2>
+
+    <pre><code class="language-python">def verify_mesh(mesh: "DeviceMesh") -> None:
+    """Print mesh info for debugging. Call on all ranks."""
+    rank = dist.get_rank()
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+    print(f"[Rank {rank}, Local {local_rank}] Mesh: {mesh}")
+    print(f"  ndim: {mesh.ndim}")
+    print(f"  shape: {mesh.mesh.shape}")  # The underlying tensor
+
+    if mesh.ndim >= 2:
+        # Print which groups this rank belongs to
+        for dim_name in mesh.mesh_dim_names:
+            sub_mesh = mesh[dim_name]
+            # Get the group for this rank along this dimension
+            print(f"  dim '{dim_name}': mesh size {mesh.size(mesh.get_dim_by_name(dim_name))}")
+
+    # Verify NVLink grouping: ranks in the same shard group should be on same node
+    if mesh.ndim == 2 and "shard" in mesh.mesh_dim_names:
+        shard_dim = mesh.get_dim_by_name("shard")
+        # Ranks in my shard group:
+        my_row = rank // mesh.size(shard_dim)
+        shard_ranks = list(range(my_row * mesh.size(shard_dim),
+                                  (my_row + 1) * mesh.size(shard_dim)))
+        hostname = os.environ.get("HOSTNAME", "unknown")
+        print(f"  Shard group ranks: {shard_ranks} (should be same node)")
+        print(f"  My hostname: {hostname}")
+</code></pre>
+
+    <h2>Performance Impact: Real Numbers</h2>
+
+    <p>Expected throughput differences on your V100 cluster (ViT-Huge, batch_size=16/GPU):</p>
+
+    <table>
+        <thead>
+        <tr><th>Config</th><th>Mesh</th><th>Expected throughput</th><th>Bottleneck</th></tr>
+        </thead>
+        <tbody>
+        <tr>
+            <td>1 node, 4 GPUs</td>
+            <td>1-D (4,)</td>
+            <td>~440 img/s</td>
+            <td>Compute-bound (NVLink is fast enough)</td>
+        </tr>
+        <tr>
+            <td>2 nodes, 8 GPUs</td>
+            <td>1-D (8,) ❌</td>
+            <td>~620 img/s</td>
+            <td>IB bandwidth for all-gathers</td>
+        </tr>
+        <tr>
+            <td>2 nodes, 8 GPUs</td>
+            <td>2-D (2,4) ✓</td>
+            <td>~780 img/s</td>
+            <td>Compute-bound (IB only for grad sync)</td>
+        </tr>
+        <tr>
+            <td>4 nodes, 16 GPUs</td>
+            <td>2-D (4,4)</td>
+            <td>~1500 img/s</td>
+            <td>IB grad sync starts to matter</td>
+        </tr>
+        <tr>
+            <td>8 nodes, 32 GPUs</td>
+            <td>2-D (8,4)</td>
+            <td>~2700 img/s</td>
+            <td>IB all-reduce across 8 replicas</td>
+        </tr>
+        </tbody>
+    </table>
+
+    <div class="callout">
+        <strong>Scaling efficiency:</strong> Going from 1→2 nodes with HSDP should give ~1.77× speedup (ideal = 2×). The ~12% loss comes from InfiniBand gradient sync. With 1-D flat sharding, you'd only get ~1.41× due to IB-bottlenecked all-gathers on every layer. That's the concrete value of HSDP on your cluster.
+    </div>
+
+    <h2>Edge Case: Uneven GPUs Per Node</h2>
+
+    <pre><code class="language-python"># What if your cluster has heterogeneous nodes? (rare but possible)
+# init_device_mesh requires rectangular shape — all rows same size.
+#
+# If node 0 has 4 GPUs and node 1 has 2 GPUs: you CANNOT use (2, 4) mesh.
+# Options:
+# 1. Only use the minimum across nodes: (2, 2) mesh, leaving 2 GPUs idle on node 0
+# 2. Use 1-D mesh (6,) and accept mixed NVLink/IB communication
+# 3. Don't train on heterogeneous nodes (best option — avoid this situation)
+#
+# For your Fraunhofer cluster with uniform V100 nodes, this isn't an issue.
+</code></pre>
+
+    <h2>Integration with the Training Script</h2>
+
+    <p>Here's how to modify the Lesson 003 training script for multi-node HSDP:</p>
+
+    <pre><code class="language-python"># Replace the mesh creation in main():
+
+def main() -> None:
+    local_rank, world_size = setup_distributed()
+
+    # Auto-detect and create appropriate mesh
+    mesh = create_mesh_for_cluster()
+
+    # Everything else remains IDENTICAL
+    model = build_model()
+    mp_policy = get_mixed_precision_policy()
+    model = apply_fsdp2(model, mesh=mesh, mp_policy=mp_policy)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.05)
+    # ... training loop unchanged ...
+</code></pre>
+
+    <div class="callout success">
+        <strong>Key point:</strong> Switching from 1-D to 2-D HSDP requires changing ONLY the mesh construction. The <code>fully_shard()</code> calls, optimizer setup, and training loop are <em>completely unchanged</em>. FSDP2 reads the mesh dimensionality and handles the rest.
+    </div>
+
+    <h2>DeviceMesh and Process Group Lifecycle</h2>
+
+    <p>Understanding when process groups are created/destroyed helps avoid subtle bugs:</p>
+
+    <pre><code class="language-python"># Process groups are created by init_device_mesh and live until:
+# 1. destroy_process_group() is called, OR
+# 2. The process exits
+
+# DO NOT call init_device_mesh multiple times with different shapes.
+# This creates new ProcessGroups without destroying old ones → resource leak.
+
+# Pattern: create mesh ONCE at startup, pass it everywhere.
+mesh = init_device_mesh(...)  # Once
+fully_shard(block, mesh=mesh)  # Reuse same mesh
+fully_shard(model, mesh=mesh)  # Same mesh
+
+# Anti-pattern:
+for block in model.blocks:
+    block_mesh = init_device_mesh(...)  # DON'T — creates new PGs each time
+    fully_shard(block, mesh=block_mesh)
+</code></pre>
+
+    <h2 id="quiz">Check Your Understanding</h2>
+
+    <div class="quiz">
+        <h3>Q1: On your 2-node, 4-GPU/node cluster with a 2-D HSDP mesh of shape (2,4), how many NCCL process groups are created in total?</h3>
+        <button onclick="checkAnswer(this, false)">2 groups — one shard group per node</button>
+        <button onclick="checkAnswer(this, true)">6 groups — 2 shard groups (dim 1) + 4 replicate groups (dim 0)</button>
+        <button onclick="checkAnswer(this, false)">8 groups — one per GPU, each managing its own communication</button>
+        <button onclick="checkAnswer(this, false)">3 groups — 1 world group + 1 shard group + 1 replicate group</button>
+        <div class="explanation">
+            <strong>Correct.</strong> For a mesh of shape (R, S): dim 1 ("shard") creates R groups of size S (one per row = per node). That's 2 groups: [0,1,2,3] and [4,5,6,7]. Dim 0 ("replicate") creates S groups of size R (one per column = per shard position). That's 4 groups: [0,4], [1,5], [2,6], [3,7]. Total: 2 + 4 = 6. (Plus the default world group, but that's not created by DeviceMesh.)
+        </div>
+    </div>
+
+    <div class="quiz">
+        <h3>Q2: With 2-D HSDP, why does the gradient all-reduce across replicas only move P/4 data per rank instead of P?</h3>
+        <button onclick="checkAnswer(this, false)">Mixed precision compresses gradients to 1/4 their original size before transmission</button>
+        <button onclick="checkAnswer(this, false)">HSDP uses gradient compression with top-K sparsification of 25% per rank</button>
+        <button onclick="checkAnswer(this, true)">Each rank owns only its 1/4 shard of the gradient after reduce-scatter; it only needs to sync THAT shard across replicas</button>
+        <button onclick="checkAnswer(this, false)">The all-reduce ring algorithm only sends data proportional to group size, which is 2 for replicas</button>
+        <div class="explanation">
+            <strong>Correct.</strong> After the intra-node reduce-scatter (along the "shard" dimension), rank 0 holds gradient shard [0:P/4], rank 1 holds [P/4:P/2], etc. For the replica sync, rank 0 only needs to all-reduce ITS shard with rank 4 (its peer in the replicate group). So each replicate-group all-reduce handles P/4 data, not the full P. This is the multiplicative benefit of HSDP — sharding before replicating reduces the per-link sync volume.
+        </div>
+    </div>
+
+    <div class="quiz">
+        <h3>Q3: You have 8 nodes × 4 GPUs and a model where P×16/4 = 5 GB per GPU (fits on V100-32GB). Should you use a (8,4) HSDP mesh or a (2,16) mesh?</h3>
+        <button onclick="checkAnswer(this, true)">(8, 4) — shard within each 4-GPU node over NVLink, replicate across 8 nodes over IB</button>
+        <button onclick="checkAnswer(this, false)">(2, 16) — shard across 2 groups of 16 GPUs for maximum memory reduction per GPU</button>
+        <button onclick="checkAnswer(this, false)">Either is equivalent — same total communication volume regardless of mesh shape</button>
+        <button onclick="checkAnswer(this, false)">(4, 8) — compromise between sharding depth and replica count for balanced throughput</button>
+        <div class="explanation">
+            <strong>Correct.</strong> The (8, 4) mesh shards within each 4-GPU NVLink domain (fast) and replicates across 8 nodes (IB). Since P×16/4 = 5 GB fits on V100-32GB, there's no need to shard across nodes. The (2, 16) mesh would shard across 16 GPUs spanning 4 nodes — meaning all-gathers and reduce-scatters would cross InfiniBand, which is 24× slower than NVLink. Always shard within the fastest communication domain when memory allows.
+        </div>
+    </div>
+
+    <div class="quiz">
+        <h3>Q4: You notice your multi-node FSDP2 training is slow. You profile and see all-gather latency is high. The mesh is 1-D (8,). What's the most likely fix?</h3>
+        <button onclick="checkAnswer(this, false)">Increase the number of FSDP units (finer granularity) to reduce each all-gather's size</button>
+        <button onclick="checkAnswer(this, false)">Enable gradient accumulation to reduce the frequency of communication</button>
+        <button onclick="checkAnswer(this, true)">Switch to 2-D HSDP mesh (2,4) so all-gathers only use fast intra-node NVLink</button>
+        <button onclick="checkAnswer(this, false)">Use CPU offloading to reduce GPU-side communication pressure during all-gathers</button>
+        <div class="explanation">
+            <strong>Correct.</strong> If all-gather latency is high with a 1-D mesh on multi-node, the problem is that all-gathers span InfiniBand. Switching to HSDP (2,4) confines all-gathers to the intra-node NVLink domain. The cost is adding a gradient all-reduce across replicas — but this moves much less data (P/N_shard) and can overlap with computation. Options A and B might help marginally but don't address the root cause (wrong topology mapping).
+        </div>
+    </div>
+
+    <h2>Key Takeaways</h2>
+    <ol>
+        <li><strong>DeviceMesh maps logical sharding to physical topology.</strong> Mesh dimensions correspond to communication domains with different bandwidths.</li>
+        <li><strong>1-D mesh:</strong> single flat shard group. Use for single-node or when model requires maximum sharding across all GPUs.</li>
+        <li><strong>2-D mesh (HSDP):</strong> (replicate, shard). Put the fast link (NVLink) on the "shard" dimension, slow link (InfiniBand) on "replicate". All-gathers stay intra-node.</li>
+        <li><strong>Rank assignment must match node boundaries.</strong> <code>torchrun</code> guarantees contiguous rank assignment per node, which maps correctly to row-major mesh filling.</li>
+        <li><strong>Decision rule:</strong> If P×16/GPUs_per_node fits on one GPU → use HSDP. If not → must shard across nodes.</li>
+        <li><strong>Switching 1-D → 2-D requires only mesh construction change.</strong> <code>fully_shard()</code> calls and training loop are unchanged.</li>
+        <li><strong>Create mesh once, reuse everywhere.</strong> Never call <code>init_device_mesh</code> in a loop.</li>
+    </ol>
+
+    <h2>Primary Source</h2>
+    <p>Read the <a href="https://pytorch.org/tutorials/recipes/distributed_device_mesh.html">PyTorch DeviceMesh Recipe</a> — it covers mesh construction, sub-mesh slicing, and integration with FSDP/TP. Also examine how <a href="https://github.com/pytorch/torchtitan/blob/main/torchtitan/parallelisms/parallelize_llama.py">torchtitan constructs its multi-dimensional mesh</a> for combined FSDP + TP.</p>
+
+
+    <script>
+        function checkAnswer(btn, correct) {
+            const quiz = btn.closest('.quiz');
+            const buttons = quiz.querySelectorAll('button');
+            const explanation = quiz.querySelector('.explanation');
+            buttons.forEach(b => { b.disabled = true; b.classList.remove('correct', 'incorrect'); });
+            if (correct) {
+                btn.classList.add('correct');
+            } else {
+                btn.classList.add('incorrect');
+                buttons.forEach(b => { if (b.getAttribute('onclick').includes('true')) b.classList.add('correct'); });
+            }
+            explanation.style.display = 'block';
+        }
+    </script>
+
+
+
+        
+        <!-- _includes/tutorial-nav.html -->
+
+
+
+
+
+
+
+
+
+
+
+
+<nav class="tutorial-nav" aria-label="Lesson navigation">
+    
+    <a href="/heap/fsdp2/004/" class="tutorial-nav-btn tutorial-nav-prev">
+        <span class="tutorial-nav-label">← Previous</span>
+        <span class="tutorial-nav-title">004 — DTensor Deep Dive: Placements, Redistribution, Dispatch</span>
+    </a>
+    
+
+    
+    <a href="/heap/fsdp2/006/" class="tutorial-nav-btn tutorial-nav-next">
+        <span class="tutorial-nav-label">Next →</span>
+        <span class="tutorial-nav-title">006 — Mixed Precision in FSDP2: fp16 on V100</span>
+    </a>
+    
+</nav>
+        
+    </article>
+
+</div>
+  </div>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <div class="footer-links">
+      <a href="https://github.com/g4br1el">GitHub</a>
+      <a href="https://www.linkedin.com/in/gadax">LinkedIn</a>
+      <a href="mailto:gdax.science@gmail.com">Email</a>
+      <a href="/files/CV-Gabriel_Dax.pdf">Resume ↓</a>
+    </div>
+    <p class="footer-copyright">© 2026 Gabriel Dax</p>
+  </div>
+</footer>
+
+
+
+</body>
+</html>

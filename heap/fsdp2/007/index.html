@@ -1,0 +1,852 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Activation Checkpointing + FSDP2 Composition — Gabriel Dax</title>
+  <!-- Begin Jekyll SEO tag v2.9.0 -->
+<meta name="generator" content="Jekyll v4.4.1" />
+<meta property="og:title" content="Activation Checkpointing + FSDP2 Composition" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="Trading 33% extra compute for 10× less activation memory — and why FSDP2 makes this trivial to compose." />
+<meta name="twitter:description" property="og:description" content="Trading 33% extra compute for 10× less activation memory — and why FSDP2 makes this trivial to compose." />
+<link rel="canonical" href="https://www.gabrieldax.de/heap/fsdp2/007/" />
+<meta property="og:url" content="https://www.gabrieldax.de/heap/fsdp2/007/" />
+<meta property="og:site_name" content="Gabriel Dax — ML Research Engineer" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2026-06-24T07:37:12+00:00" />
+<meta property="article:modified_time" content="2026-06-24T07:37:12+00:00" />
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:title" content="Activation Checkpointing + FSDP2 Composition" />
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"BlogPosting","dateModified":"2026-06-24T07:37:12+00:00","datePublished":"2026-06-24T07:37:12+00:00","description":"Trading 33% extra compute for 10× less activation memory — and why FSDP2 makes this trivial to compose.","headline":"Activation Checkpointing + FSDP2 Composition","mainEntityOfPage":{"@type":"WebPage","@id":"https://www.gabrieldax.de/heap/fsdp2/007/"},"url":"https://www.gabrieldax.de/heap/fsdp2/007/"}</script>
+<!-- End Jekyll SEO tag -->
+
+  <meta content='text/html; charset=utf-8' http-equiv='Content-Type'>
+<meta http-equiv='X-UA-Compatible' content='IE=edge'>
+<meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0'>
+
+
+<meta property="og:description" content="Trading 33% extra compute for 10× less activation memory — and why FSDP2 makes this trivial to compose." />
+
+<meta name="author" content="Gabriel Dax" />
+
+
+
+<meta property="og:title" content="Activation Checkpointing + FSDP2 Composition" />
+<meta property="twitter:title" content="Activation Checkpointing + FSDP2 Composition" />
+
+
+
+<meta property="og:image" content="https://www.gabrieldax.de/images/self.png"/>
+<meta property="twitter:image" content="https://www.gabrieldax.de/images/self.png"/>
+
+
+  <link rel="stylesheet" href="/assets/style.css">
+  <link rel="icon" type="image/png" sizes="32x32" href="/images/favicon.jpg">
+  <link rel="canonical" href="https://www.gabrieldax.de/heap/fsdp2/007/">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  
+
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div>
+      <a href="/" class="site-name">Gabriel Dax</a>
+      <span class="site-tagline">ML Research Engineer</span>
+    </div>
+    <nav>
+      <a href="/" >Home</a>
+      <a href="/projects" >Projects</a>
+      <a href="/publications" >Publications</a>
+      <a href="/bio" >CV</a>
+    </nav>
+  </div>
+</header>
+
+<main class="main-content">
+  <div class="container">
+    <div class="tutorial-wrapper">
+
+    <nav class="tutorial-breadcrumb">
+        <a href="/heap/">← All Tutorials</a>
+        
+        <span class="tutorial-position">Lesson 7 / 18</span>
+        
+    </nav>
+
+    <article class="tutorial-article">
+        
+        <div class="tutorial-lesson-header">
+            <span class="tutorial-tag">Lesson 007</span>
+            
+            <span class="tutorial-tag tutorial-tag--secondary">Core</span>
+            
+            <span class="tutorial-tag tutorial-tag--secondary">Memory Optimization</span>
+            
+        </div>
+        
+
+        <h1>Activation Checkpointing + FSDP2 Composition</h1>
+
+        <p><em>Trading 33% extra compute for 10× less activation memory — and why FSDP2 makes this trivial to compose.</em></p>
+
+<h2>The Activation Memory Problem</h2>
+
+<p>From Lesson 006, you know that mixed precision halves activation memory. But activations still dominate for large batches or high resolutions. Let's quantify for ViT-Huge:</p>
+
+<pre><code class="language-python"># ViT-Huge/14, image 224×224, batch_size=16 per GPU:
+#   seq_len = (224/14)² + 1 = 257 (patches + cls token)
+#   hidden_dim = 1280
+#   num_layers = 32
+#
+# Per-layer activations saved for backward (fp16):
+#   Input to attention:       batch × seq × hidden = 16 × 257 × 1280 × 2 = 10.0 MB
+#   Q, K, V:                  3 × batch × heads × seq × head_dim = 3 × 16 × 16 × 257 × 80 × 2 = 30.1 MB
+#   Attention weights:        batch × heads × seq × seq = 16 × 16 × 257 × 257 × 2 = 33.7 MB
+#   Attention output:         16 × 257 × 1280 × 2 = 10.0 MB
+#   MLP intermediate (×4):   16 × 257 × 5120 × 2 = 40.1 MB
+#   Various residual copies:  ~20 MB
+#   ─────────────────────────────────────────────────
+#   Per layer total:          ~144 MB
+#   All 32 layers:            ~4.6 GB
+#
+# With batch_size=32:         ~9.2 GB
+# With batch_size=64:         ~18.4 GB  ← exceeds what's left after model state!
+</code></pre>
+
+<div class="callout">
+    <strong>The problem:</strong> With FSDP2 on 4 GPUs, model-proportional memory is only ~2.4 GB. You have ~29 GB left for activations. At batch=16 you use ~4.6 GB (comfortable). But at batch=64 or at higher resolution (512×512 → 4× more tokens → 4× more activation memory), you hit the wall. Activation checkpointing is how you break through.
+</div>
+
+<h2>What Activation Checkpointing Does</h2>
+
+<p>The core idea: instead of saving all intermediate activations during forward (for use in backward), <strong>discard</strong> them and <strong>recompute</strong> them during backward when needed.</p>
+
+<div class="diagram">
+    Without Activation Checkpointing:
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    Forward:  Block 0 ──▶ Block 1 ──▶ Block 2 ──▶ ... ──▶ Block 31 ──▶ Loss
+    ↓ save     ↓ save     ↓ save              ↓ save
+    act_0      act_1      act_2               act_31
+
+    Memory:   ALL 32 blocks' activations stored simultaneously = 4.6 GB
+
+    Backward: Block 31 ←── Block 30 ←── ... ←── Block 0
+    uses act_31   uses act_30          uses act_0
+
+
+    With Activation Checkpointing (every block):
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    Forward:  Block 0 ──▶ Block 1 ──▶ Block 2 ──▶ ... ──▶ Block 31 ──▶ Loss
+    ↓ save     discard    discard             discard
+    input_0    (only boundary inputs saved)
+
+    Memory:   Only INPUTS to each checkpointed block = 32 × 10 MB = 320 MB
+    (vs. 4.6 GB without checkpointing → ~14× reduction)
+
+    Backward: When Block 15 needs its activations:
+    1. Re-run Block 15's forward (using saved input_15)
+    2. This produces the activations needed for Block 15's backward
+    3. Compute Block 15's gradients
+    4. Discard re-computed activations
+    5. Move to Block 14
+</div>
+    </code></pre>
+
+    <div class="callout success">
+        <strong>The trade-off:</strong> You run each block's forward TWICE (once in forward pass, once during backward). This costs ~33% extra compute time. But you save ~14× activation memory. For memory-bound workloads, this is an excellent trade.
+    </div>
+
+    <h2>Why FSDP2 Makes This Trivial (vs. FSDP1)</h2>
+
+    <p>In FSDP1, activation checkpointing required a separate wrapper (<code>checkpoint_wrapper</code>) that had to be ordered carefully with the FSDP wrapper:</p>
+
+    <pre><code class="language-python"># FSDP1: wrapper ordering nightmare
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    checkpoint_wrapper,
+    apply_activation_checkpointing,
+)
+
+# Had to apply checkpoint BEFORE FSDP wrapping, or AFTER — documentation was unclear
+# Wrong order → silent correctness bugs or double-communication
+model = FSDP(model, auto_wrap_policy=...)
+apply_activation_checkpointing(model, check_fn=lambda m: isinstance(m, Block))
+# ^ This could BREAK if FSDP already wrapped the blocks
+</code></pre>
+
+    <p>In FSDP2, activation checkpointing is <strong>completely orthogonal</strong>:</p>
+
+    <pre><code class="language-python"># FSDP2: clean composition — order doesn't matter
+from torch.utils.checkpoint import checkpoint
+
+for block in model.blocks:
+    fully_shard(block, mesh=mesh, mp_policy=mp_policy)
+
+# That's it for FSDP2. Now add checkpointing independently:
+# Option 1: wrap the forward method
+# Option 2: use the torch.utils.checkpoint function directly in the model
+
+fully_shard(model, mesh=mesh, mp_policy=mp_policy)
+</code></pre>
+
+    <p>The reason this works: FSDP2 uses hooks on the module, checkpointing controls what autograd saves. They operate on different abstractions and don't interfere.</p>
+
+    <h2>Implementation: Three Approaches</h2>
+
+    <h3>Approach 1: <code>torch.utils.checkpoint.checkpoint</code> (Functional)</h3>
+
+    <p>The cleanest approach — modify the model's forward to use the checkpoint function:</p>
+
+    <pre><code class="language-python">from torch.utils.checkpoint import checkpoint
+
+
+class ViTWithCheckpointing(nn.Module):
+    """Wrapper that adds checkpointing to any ViT from timm."""
+
+    def __init__(self, base_model: nn.Module, checkpoint_every: int = 1):
+        super().__init__()
+        self.patch_embed = base_model.patch_embed
+        self.cls_token = base_model.cls_token
+        self.pos_embed = base_model.pos_embed
+        self.pos_drop = base_model.pos_drop
+        self.blocks = base_model.blocks
+        self.norm = base_model.norm
+        self.head = base_model.head
+        self.checkpoint_every = checkpoint_every
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.patch_embed(x)
+        cls_tokens = self.cls_token.expand(x.shape[0], -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x = self.pos_drop(x + self.pos_embed)
+
+        for i, block in enumerate(self.blocks):
+            if i % self.checkpoint_every == 0:
+                # checkpoint: don't save activations, recompute in backward
+                x = checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
+
+        x = self.norm(x)
+        x = x[:, 0]  # cls token
+        x = self.head(x)
+        return x
+</code></pre>
+
+    <div class="callout warning">
+        <strong>Always use <code>use_reentrant=False</code>.</strong> The old reentrant implementation (default in older PyTorch) has known bugs with FSDP and doesn't support all autograd features. PyTorch 2.4+ defaults to non-reentrant, but be explicit. Non-reentrant checkpointing uses autograd's <code>saved_tensors_hooks</code> which compose correctly with FSDP2's hooks.
+    </div>
+
+    <h3>Approach 2: <code>checkpoint_wrapper</code> (Per-Module, Post-Hoc)</h3>
+
+    <p>If you don't want to modify the model class, apply checkpointing after construction:</p>
+
+    <pre><code class="language-python">from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    checkpoint_wrapper,
+    CheckpointImpl,
+)
+
+
+def apply_activation_checkpointing_fsdp2(model: nn.Module) -> nn.Module:
+    """Apply activation checkpointing to each transformer block."""
+    for i, block in enumerate(model.blocks):
+        # Wrap the block's forward with checkpointing
+        model.blocks[i] = checkpoint_wrapper(
+            block,
+            checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+        )
+    return model
+
+
+# Usage order (EITHER order works with FSDP2):
+model = build_model()
+
+# Option A: checkpoint first, then shard
+model = apply_activation_checkpointing_fsdp2(model)
+for block in model.blocks:
+    fully_shard(block, mesh=mesh, mp_policy=mp_policy)
+fully_shard(model, mesh=mesh, mp_policy=mp_policy)
+
+# Option B: shard first, then checkpoint (also valid with FSDP2)
+# for block in model.blocks:
+#     fully_shard(block, mesh=mesh, mp_policy=mp_policy)
+# model = apply_activation_checkpointing_fsdp2(model)
+# fully_shard(model, mesh=mesh, mp_policy=mp_policy)
+</code></pre>
+
+    <h3>Approach 3: Selective Checkpointing (Recommended for Production)</h3>
+
+    <p>Not all layers need checkpointing. The attention mechanism dominates activation memory (attention weights matrix is seq×seq). You can checkpoint only selected parts:</p>
+
+    <pre><code class="language-python">from torch.utils.checkpoint import checkpoint
+
+
+def selective_checkpoint_forward(block: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """
+    Checkpoint only the attention portion of each block.
+    MLP recomputation is cheap; attention recomputation is expensive.
+    But attention SAVES more memory (the seq×seq attention matrix).
+
+    Trade-off: checkpoint attention → save the most memory where it's largest,
+    at the cost of recomputing the most expensive operation.
+
+    For ViT-Huge: attention is ~60% of per-layer activation memory
+    but only ~40% of per-layer compute. Good trade.
+    """
+    # Checkpoint the attention sub-block
+    attn_output = checkpoint(
+        block.attn,
+        block.norm1(x),
+        use_reentrant=False,
+    )
+    x = x + attn_output
+
+    # MLP runs normally (activations saved)
+    x = x + block.mlp(block.norm2(x))
+    return x
+</code></pre>
+
+    <div class="callout">
+        <strong>For your initial implementation:</strong> Start with Approach 1 (checkpoint every block). It's simplest and gives maximum memory savings. Only move to selective checkpointing if the ~33% compute overhead is too costly for your throughput requirements. Profile first, optimize second.
+    </div>
+
+    <h2>The Complete Pattern: FSDP2 + Checkpointing</h2>
+
+    <pre><code class="language-python">"""
+Production pattern: FSDP2 + activation checkpointing + mixed precision.
+This is the recommended setup for training ViT-Huge on V100-32GB.
+"""
+from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
+from torch.distributed.device_mesh import init_device_mesh
+from torch.utils.checkpoint import checkpoint
+import timm
+
+
+def build_and_configure_model(mesh, mp_policy):
+    """Build model with FSDP2 + activation checkpointing."""
+
+    # 1. Build model on CPU
+    model = timm.create_model("vit_huge_patch14_224", pretrained=False, num_classes=1000)
+
+    # 2. Enable activation checkpointing on each block
+    #    We monkey-patch the forward to use checkpoint()
+    original_forwards = {}
+    for i, block in enumerate(model.blocks):
+        original_forwards[i] = block.forward
+
+        # Create closure that captures the block
+        def make_checkpointed_forward(blk):
+            def checkpointed_forward(x):
+                return checkpoint(blk.__class__.forward, blk, x, use_reentrant=False)
+            return checkpointed_forward
+
+        block.forward = make_checkpointed_forward(block)
+
+    # 3. Apply FSDP2 sharding (after checkpointing setup)
+    for block in model.blocks:
+        fully_shard(block, mesh=mesh, mp_policy=mp_policy)
+    fully_shard(model, mesh=mesh, mp_policy=mp_policy)
+
+    return model
+</code></pre>
+
+    <div class="callout warning">
+        <strong>Monkey-patching caveat:</strong> The closure approach above works but is fragile with <code>torch.compile</code> (Lesson 010). A cleaner approach is to subclass or use timm's built-in gradient checkpointing: <code>model.set_grad_checkpointing(enable=True)</code>. Most timm models support this natively.
+    </div>
+
+    <h3>Using timm's Built-In Checkpointing (Simplest)</h3>
+
+    <pre><code class="language-python">def build_and_configure_model_clean(mesh, mp_policy):
+    """Cleanest approach: use timm's native gradient checkpointing."""
+
+    model = timm.create_model("vit_huge_patch14_224", pretrained=False, num_classes=1000)
+
+    # timm models have built-in support:
+    model.set_grad_checkpointing(enable=True)
+    # This internally wraps each block's forward with torch.utils.checkpoint
+
+    # Apply FSDP2
+    for block in model.blocks:
+        fully_shard(block, mesh=mesh, mp_policy=mp_policy)
+    fully_shard(model, mesh=mesh, mp_policy=mp_policy)
+
+    return model
+</code></pre>
+
+    <div class="callout success">
+        <strong>This is the recommended approach for timm models.</strong> One line (<code>model.set_grad_checkpointing(enable=True)</code>) enables checkpointing for all blocks. It composes cleanly with FSDP2 because both are non-intrusive: checkpointing modifies the autograd graph, FSDP2 manages parameter placement via hooks.
+    </div>
+
+    <h2>Memory Impact: Quantified</h2>
+
+    <table>
+        <thead>
+        <tr><th>Config (ViT-Huge, 4 GPUs, fp16)</th><th>Model-prop. mem</th><th>Activation mem</th><th>Total peak</th><th>Max batch/GPU</th></tr>
+        </thead>
+        <tbody>
+        <tr>
+            <td>FSDP2, no checkpointing</td>
+            <td>2.4 GB</td>
+            <td>~4.6 GB (batch=16)</td>
+            <td>~8 GB</td>
+            <td>~80</td>
+        </tr>
+        <tr>
+            <td><strong>FSDP2 + checkpointing</strong></td>
+            <td>2.4 GB</td>
+            <td><strong>~0.35 GB (batch=16)</strong></td>
+            <td><strong>~4 GB</strong></td>
+            <td><strong>~350+</strong></td>
+        </tr>
+        <tr>
+            <td>FSDP2 + checkpointing, batch=64</td>
+            <td>2.4 GB</td>
+            <td>~1.4 GB</td>
+            <td>~5 GB</td>
+            <td>—</td>
+        </tr>
+        <tr>
+            <td>FSDP2 + checkpointing, 512×512</td>
+            <td>2.4 GB</td>
+            <td>~5.4 GB (batch=16)</td>
+            <td>~9 GB</td>
+            <td>~50</td>
+        </tr>
+        </tbody>
+    </table>
+
+    <div class="callout">
+        <strong>Why activation memory doesn't go to zero with checkpointing:</strong> You still need to store the <em>inputs</em> to each checkpointed segment (to recompute from during backward). For per-block checkpointing, that's one tensor per block boundary: <code>32 × batch × seq × hidden × 2 bytes</code>. Plus, during the recomputation of one block, that block's full internal activations exist temporarily. The peak is: stored boundary inputs + one block's worth of activations.
+    </div>
+
+    <h2>The Compute Cost: What 33% Actually Means</h2>
+
+    <div class="diagram">
+        Without checkpointing:
+        Forward:   1.0× compute
+        Backward:  2.0× compute (backward is ~2× forward for most ops)
+        Total:     3.0× compute per step
+
+        With checkpointing (every block):
+        Forward:   1.0× compute
+        Recompute: 1.0× compute (one extra forward per block during backward)
+        Backward:  2.0× compute
+        Total:     4.0× compute per step
+
+        Overhead: (4.0 - 3.0) / 3.0 = 33% more compute per step
+    </div>
+        </code></pre>
+
+        <p>But this 33% is the <strong>theoretical maximum</strong>. In practice on V100:</p>
+
+        <ul>
+            <li>If you're <strong>memory-bound</strong> (can't fit batch without checkpointing): checkpointing enables larger batch → better GPU utilization → net throughput can be HIGHER</li>
+            <li>FSDP2 communication can <strong>overlap with recomputation</strong>: while rank 0 recomputes block N's activations, the all-gather for block N-1 can be in flight</li>
+            <li>Measured overhead for ViT-Huge on V100: typically <strong>20–28%</strong> (less than 33% due to memory/compute overlap)</li>
+        </ul>
+
+        <h2>Interaction with FSDP2's Communication Lifecycle</h2>
+
+        <p>When both FSDP2 and checkpointing are active, the backward pass for one block looks like:</p>
+
+        <div class="diagram">
+            Backward pass for Block i (FSDP2 + checkpointing):
+            ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+            1. Backward reaches Block i (needs activations for grad computation)
+
+            2. FSDP2 pre-backward hook fires:
+            → all-gather Block i's parameters: Shard(0) → Replicate
+            → Parameters are now full fp16 on each rank
+
+            3. Recomputation phase (checkpointing triggers):
+            → Re-run Block i's forward using saved input + full parameters
+            → Produces Block i's internal activations (transiently)
+            → These activations are used for the gradient computation below
+
+            4. Gradient computation:
+            → Autograd computes gradients using recomputed activations + full params
+            → Produces fp16 gradients (Partial on each rank)
+
+            5. FSDP2 post-backward hook fires:
+            → Cast grads fp16 → fp32
+            → reduce-scatter: Partial → Shard(0)
+            → Free full parameter buffer (back to shard)
+
+            6. Discard recomputed activations
+            → Memory freed
+
+            7. Move to Block i-1 (repeat)
+        </div>
+            </code></pre>
+
+            <div class="callout">
+                <strong>Important:</strong> The all-gather in step 2 serves BOTH the recomputation (step 3) and the gradient computation (step 4). FSDP2 doesn't need to all-gather twice just because checkpointing re-runs forward — the parameters stay unsharded for the duration of steps 2–5. This is a natural consequence of the hook-based design: the pre-backward hook fires once, the parameter stays Replicate until post-backward.
+            </div>
+
+            <h2>Selective Checkpointing: Every-N-Blocks Strategy</h2>
+
+            <p>Full checkpointing (every block) gives maximum memory savings but maximum compute overhead. A common compromise:</p>
+
+            <pre><code class="language-python">def apply_selective_checkpointing(
+    model: nn.Module,
+    checkpoint_every_n: int = 2,
+) -> None:
+    """
+    Checkpoint every N-th block. Blocks in between save activations normally.
+
+    Memory: activations for (N-1) consecutive blocks are stored.
+    Compute: only 1/N of blocks are recomputed.
+
+    checkpoint_every_n=1: full checkpointing (default, max memory savings)
+    checkpoint_every_n=2: checkpoint every other block (50% compute overhead reduction)
+    checkpoint_every_n=4: checkpoint every 4th block (75% compute overhead reduction)
+    """
+    for i, block in enumerate(model.blocks):
+        if i % checkpoint_every_n == 0:
+            # This block's activations will be recomputed
+            block._checkpoint = True
+        else:
+            # This block saves activations normally
+            block._checkpoint = False
+</code></pre>
+
+            <table>
+                <thead>
+                <tr><th>checkpoint_every_n</th><th>Activation memory (batch=16)</th><th>Compute overhead</th><th>Use when</th></tr>
+                </thead>
+                <tbody>
+                <tr>
+                    <td>1 (every block)</td>
+                    <td>~0.35 GB</td>
+                    <td>~33%</td>
+                    <td>Maximum batch size needed; compute budget is secondary</td>
+                </tr>
+                <tr>
+                    <td>2</td>
+                    <td>~0.67 GB</td>
+                    <td>~17%</td>
+                    <td>Good balance; enough memory savings for most cases</td>
+                </tr>
+                <tr>
+                    <td>4</td>
+                    <td>~1.3 GB</td>
+                    <td>~8%</td>
+                    <td>Near-full speed; still meaningful memory reduction</td>
+                </tr>
+                <tr>
+                    <td>∞ (none)</td>
+                    <td>~4.6 GB</td>
+                    <td>0%</td>
+                    <td>Memory is not the bottleneck</td>
+                </tr>
+                </tbody>
+            </table>
+
+            <h2>A Subtlety: Checkpointing and FSDP2 Prefetching</h2>
+
+            <p>FSDP2's prefetch mechanism (start all-gathering block N+1 while block N computes) interacts with checkpointing during backward:</p>
+
+            <pre><code class="language-python"># During backward WITHOUT checkpointing:
+#   Block i backward compute takes time T_bwd
+#   FSDP2 prefetches Block i-1's all-gather during Block i's compute
+#   Good overlap: all-gather latency hidden by T_bwd
+
+# During backward WITH checkpointing:
+#   Block i: recompute forward (T_fwd) + backward (T_bwd) = T_fwd + T_bwd
+#   FSDP2 prefetches Block i-1's all-gather during Block i's (recompute + backward)
+#   BETTER overlap: more compute time to hide the all-gather latency!
+#
+# This is why measured overhead is often less than 33%:
+# The extra compute from recomputation provides more time to overlap communication.
+</code></pre>
+
+            <div class="callout success">
+                <strong>Counter-intuitive result:</strong> Activation checkpointing can actually IMPROVE FSDP2's communication overlap efficiency. The recomputation adds compute time during backward, which gives the prefetch mechanism more runway to hide all-gather latency. On bandwidth-limited setups (InfiniBand with 1-D mesh), checkpointing can bring measured overhead down to 15–20% instead of the theoretical 33%.
+            </div>
+
+            <h2>Putting It All Together: Updated Training Script</h2>
+
+            <pre><code class="language-python">"""
+train_fsdp2_checkpoint.py — ViT-Huge with FSDP2 + activation checkpointing.
+Enables batch_size=64 per GPU on V100-32GB (impossible without checkpointing).
+"""
+import os
+import time
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, DistributedSampler
+from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
+from torch.distributed.device_mesh import init_device_mesh
+import torch.distributed as dist
+
+import timm
+
+
+def main():
+    dist.init_process_group("nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = dist.get_world_size()
+    torch.cuda.set_device(local_rank)
+
+    mesh = init_device_mesh("cuda", (world_size,))
+    mp_policy = MixedPrecisionPolicy(param_dtype=torch.float16, reduce_dtype=torch.float32)
+
+    # Build model
+    model = timm.create_model("vit_huge_patch14_224", pretrained=False, num_classes=1000)
+
+    # Enable gradient checkpointing (one line!)
+    model.set_grad_checkpointing(enable=True)
+
+    # Apply FSDP2
+    for block in model.blocks:
+        fully_shard(block, mesh=mesh, mp_policy=mp_policy)
+    fully_shard(model, mesh=mesh, mp_policy=mp_policy)
+
+    # Optimizer (after sharding)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.05)
+
+    # Data — NOW we can use batch_size=64!
+    dataset = SyntheticImageDataset(10_000, 224, 1000)
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=dist.get_rank())
+    dataloader = DataLoader(
+        dataset, batch_size=64, sampler=sampler,  # 64 per GPU!
+        num_workers=4, pin_memory=True, drop_last=True,
+    )
+
+    # Training loop (identical to before)
+    model.train()
+    for epoch in range(3):
+        sampler.set_epoch(epoch)
+        for batch_idx, (images, labels) in enumerate(dataloader):
+            images = images.to(local_rank, non_blocking=True)
+            labels = labels.to(local_rank, non_blocking=True)
+
+            outputs = model(images)
+            loss = nn.functional.cross_entropy(outputs, labels)
+            loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+
+            if batch_idx % 5 == 0 and local_rank == 0:
+                print(f"[E{epoch}][B{batch_idx}] loss={loss.item():.4f}")
+
+    peak_gb = torch.cuda.max_memory_allocated(local_rank) / 1e9
+    print(f"[Rank {local_rank}] Peak: {peak_gb:.2f} GB")
+
+    dist.destroy_process_group()
+
+
+class SyntheticImageDataset(torch.utils.data.Dataset):
+    def __init__(self, n, size, classes):
+        self.n, self.size, self.classes = n, size, classes
+    def __len__(self): return self.n
+    def __getitem__(self, i):
+        return torch.randn(3, self.size, self.size), torch.randint(0, self.classes, (1,)).item()
+
+
+if __name__ == "__main__":
+    main()
+</code></pre>
+
+            <h2>Expected Results Comparison</h2>
+
+            <table>
+                <thead>
+                <tr><th>Metric</th><th>FSDP2, no AC, batch=16</th><th>FSDP2 + AC, batch=64</th><th>Change</th></tr>
+                </thead>
+                <tbody>
+                <tr><td>Peak memory / GPU</td><td>~8 GB</td><td>~12 GB</td><td>+4 GB (but 4× batch!)</td></tr>
+                <tr><td>Effective batch size (4 GPUs)</td><td>64</td><td>256</td><td>4× larger</td></tr>
+                <tr><td>Throughput (img/s)</td><td>~440</td><td>~580</td><td>+32% (larger batch → better GPU util)</td></tr>
+                <tr><td>Time per step</td><td>~145 ms</td><td>~440 ms</td><td>3× longer (but 4× more work per step)</td></tr>
+                <tr><td>Per-sample compute</td><td>~9.1 ms</td><td>~6.9 ms</td><td>-24% faster per sample!</td></tr>
+                </tbody>
+            </table>
+
+            <div class="callout success">
+                <strong>Net effect:</strong> Even though each step takes longer (due to recomputation + larger batch), you process more samples per second because the GPU is better utilized with larger batches. The 33% recomputation overhead is more than compensated by the improved arithmetic intensity of larger matrix multiplications.
+            </div>
+
+            <h2>When NOT to Use Activation Checkpointing</h2>
+
+            <ul>
+                <li><strong>Memory is not the bottleneck:</strong> If you can fit your target batch size without checkpointing, don't use it — you're paying 20–33% compute for nothing.</li>
+                <li><strong>You're already compute-bound:</strong> If your throughput is limited by FLOPS (not memory), checkpointing only makes it worse.</li>
+                <li><strong>Very small models:</strong> Activation memory is negligible for models under ~100M params at moderate batch sizes.</li>
+                <li><strong>Inference / eval:</strong> No backward pass → no saved activations → checkpointing does nothing. (Also, <code>torch.no_grad()</code> already prevents activation saving.)</li>
+            </ul>
+
+            <h2>Decision Framework</h2>
+
+            <div class="diagram">
+                Should you use activation checkpointing?
+                ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+                ┌──────────────────────┐
+                │ Can you fit target   │
+                │ batch without AC?    │
+                └──────────┬───────────┘
+                ╱         ╲
+                Yes          No
+                │            │
+                ┌──────────┴──┐    ┌───┴────────────────┐
+                │ Don't use AC │    │ Use AC.            │
+                │ (pure waste) │    │ checkpoint_every=1 │
+                └─────────────┘    │ Try larger batch.  │
+                └───┬────────────────┘
+                │
+                ┌────────┴────────────┐
+                │ Is 33% overhead     │
+                │ acceptable?         │
+                └────────┬────────────┘
+                ╱         ╲
+                Yes          No
+                │            │
+                ┌────────┴───┐   ┌───┴──────────────────┐
+                │ Keep every=1│   │ Try every=2 or every=4│
+                │ Done.       │   │ Balance mem vs compute│
+                └────────────┘   └───────────────────────┘
+            </div>
+
+            <h2 id="quiz">Check Your Understanding</h2>
+
+            <div class="quiz">
+                <h3>Q1: With FSDP2 + activation checkpointing, how many times are Block i's parameters all-gathered during one training step?</h3>
+                <button onclick="checkAnswer(this, false)">Three times — once in forward, once for recomputation, once for gradient computation</button>
+                <button onclick="checkAnswer(this, true)">Two times — once in forward, once in backward (recomputation + gradient happen while params are still unsharded)</button>
+                <button onclick="checkAnswer(this, false)">One time — FSDP2 keeps params unsharded from forward through backward for checkpointed blocks</button>
+                <button onclick="checkAnswer(this, false)">Four times — forward, post-forward reshard, recompute gather, backward gather</button>
+                <div class="explanation">
+                    <strong>Correct.</strong> FSDP2's lifecycle is unchanged by checkpointing: pre-forward all-gathers once (forward compute runs, post-forward frees), pre-backward all-gathers once (recomputation + gradient computation both use this single unsharded copy, then post-backward frees). The recomputation happens WITHIN the backward phase, while parameters are already Replicate from the pre-backward hook. No extra all-gather needed.
+                </div>
+            </div>
+
+            <div class="quiz">
+                <h3>Q2: Why does activation checkpointing sometimes result in LESS than 33% compute overhead when combined with FSDP2?</h3>
+                <button onclick="checkAnswer(this, false)">FSDP2 caches some activations internally that checkpointing would normally discard</button>
+                <button onclick="checkAnswer(this, true)">The extra recomputation time provides more compute to overlap with FSDP2's all-gather communication, improving utilization</button>
+                <button onclick="checkAnswer(this, false)">PyTorch's compiler optimizes the recomputation to skip unnecessary operations during backward</button>
+                <button onclick="checkAnswer(this, false)">Mixed precision makes the recomputation cheaper since it runs in fp16 while original forward ran in fp32</button>
+                <div class="explanation">
+                    <strong>Correct.</strong> FSDP2 prefetches the next block's parameters (all-gather) during the current block's backward computation. With checkpointing, backward = recompute + grad_compute — more total compute time available to hide communication latency. If the prefetch was already overlapping perfectly, this doesn't help. But on bandwidth-limited setups (especially cross-node), the extra compute provides more runway for the communication to complete without stalling.
+                </div>
+            </div>
+
+            <div class="quiz">
+                <h3>Q3: You're training ViT-Huge on 4× V100-32GB with FSDP2. Without checkpointing, peak memory is 8 GB (batch=16). Your target is batch=32. Should you enable checkpointing?</h3>
+                <button onclick="checkAnswer(this, false)">Yes — always enable checkpointing for large models to maximize memory efficiency</button>
+                <button onclick="checkAnswer(this, true)">No — batch=32 would use ~12 GB peak (double activations), which fits in 32 GB without needing checkpointing</button>
+                <button onclick="checkAnswer(this, false)">Yes — the 33% overhead is compensated by better GPU utilization at larger batch sizes</button>
+                <button onclick="checkAnswer(this, false)">Depends on whether InfiniBand or NVLink is the bottleneck for all-gather operations</button>
+                <div class="explanation">
+                    <strong>Correct.</strong> If peak at batch=16 is 8 GB, then batch=32 roughly doubles activation memory: ~8 + 4.6 = ~12.6 GB. That fits comfortably in 32 GB with 19 GB headroom. Enabling checkpointing here would save memory you don't need to save, at the cost of 20-33% more compute. Only enable it if you need batch=32 AND can't fit otherwise, which isn't the case here.
+                </div>
+            </div>
+
+            <div class="quiz">
+                <h3>Q4: What does <code>use_reentrant=False</code> prevent that matters for FSDP2?</h3>
+                <button onclick="checkAnswer(this, false)">It prevents the checkpoint function from calling backward inside forward, which confuses FSDP2's hook ordering</button>
+                <button onclick="checkAnswer(this, true)">It uses saved_tensors_hooks (composable with FSDP2 hooks) instead of the old approach that detaches tensors from the graph and breaks gradient flow for some autograd features</button>
+                <button onclick="checkAnswer(this, false)">It prevents re-entrancy into the NCCL communication layer which can deadlock with FSDP2's all-gather calls</button>
+                <button onclick="checkAnswer(this, false)">It disables Python's GIL during recomputation, allowing FSDP2's communication threads to run concurrently</button>
+                <div class="explanation">
+                    <strong>Correct.</strong> The non-reentrant implementation uses PyTorch's <code>saved_tensors_hooks</code> mechanism, which cleanly integrates with the autograd graph. The old reentrant implementation used <code>.detach()</code> and re-runs forward under a new autograd context, which can break: (1) gradient flow for operations that span checkpoint boundaries, (2) hooks registered by FSDP2 on the autograd graph, and (3) features like autograd.Function with custom backward. Non-reentrant is strictly better for composability.
+                </div>
+            </div>
+
+            <h2>Key Takeaways</h2>
+            <ol>
+                <li><strong>Activation checkpointing trades ~33% compute for ~14× activation memory reduction</strong> (per-block checkpointing on ViT-Huge).</li>
+                <li><strong>FSDP2 + checkpointing compose orthogonally.</strong> Apply with <code>model.set_grad_checkpointing(enable=True)</code> (timm) or <code>torch.utils.checkpoint.checkpoint()</code>. Order with <code>fully_shard()</code> doesn't matter.</li>
+                <li><strong>No extra all-gathers:</strong> recomputation happens while params are already Replicate from the pre-backward hook.</li>
+                <li><strong>Always use <code>use_reentrant=False</code></strong> — the non-reentrant implementation composes correctly with FSDP2's autograd hooks.</li>
+                <li><strong>Measured overhead is often 20–28%</strong> (less than 33%) because recomputation provides additional compute time to overlap with FSDP2's prefetched communication.</li>
+                <li><strong>Don't use if memory isn't the bottleneck.</strong> Checkpointing is pure cost if you can already fit your target batch size.</li>
+                <li><strong>Selective checkpointing</strong> (<code>checkpoint_every_n=2 or 4</code>) offers a middle ground: less memory savings but less compute overhead.</li>
+            </ol>
+
+            <h2>Primary Source</h2>
+            <p>Read <a href="https://pytorch.org/docs/stable/checkpoint.html"><code>torch.utils.checkpoint</code> documentation</a> — particularly the "Non-reentrant variant" section which explains the <code>saved_tensors_hooks</code> mechanism. Then examine how <a href="https://github.com/pytorch/torchtitan/blob/main/torchtitan/parallelisms/parallelize_llama.py">torchtitan applies checkpointing</a> alongside FSDP2 — look for the <code>apply_ac</code> function and its interaction with <code>fully_shard</code>.</p>
+
+            <script>
+                function checkAnswer(btn, correct) {
+                    const quiz = btn.closest('.quiz');
+                    const buttons = quiz.querySelectorAll('button');
+                    const explanation = quiz.querySelector('.explanation');
+                    buttons.forEach(b => { b.disabled = true; b.classList.remove('correct', 'incorrect'); });
+                    if (correct) {
+                        btn.classList.add('correct');
+                    } else {
+                        btn.classList.add('incorrect');
+                        buttons.forEach(b => { if (b.getAttribute('onclick').includes('true')) b.classList.add('correct'); });
+                    }
+                    explanation.style.display = 'block';
+                }
+            </script>
+
+
+
+        
+        <!-- _includes/tutorial-nav.html -->
+
+
+
+
+
+
+
+
+
+
+
+
+<nav class="tutorial-nav" aria-label="Lesson navigation">
+    
+    <a href="/heap/fsdp2/006/" class="tutorial-nav-btn tutorial-nav-prev">
+        <span class="tutorial-nav-label">← Previous</span>
+        <span class="tutorial-nav-title">006 — Mixed Precision in FSDP2: fp16 on V100</span>
+    </a>
+    
+
+    
+    <a href="/heap/fsdp2/008/" class="tutorial-nav-btn tutorial-nav-next">
+        <span class="tutorial-nav-label">Next →</span>
+        <span class="tutorial-nav-title">008 — Communication Overlap & Prefetch Tuning</span>
+    </a>
+    
+</nav>
+        
+    </article>
+
+</div>
+  </div>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <div class="footer-links">
+      <a href="https://github.com/g4br1el">GitHub</a>
+      <a href="https://www.linkedin.com/in/gadax">LinkedIn</a>
+      <a href="mailto:gdax.science@gmail.com">Email</a>
+      <a href="/files/CV-Gabriel_Dax.pdf">Resume ↓</a>
+    </div>
+    <p class="footer-copyright">© 2026 Gabriel Dax</p>
+  </div>
+</footer>
+
+
+
+</body>
+</html>

@@ -1,0 +1,957 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Communication Overlap & Prefetch Tuning — Gabriel Dax</title>
+  <!-- Begin Jekyll SEO tag v2.9.0 -->
+<meta name="generator" content="Jekyll v4.4.1" />
+<meta property="og:title" content="Communication Overlap &amp; Prefetch Tuning" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="Understanding CUDA streams, how FSDP2 hides communication latency behind compute, and how to identify when overlap breaks down." />
+<meta name="twitter:description" property="og:description" content="Understanding CUDA streams, how FSDP2 hides communication latency behind compute, and how to identify when overlap breaks down." />
+<link rel="canonical" href="https://www.gabrieldax.de/heap/fsdp2/008/" />
+<meta property="og:url" content="https://www.gabrieldax.de/heap/fsdp2/008/" />
+<meta property="og:site_name" content="Gabriel Dax — ML Research Engineer" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2026-06-24T07:37:12+00:00" />
+<meta property="article:modified_time" content="2026-06-24T07:37:12+00:00" />
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:title" content="Communication Overlap &amp; Prefetch Tuning" />
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"BlogPosting","dateModified":"2026-06-24T07:37:12+00:00","datePublished":"2026-06-24T07:37:12+00:00","description":"Understanding CUDA streams, how FSDP2 hides communication latency behind compute, and how to identify when overlap breaks down.","headline":"Communication Overlap &amp; Prefetch Tuning","mainEntityOfPage":{"@type":"WebPage","@id":"https://www.gabrieldax.de/heap/fsdp2/008/"},"url":"https://www.gabrieldax.de/heap/fsdp2/008/"}</script>
+<!-- End Jekyll SEO tag -->
+
+  <meta content='text/html; charset=utf-8' http-equiv='Content-Type'>
+<meta http-equiv='X-UA-Compatible' content='IE=edge'>
+<meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0'>
+
+
+<meta property="og:description" content="Understanding CUDA streams, how FSDP2 hides communication latency behind compute, and how to identify when overlap breaks down." />
+
+<meta name="author" content="Gabriel Dax" />
+
+
+
+<meta property="og:title" content="Communication Overlap & Prefetch Tuning" />
+<meta property="twitter:title" content="Communication Overlap & Prefetch Tuning" />
+
+
+
+<meta property="og:image" content="https://www.gabrieldax.de/images/self.png"/>
+<meta property="twitter:image" content="https://www.gabrieldax.de/images/self.png"/>
+
+
+  <link rel="stylesheet" href="/assets/style.css">
+  <link rel="icon" type="image/png" sizes="32x32" href="/images/favicon.jpg">
+  <link rel="canonical" href="https://www.gabrieldax.de/heap/fsdp2/008/">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  
+
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div>
+      <a href="/" class="site-name">Gabriel Dax</a>
+      <span class="site-tagline">ML Research Engineer</span>
+    </div>
+    <nav>
+      <a href="/" >Home</a>
+      <a href="/projects" >Projects</a>
+      <a href="/publications" >Publications</a>
+      <a href="/bio" >CV</a>
+    </nav>
+  </div>
+</header>
+
+<main class="main-content">
+  <div class="container">
+    <div class="tutorial-wrapper">
+
+    <nav class="tutorial-breadcrumb">
+        <a href="/heap/">← All Tutorials</a>
+        
+        <span class="tutorial-position">Lesson 8 / 18</span>
+        
+    </nav>
+
+    <article class="tutorial-article">
+        
+        <div class="tutorial-lesson-header">
+            <span class="tutorial-tag">Lesson 008</span>
+            
+            <span class="tutorial-tag tutorial-tag--secondary">Performance</span>
+            
+            <span class="tutorial-tag tutorial-tag--secondary">Tuning</span>
+            
+        </div>
+        
+
+        <h1>Communication Overlap & Prefetch Tuning</h1>
+
+        <p><em>Understanding CUDA streams, how FSDP2 hides communication latency behind compute, and how to identify when overlap breaks down.</em></p>
+
+<h2>The Fundamental Performance Model</h2>
+
+<p>FSDP2's throughput depends on whether communication and computation can run <strong>simultaneously</strong>. If they can't overlap, you pay the full cost of both sequentially:</p>
+
+<div class="diagram">
+    Ideal (full overlap):
+    Compute:  ████████████████████████████████████████████████
+    Comms:    ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
+    Step time = max(compute, comms) ← communication is "free"
+
+    No overlap (sequential):
+    Compute:  ████████████████████████  (idle)
+    Comms:    (idle)                    ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
+    Step time = compute + comms ← communication adds directly to runtime
+
+    Reality (partial overlap):
+    Compute:  ████████████████████████████████████████████████
+    Comms:    ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓████ ← tail exposed
+    Step time = compute + exposed_comm_tail
+</div>
+
+<p>The goal of prefetch tuning: minimize the <strong>exposed communication tail</strong> — the portion of communication that isn't hidden behind compute.</p>
+
+<h2>CUDA Streams: The Mechanism for Overlap</h2>
+
+<p>GPU overlap works because CUDA operations on <strong>different streams</strong> can execute concurrently (if hardware resources allow):</p>
+
+<pre><code class="language-python"># Conceptual CUDA stream model in FSDP2:
+#
+# Stream 0 (default): Compute operations (matmuls, activations, norms)
+# Stream 1 (comms):   NCCL collectives (all-gather, reduce-scatter)
+#
+# Operations on different streams CAN overlap.
+# Operations on the SAME stream are sequential.
+#
+# FSDP2 internally:
+#   1. Issues all-gather on Stream 1 (comms stream)
+#   2. Returns control to the model's forward on Stream 0 (compute stream)
+#   3. Before using the all-gathered result, inserts a stream synchronization
+#      (Stream 0 waits for Stream 1 to complete the all-gather)
+#
+# If the all-gather finishes before Stream 0 needs the result → full overlap
+# If the all-gather hasn't finished when Stream 0 needs it → Stream 0 stalls
+</code></pre>
+
+<div class="diagram">
+    CUDA Stream Timeline (one FSDP unit):
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    Time ──────────────────────────────────────────────────────────────▶
+
+    Stream 0 (compute):
+    [Block N-1 compute]  [sync wait?]  [Block N compute ███████████████]
+    ↑
+    Wait for AG to complete
+
+    Stream 1 (comms):
+    [AG Block N ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓]
+    ↑                            ↑
+    Issued during Block N-1      Complete
+    (prefetch!)
+
+    If AG completes before sync point → no stall (ideal)
+    If AG still in-flight at sync point → compute stalls (bad)
+</div>
+    </code></pre>
+
+    <h3>When Overlap Fails</h3>
+
+    <p>The overlap breaks down in specific situations:</p>
+
+    <table>
+        <thead>
+        <tr><th>Situation</th><th>Why overlap fails</th><th>On your V100 cluster</th></tr>
+        </thead>
+        <tbody>
+        <tr>
+            <td>Small model, large batch</td>
+            <td>Compute per layer is fast (finishes before AG completes) → stall at sync</td>
+            <td>Less likely with ViT-Huge (large layers = long compute)</td>
+        </tr>
+        <tr>
+            <td>Large model, small batch</td>
+            <td>Compute per layer is fast (small batch) but AG is large (many params) → stall</td>
+            <td>Risk at batch_size=1-2; fine at batch≥16</td>
+        </tr>
+        <tr>
+            <td>Slow interconnect</td>
+            <td>AG takes too long relative to compute → can't hide behind one layer's compute</td>
+            <td>Risk with InfiniBand in 1-D mesh (solved by HSDP)</td>
+        </tr>
+        <tr>
+            <td>No prefetch</td>
+            <td>AG for block N starts only when block N's forward begins → zero overlap time</td>
+            <td>Fixed by enabling prefetch (default in FSDP2)</td>
+        </tr>
+        <tr>
+            <td>PCIe bottleneck</td>
+            <td>If GPU↔NIC goes through PCIe, bandwidth is shared with H2D data transfers</td>
+            <td>V100 SXM2 uses NVLink for GPU-GPU; IB goes through PCIe (separate lanes)</td>
+        </tr>
+        </tbody>
+    </table>
+
+    <h2>FSDP2 Prefetch Configuration</h2>
+
+    <p>FSDP2 controls prefetching through the <code>fully_shard</code> API and internal <code>FSDPState</code> configuration:</p>
+
+    <pre><code class="language-python"># As of PyTorch 2.5, prefetch behavior is controlled via:
+
+from torch.distributed._composable.fsdp import fully_shard
+
+# Forward prefetch: start all-gathering block N+1 during block N's compute
+# This is ENABLED by default. You rarely need to change it.
+for block in model.blocks:
+    fully_shard(block, mesh=mesh, mp_policy=mp_policy)
+    # Prefetch is automatic — FSDP2 tracks the execution order of FSDP units
+    # and issues the next unit's all-gather as soon as the current one starts
+
+# Backward prefetch: during block N's backward, prefetch block N-1's params
+# Also enabled by default.
+
+fully_shard(model, mesh=mesh, mp_policy=mp_policy)
+</code></pre>
+
+    <h3>How Prefetch Order Is Determined</h3>
+
+    <pre><code class="language-python"># FSDP2 determines prefetch order from the execution order:
+#
+# Forward: blocks execute in order 0, 1, 2, ..., 31
+#   → Prefetch: when block i starts forward, issue AG for block i+1
+#
+# Backward: blocks execute in REVERSE order 31, 30, 29, ..., 0
+#   → Prefetch: when block i starts backward, issue AG for block i-1
+#
+# The FSDPState records execution order during the first forward pass
+# (the "lazy initialization" pass) and uses it for all subsequent steps.
+#
+# This means: the FIRST training step has NO prefetch (FSDP2 is learning
+# the execution order). Steps 2+ benefit from prefetch.
+# Implication: don't benchmark on step 1.
+</code></pre>
+
+    <div class="callout warning">
+        <strong>First-step anomaly:</strong> The first training step is always slower because FSDP2 has not yet learned the execution order for prefetching. Always discard the first 1-2 steps when benchmarking. This is also why profiling should start from step 3+.
+    </div>
+
+    <h2>The Compute-to-Communication Ratio</h2>
+
+    <p>The key metric for predicting whether overlap will succeed:</p>
+
+    <pre><code class="language-python"># For one FSDP unit (one transformer block):
+#
+# Compute time (T_compute):
+#   FLOPs per block ≈ 2 × batch × seq × hidden² × (4 + 4×mlp_ratio)
+#   For ViT-Huge, batch=16, seq=257:
+#     ≈ 2 × 16 × 257 × 1280² × (4 + 4×4) = 2 × 16 × 257 × 1638400 × 20
+#     ≈ 2.72 × 10¹¹ FLOPs per block
+#   V100 fp16 Tensor Core: ~125 TFLOPS peak, ~80 TFLOPS sustained
+#   T_compute ≈ 2.72e11 / 80e12 ≈ 3.4 ms per block
+
+# Communication time (T_comm):
+#   All-gather data: block params × 4 bytes (fp32) = ~20M × 4 = 76 MB
+#   NVLink bandwidth (4 GPUs): ~200 GB/s effective for all-gather
+#   T_comm_ag ≈ 76 MB / 200 GB/s ≈ 0.38 ms
+#
+#   Reduce-scatter: same size = 0.38 ms (but in backward only)
+
+# Ratio:
+#   T_compute / T_comm_ag ≈ 3.4 / 0.38 ≈ 9×
+#
+# Interpretation: compute takes 9× longer than communication
+#   → Communication can be FULLY hidden behind compute
+#   → FSDP2 overhead should be near-zero on this setup
+</code></pre>
+
+    <div class="callout success">
+        <strong>For ViT-Huge on 4× V100 NVLink:</strong> The compute-to-comm ratio is ~9×, meaning communication is easily hidden. You're compute-bound, not communication-bound. This is the ideal regime for FSDP2.
+    </div>
+
+    <h3>When the Ratio Degrades</h3>
+
+    <table>
+        <thead>
+        <tr><th>Change</th><th>Effect on T_compute</th><th>Effect on T_comm</th><th>New ratio</th><th>Overlap status</th></tr>
+        </thead>
+        <tbody>
+        <tr>
+            <td>batch=4 instead of 16</td>
+            <td>÷4 → 0.85 ms</td>
+            <td>Unchanged (params same)</td>
+            <td>~2.2×</td>
+            <td>Marginal — some exposure</td>
+        </tr>
+        <tr>
+            <td>8 GPUs, 1-D mesh (cross IB)</td>
+            <td>÷2 (smaller batch/rank)</td>
+            <td>IB: 76 MB / 10 GB/s ≈ 7.6 ms</td>
+            <td>~0.2×</td>
+            <td>❌ Completely comm-bound</td>
+        </tr>
+        <tr>
+            <td>8 GPUs, HSDP (2,4)</td>
+            <td>÷2 (smaller batch/rank)</td>
+            <td>NVLink: 0.38 ms (AG intra-node)</td>
+            <td>~4.5×</td>
+            <td>✓ Good overlap</td>
+        </tr>
+        <tr>
+            <td>Smaller model (ViT-Base)</td>
+            <td>÷10 (86M vs 632M params → less FLOPs)</td>
+            <td>÷7 (fewer params to gather)</td>
+            <td>~6× (still good)</td>
+            <td>✓ Fine</td>
+        </tr>
+        <tr>
+            <td>batch=64 (with checkpointing)</td>
+            <td>×4 → 13.6 ms</td>
+            <td>Unchanged</td>
+            <td>~36×</td>
+            <td>✓✓ Trivially compute-bound</td>
+        </tr>
+        </tbody>
+    </table>
+
+    <div class="callout">
+        <strong>Key insight:</strong> HSDP exists precisely because the 1-D mesh with InfiniBand destroys the compute-to-comm ratio. Moving all-gathers to NVLink (via HSDP) restores the ratio to a regime where overlap works. This is the quantitative justification for Lesson 005's topology discussion.
+    </div>
+
+    <h2>Profiling Communication Overlap</h2>
+
+    <p>Theory is useful, but you need to <strong>measure</strong> whether overlap is actually happening on your cluster. Two tools:</p>
+
+    <h3>Tool 1: torch.profiler (Recommended Start)</h3>
+
+    <pre><code class="language-python">from torch.profiler import profile, schedule, tensorboard_trace_handler
+
+def train_with_profiling(model, dataloader, optimizer, local_rank):
+    """Profile steps 3-7 (skip first 2 for warm-up + prefetch learning)."""
+
+    prof_schedule = schedule(
+        wait=1,    # Skip step 0 (unrepresentative)
+        warmup=2,  # Steps 1-2: warm-up (profiler overhead stabilizes)
+        active=5,  # Steps 3-7: record
+        repeat=1,
+    )
+
+    with profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        schedule=prof_schedule,
+        on_trace_ready=tensorboard_trace_handler(f"./tb_logs/rank{local_rank}"),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True,  # Enables source code correlation
+    ) as prof:
+
+        for batch_idx, (images, labels) in enumerate(dataloader):
+            if batch_idx >= 8:
+                break
+
+            images = images.to(local_rank, non_blocking=True)
+            labels = labels.to(local_rank, non_blocking=True)
+
+            outputs = model(images)
+            loss = nn.functional.cross_entropy(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+
+            prof.step()  # Signal end of step to profiler
+
+    # After profiling, view in TensorBoard:
+    # tensorboard --logdir=./tb_logs
+</code></pre>
+
+    <h3>What to Look for in the Trace</h3>
+
+    <div class="diagram">
+        TensorBoard Trace View (Chrome Trace format):
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+        Stream 0 (Compute):
+        │ volta_h884gemm_256x128 │ LayerNorm │ volta_h884gemm... │ ... │
+        └────────────────────────┴───────────┴──────────────────────────┘
+
+        Stream 7 (NCCL):
+        │  ncclAllGather_476  │     │  ncclReduceScatter_477  │
+        └─────────────────────┘     └─────────────────────────┘
+
+        ↕ TIME AXIS ──────────────────────────────────────────────────▶
+
+        GOOD: NCCL kernels run concurrently with compute kernels (vertical overlap)
+        BAD:  Gaps in compute stream while NCCL runs (stalls visible as empty periods)
+    </div>
+
+    <pre><code class="language-python"># Key metrics to extract from profiler output:
+
+# 1. NCCL kernel duration (total per step)
+#    Should be < compute duration for full overlap possibility
+
+# 2. Gaps/stalls in compute stream
+#    Look for periods where Stream 0 is idle but Stream 7 (NCCL) is active
+#    These are the "exposed communication tails" — FSDP2 overhead
+
+# 3. Kernel-to-kernel gap between FSDP units
+#    Time between last kernel of block N and first kernel of block N+1
+#    If this is large, the all-gather for block N+1 wasn't prefetched early enough
+
+# 4. Total step time breakdown
+#    Ideal: step_time ≈ compute_time (comms fully overlapped)
+#    Real:  step_time = compute_time + exposed_comm_time + overhead
+</code></pre>
+
+    <h3>Tool 2: NVIDIA Nsight Systems (Deeper)</h3>
+
+    <pre><code class="language-bash"># For more detailed GPU-level analysis:
+nsys profile \
+    --trace=cuda,nvtx,osrt \
+    --cuda-memory-usage=true \
+    --output=fsdp2_profile \
+    torchrun --standalone --nproc_per_node=4 train_fsdp2.py
+
+# Open in Nsight Systems GUI:
+nsys-ui fsdp2_profile.nsys-rep
+
+# What nsys shows that torch.profiler doesn't:
+# - Exact CUDA stream assignments for each kernel
+# - NVLink / PCIe traffic visualization
+# - SM (Streaming Multiprocessor) occupancy during NCCL ops
+# - Whether NCCL uses separate SMs or shares with compute
+</code></pre>
+
+    <h2>NCCL and SM Contention</h2>
+
+    <p>A subtle performance issue: NCCL collectives use <strong>GPU SMs</strong> (Streaming Multiprocessors) to drive communication. On V100 with 80 SMs, NCCL may claim 2-4 SMs for its operations. This means:</p>
+
+    <pre><code class="language-python"># When NCCL and compute overlap:
+#   - Compute uses ~76-78 SMs (out of 80)
+#   - NCCL uses ~2-4 SMs for its kernels
+#   - Compute throughput is reduced by ~2-5%
+#
+# This "SM sharing tax" is unavoidable but small on V100.
+# On newer GPUs (H100), NCCL can use a dedicated copy engine
+# without stealing SMs.
+#
+# Practical impact: your sustained compute throughput during FSDP2 training
+# is ~95-98% of what a standalone benchmark would show.
+# This is NOT a bug — it's the cost of overlap.
+</code></pre>
+
+    <h2>Tuning the Overlap: What You Can Control</h2>
+
+    <h3>1. Batch Size (Most Impactful)</h3>
+
+    <pre><code class="language-python"># Larger batch → more compute per FSDP unit → easier to hide communication
+#
+# ViT-Huge on 4× V100:
+#   batch=4:  T_compute ≈ 0.85 ms, T_comm ≈ 0.38 ms → ratio 2.2×  (tight)
+#   batch=16: T_compute ≈ 3.4 ms,  T_comm ≈ 0.38 ms → ratio 9×    (comfortable)
+#   batch=64: T_compute ≈ 13.6 ms, T_comm ≈ 0.38 ms → ratio 36×   (trivial)
+#
+# Rule of thumb: if ratio > 3×, overlap is fine. If < 2×, expect visible stalls.
+</code></pre>
+
+    <h3>2. FSDP Unit Granularity</h3>
+
+    <pre><code class="language-python"># Coarser units → larger all-gathers (more data, longer time)
+#                  but also more compute between them
+# Finer units → smaller all-gathers (less data, shorter time)
+#               but less compute between them (less time to hide comms)
+#
+# For ViT-Huge with per-block sharding:
+#   AG size: 20M params × 4 bytes = 76 MB (moderate)
+#   Compute per block: 3.4 ms at batch=16 (plenty of overlap time)
+#
+# If you sharded per-LAYER (attention, MLP separately):
+#   AG size: ~10M params × 4 = 38 MB (smaller, faster to gather)
+#   Compute per sub-block: ~1.7 ms (less time to overlap with NEXT AG)
+#   Net effect: similar overlap quality, but more collective calls → more latency events
+#
+# Recommendation: per-block is the sweet spot for transformers.
+# Only go finer if a single block doesn't fit unsharded.
+</code></pre>
+
+    <h3>3. NCCL Environment Variables</h3>
+
+    <pre><code class="language-bash"># Tuning NCCL for your V100 NVLink/IB cluster:
+
+# Number of channels (parallel communication lanes)
+# More channels → higher bandwidth utilization, more SM usage
+# Default is usually fine, but can tune:
+export NCCL_MIN_NCHANNELS=4
+export NCCL_MAX_NCHANNELS=8
+
+# Algorithm selection for all-gather:
+# Ring: good for intra-node NVLink (balanced load)
+# Tree: good for cross-node IB (lower latency for small messages)
+# Default: NCCL auto-selects based on message size and topology
+export NCCL_ALGO=Ring  # or Tree, or leave unset for auto
+
+# Thread model: affects how NCCL interacts with GPU scheduling
+export NCCL_NTHREADS=512  # default, rarely needs changing
+
+# Debug: see what NCCL is doing
+export NCCL_DEBUG=INFO    # Verbose (shows topology detection, algorithm selection)
+export NCCL_DEBUG=WARN    # Quiet (only errors/warnings)
+
+# Network interface selection (for InfiniBand):
+export NCCL_IB_HCA=mlx5   # Select IB adapter (if multiple)
+export NCCL_SOCKET_IFNAME=ib0  # Fallback interface
+
+# IMPORTANT for V100 NVLink:
+# NCCL auto-detects NVLink topology. If it fails to detect:
+export NCCL_P2P_LEVEL=NVL  # Force NVLink for peer-to-peer
+</code></pre>
+
+    <div class="callout warning">
+        <strong>Don't over-tune NCCL.</strong> The defaults work well for standard topologies. Only set these if profiling reveals specific issues (e.g., NCCL choosing Tree when Ring would be faster for your all-gather sizes). Most performance gains come from batch size and HSDP, not NCCL knobs.
+    </div>
+
+    <h3>4. Gradient Accumulation (Advanced)</h3>
+
+    <p>If you can't increase batch size (memory limit) but want to improve the compute-to-comm ratio:</p>
+
+    <pre><code class="language-python">def train_with_gradient_accumulation(
+    model, dataloader, optimizer,
+    local_rank, accumulation_steps: int = 4
+):
+    """
+    Accumulate gradients over multiple micro-batches before communication.
+
+    With FSDP2: each forward/backward STILL triggers all-gather + reduce-scatter
+    for EACH micro-batch. Gradient accumulation does NOT eliminate communication!
+
+    But it allows you to use a smaller per-step batch (fitting in memory)
+    while achieving the effective batch size of accumulation_steps × micro_batch.
+
+    Communication overhead: same per micro-batch. No overlap improvement.
+    Use case: when you need large effective batch but can't fit it in one go.
+    """
+    model.train()
+    optimizer.zero_grad()
+
+    for batch_idx, (images, labels) in enumerate(dataloader):
+        images = images.to(local_rank, non_blocking=True)
+        labels = labels.to(local_rank, non_blocking=True)
+
+        # Forward + backward (triggers FSDP2 communication)
+        outputs = model(images)
+        loss = nn.functional.cross_entropy(outputs, labels)
+        # Scale loss by accumulation steps to average gradients
+        (loss / accumulation_steps).backward()
+
+        if (batch_idx + 1) % accumulation_steps == 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+</code></pre>
+
+    <div class="callout warning">
+        <strong>Gradient accumulation with FSDP2 does NOT reduce communication.</strong> Each micro-batch still requires full all-gather + reduce-scatter. Unlike DDP where you can skip gradient sync on intermediate steps (<code>model.no_sync()</code>), FSDP2 must all-gather for every forward (params are sharded — you can't compute without them). Gradient accumulation is useful for effective batch size but NOT for communication reduction.
+    </div>
+
+    <h3>The no_sync() Caveat</h3>
+
+    <pre><code class="language-python"># In DDP:
+#   with model.no_sync():  ← skips all-reduce on this step
+#       loss.backward()    # Gradients accumulate locally
+#   loss.backward()        # This step DOES sync
+#
+# In FSDP2:
+#   There is no equivalent "skip communication" for forward/backward.
+#   The all-gather is REQUIRED for forward (can't compute without full params).
+#   The reduce-scatter CAN theoretically be deferred, but FSDP2 doesn't expose
+#   this cleanly in the current API.
+#
+# FSDP2 does support set_requires_gradient_sync(False) for the reduce-scatter:
+#   → Skips the reduce-scatter, accumulates Partial gradients locally
+#   → But local grads are full-sized (not sharded) → USES MORE MEMORY
+#   → And all-gather still happens every forward
+#
+# Net: gradient accumulation with FSDP2 saves no communication on forward,
+# and the backward savings require careful memory management.
+# It's mainly useful for matching effective batch sizes, not performance.
+</code></pre>
+
+    <h2>Measuring Overlap Quality</h2>
+
+    <p>A practical script to estimate overlap efficiency without a full profiler:</p>
+
+    <pre><code class="language-python">import torch
+import time
+import torch.distributed as dist
+
+
+def measure_overlap_efficiency(
+    model: torch.nn.Module,
+    dataloader,
+    local_rank: int,
+    num_steps: int = 20,
+) -> dict:
+    """
+    Estimate overlap efficiency by comparing actual step time
+    to theoretical compute-only time.
+
+    Method: Run FSDP2 training steps and compare to a single-GPU
+    (non-distributed) baseline at the same batch size per GPU.
+
+    Overlap efficiency = 1 - (fsdp_time - compute_time) / comm_time
+    Where:
+      fsdp_time = actual FSDP2 step time
+      compute_time ≈ time for same model forward+backward without communication
+      comm_time = measured communication time (from profiler)
+
+    Simpler proxy: compare throughput to single-GPU throughput.
+    If FSDP2 with N GPUs gives N× throughput → perfect overlap.
+    """
+    model.train()
+
+    # Warm up (first 2 steps: prefetch learning + CUDA warm-up)
+    warmup_iter = iter(dataloader)
+    for _ in range(3):
+        images, labels = next(warmup_iter)
+        images = images.to(local_rank, non_blocking=True)
+        labels = labels.to(local_rank, non_blocking=True)
+        outputs = model(images)
+        loss = torch.nn.functional.cross_entropy(outputs, labels)
+        loss.backward()
+        model.zero_grad()
+
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    # Measure
+    step_times = []
+    data_iter = iter(dataloader)
+
+    for step in range(num_steps):
+        images, labels = next(data_iter)
+        images = images.to(local_rank, non_blocking=True)
+        labels = labels.to(local_rank, non_blocking=True)
+
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+
+        outputs = model(images)
+        loss = torch.nn.functional.cross_entropy(outputs, labels)
+        loss.backward()
+        model.zero_grad()
+
+        torch.cuda.synchronize()
+        end = time.perf_counter()
+
+        step_times.append(end - start)
+
+    avg_step = sum(step_times) / len(step_times)
+    std_step = (sum((t - avg_step)**2 for t in step_times) / len(step_times)) ** 0.5
+
+    # Compute throughput
+    batch_size = next(iter(dataloader))[0].shape[0]
+    world_size = dist.get_world_size()
+    throughput = batch_size * world_size / avg_step
+
+    results = {
+        "avg_step_ms": avg_step * 1000,
+        "std_step_ms": std_step * 1000,
+        "throughput_img_per_sec": throughput,
+        "per_gpu_throughput": throughput / world_size,
+        "step_times_ms": [t * 1000 for t in step_times],
+    }
+
+    if local_rank == 0:
+        print(f"Average step: {results['avg_step_ms']:.2f} ± {results['std_step_ms']:.2f} ms")
+        print(f"Throughput: {results['throughput_img_per_sec']:.0f} img/s "
+              f"({results['per_gpu_throughput']:.0f} per GPU)")
+
+        # Compare to expected:
+        # If per_gpu_throughput ≈ single_gpu_throughput → overlap is good
+        # If per_gpu_throughput << single_gpu_throughput → communication exposed
+
+    return results
+</code></pre>
+
+    <h2>Interpreting Results: What Good Looks Like</h2>
+
+    <table>
+        <thead>
+        <tr><th>Metric</th><th>Good</th><th>Concerning</th><th>Action</th></tr>
+        </thead>
+        <tbody>
+        <tr>
+            <td>Per-GPU throughput vs single-GPU</td>
+            <td>&gt; 90% of single-GPU</td>
+            <td>&lt; 75% of single-GPU</td>
+            <td>Check interconnect, switch to HSDP, increase batch</td>
+        </tr>
+        <tr>
+            <td>Step time std deviation</td>
+            <td>&lt; 5% of mean</td>
+            <td>&gt; 15% of mean</td>
+            <td>NCCL stragglers, thermal throttling, contention from other jobs</td>
+        </tr>
+        <tr>
+            <td>Scaling efficiency (N GPUs)</td>
+            <td>&gt; 85% (throughput / N × single_gpu)</td>
+            <td>&lt; 70%</td>
+            <td>Communication bottleneck — profile with nsys</td>
+        </tr>
+        <tr>
+            <td>First-step penalty</td>
+            <td>2-3× normal step (prefetch learning)</td>
+            <td>&gt; 5× normal step</td>
+            <td>Check for NCCL initialization issues, topology detection</td>
+        </tr>
+        </tbody>
+    </table>
+
+    <h2>Expected Numbers for Your Setup</h2>
+
+    <p>Predicted performance for ViT-Huge, fp16, FSDP2, your V100 cluster:</p>
+
+    <table>
+        <thead>
+        <tr><th>Config</th><th>Step time</th><th>Throughput</th><th>Scaling eff.</th><th>Bottleneck</th></tr>
+        </thead>
+        <tbody>
+        <tr>
+            <td>1 GPU, batch=16 (DDP baseline)</td>
+            <td>~145 ms</td>
+            <td>~110 img/s</td>
+            <td>—</td>
+            <td>Compute</td>
+        </tr>
+        <tr>
+            <td>4 GPU, 1-D, batch=16/GPU</td>
+            <td>~148 ms</td>
+            <td>~430 img/s</td>
+            <td>~98%</td>
+            <td>Compute (NVLink trivially fast)</td>
+        </tr>
+        <tr>
+            <td>8 GPU, 1-D (2 nodes), batch=16/GPU</td>
+            <td>~170 ms</td>
+            <td>~750 img/s</td>
+            <td>~85%</td>
+            <td>IB all-gather latency</td>
+        </tr>
+        <tr>
+            <td>8 GPU, HSDP (2,4), batch=16/GPU</td>
+            <td>~152 ms</td>
+            <td>~840 img/s</td>
+            <td>~95%</td>
+            <td>Compute + IB grad sync</td>
+        </tr>
+        <tr>
+            <td>4 GPU, 1-D, batch=64/GPU + AC</td>
+            <td>~450 ms</td>
+            <td>~570 img/s</td>
+            <td>~97%</td>
+            <td>Compute (recomputation dominates)</td>
+        </tr>
+        </tbody>
+    </table>
+
+    <div class="callout success">
+        <strong>Key observation:</strong> The 1-D mesh 2-node config drops to 85% scaling efficiency due to IB-bound all-gathers. HSDP restores it to 95%. The 10% gap between them represents ~90 img/s — significant at production scale. This is measurable on your cluster.
+    </div>
+
+    <h2>Advanced: Explicit Prefetch Control (PyTorch 2.5+)</h2>
+
+    <pre><code class="language-python"># In newer PyTorch versions, you can control prefetch distance:
+# (API may be under torch.distributed._composable.fsdp internals)
+
+# The concept: instead of prefetching exactly 1 FSDP unit ahead,
+# prefetch 2 units ahead. This gives more time for the all-gather
+# to complete, but uses more memory (2 units unsharded simultaneously).
+
+# As of PyTorch 2.5, this is controlled via:
+# torch.distributed._composable.fsdp._fsdp_state.FSDPState._unshard_params_ctx
+# with a configurable "prefetch ahead" count.
+
+# In practice, prefetch_distance=1 (default) is almost always sufficient
+# because one block's compute time vastly exceeds the all-gather time
+# on NVLink. Only increase if profiling shows stalls despite prefetch.
+
+# When you MIGHT increase prefetch distance:
+# - Very small blocks (few params, fast compute) on slow interconnect
+# - Heterogeneous blocks where some are fast (norms, embeddings)
+# - Multi-node without HSDP (not recommended — use HSDP instead)
+</code></pre>
+
+    <h2>Practical Tuning Checklist</h2>
+
+    <pre><code class="language-python"># Step-by-step performance tuning for FSDP2:
+
+# 1. Start with correct config (lessons 003-007):
+#    ✓ Per-block FSDP units
+#    ✓ HSDP mesh for multi-node
+#    ✓ MixedPrecision (fp16 compute, fp32 reduce)
+#    ✓ Activation checkpointing (if needed for batch size)
+
+# 2. Measure baseline throughput:
+#    - Run 20 steps, skip first 3, average remaining
+#    - Record: step_time, throughput, peak memory
+
+# 3. Compare to single-GPU baseline:
+#    - If per-GPU throughput > 90% of single-GPU → you're done
+#    - If < 90% → proceed to step 4
+
+# 4. Profile with torch.profiler:
+#    - Look for gaps in compute stream (NCCL stalls)
+#    - Measure exposed comm tail per block
+
+# 5. If comm-bound:
+#    a. Switch to HSDP (if multi-node and not already using it)
+#    b. Increase batch size (more compute to hide comms)
+#    c. Check NCCL environment (topology detection, algorithm)
+#    d. Consider coarser FSDP units (fewer, larger all-gathers)
+
+# 6. If compute-bound:
+#    a. Enable torch.compile (Lesson 010)
+#    b. Verify Tensor Core usage (dims multiple of 8)
+#    c. Check for CPU bottlenecks (data loading)
+
+# 7. Iterate: measure → identify bottleneck → fix → measure again
+</code></pre>
+
+    <h2 id="quiz">Check Your Understanding</h2>
+
+    <div class="quiz">
+        <h3>Q1: On your V100 cluster with ViT-Huge (batch=16, 4 GPUs NVLink), the compute-to-comm ratio is ~9×. What does this predict about FSDP2's overhead?</h3>
+        <button onclick="checkAnswer(this, true)">Near-zero overhead — communication is fully hidden behind compute with room to spare</button>
+        <button onclick="checkAnswer(this, false)">~11% overhead — communication takes 1/9 of compute time and is fully exposed</button>
+        <button onclick="checkAnswer(this, false)">~50% overhead — the 1.5× communication volume of FSDP vs DDP adds significant time</button>
+        <button onclick="checkAnswer(this, false)">Unpredictable — the ratio doesn't account for CUDA stream scheduling overhead</button>
+        <div class="explanation">
+            <strong>Correct.</strong> A 9× ratio means the all-gather completes in ~1/9 of the time that the next block's compute takes. With prefetching (start AG during current compute), the all-gather finishes well before it's needed. The exposed tail is effectively zero. The only overhead is the ~2-5% SM sharing tax from NCCL using a few SMs during overlap. Measured scaling efficiency should be 95-98%.
+        </div>
+    </div>
+
+    <div class="quiz">
+        <h3>Q2: You profile your 2-node FSDP2 training and see that the compute stream is idle for 4ms between each block's forward pass. What's the most likely cause?</h3>
+        <button onclick="checkAnswer(this, false)">Activation checkpointing is causing extra recomputation between blocks that shows up as idle time</button>
+        <button onclick="checkAnswer(this, true)">The all-gather for the next block hasn't completed when compute needs it — the prefetch didn't have enough runway to hide InfiniBand latency</button>
+        <button onclick="checkAnswer(this, false)">The CPU is bottlenecked on data loading and can't feed the GPU fast enough</button>
+        <button onclick="checkAnswer(this, false)">torch.compile introduced graph breaks at FSDP unit boundaries causing recompilation delays</button>
+        <div class="explanation">
+            <strong>Correct.</strong> A 4ms gap in the compute stream between blocks means the GPU is waiting for the all-gather to deliver the next block's parameters. The prefetch started during the previous block's compute, but the previous block's compute wasn't long enough to hide the all-gather latency (especially over InfiniBand). Fix: switch to HSDP (move all-gathers to NVLink), or increase batch size (more compute time to hide the latency).
+        </div>
+    </div>
+
+    <div class="quiz">
+        <h3>Q3: Why doesn't gradient accumulation reduce FSDP2's communication volume per effective batch?</h3>
+        <button onclick="checkAnswer(this, false)">FSDP2 doesn't support gradient accumulation — it raises an error if you try</button>
+        <button onclick="checkAnswer(this, true)">Each micro-batch forward still requires all-gathering parameters (can't compute without full params), so all-gather count equals micro-batch count regardless of accumulation</button>
+        <button onclick="checkAnswer(this, false)">Gradient accumulation conflicts with reduce-scatter — accumulated gradients are too large to scatter efficiently</button>
+        <button onclick="checkAnswer(this, false)">FSDP2's mixed precision policy requires fresh parameter copies for each micro-batch to prevent precision drift</button>
+        <div class="explanation">
+            <strong>Correct.</strong> Unlike DDP where you can skip gradient all-reduce on intermediate micro-batches (model.no_sync()), FSDP2 MUST all-gather parameters for every forward pass — the parameters are sharded, so you literally cannot compute without gathering them first. The only potentially skippable communication is the reduce-scatter of gradients (defer to last micro-batch), but the all-gather cost (which is 2/3 of total FSDP communication) remains per micro-batch.
+        </div>
+    </div>
+
+    <div class="quiz">
+        <h3>Q4: The first training step is always slower than subsequent steps with FSDP2. Why?</h3>
+        <button onclick="checkAnswer(this, false)">PyTorch's CUDA context initialization and JIT compilation of kernels happens on the first step</button>
+        <button onclick="checkAnswer(this, true)">FSDP2 learns the execution order of FSDP units on the first forward pass to configure prefetch scheduling — no prefetch is possible on step 1</button>
+        <button onclick="checkAnswer(this, false)">NCCL's connection establishment and buffer allocation occurs lazily on the first collective operation</button>
+        <button onclick="checkAnswer(this, false)">The optimizer's state tensors (Adam m, v) are allocated on the first step, causing a memory allocation spike</button>
+        <div class="explanation">
+            <strong>Correct.</strong> FSDP2's prefetch system needs to know the order in which FSDP units execute (to prefetch the NEXT unit). This order is recorded during the first forward pass. Step 1 has NO prefetch — each all-gather starts only when the hook fires (no ahead-of-time communication). Steps 2+ use the recorded order to issue prefetch all-gathers early. Note: answers A and C are ALSO true for the very first step but apply to DDP equally — the FSDP2-specific first-step penalty is the lack of prefetch.
+        </div>
+    </div>
+
+    <h2>Key Takeaways</h2>
+    <ol>
+        <li><strong>Overlap works via CUDA streams:</strong> compute on Stream 0, NCCL on Stream 1. They run concurrently unless Stream 0 stalls waiting for a result from Stream 1.</li>
+        <li><strong>Compute-to-comm ratio &gt; 3× → good overlap.</strong> For ViT-Huge on V100 NVLink: ratio ~9× (batch=16). Communication is trivially hidden.</li>
+        <li><strong>HSDP exists to fix the ratio on multi-node.</strong> InfiniBand all-gathers destroy the ratio (0.2×). HSDP moves them to NVLink (4.5×).</li>
+        <li><strong>Prefetch is automatic but learned on step 1.</strong> Always discard step 1 for benchmarking. Steps 2+ have prefetch.</li>
+        <li><strong>Gradient accumulation does NOT reduce FSDP2 communication.</strong> All-gathers happen every micro-batch (can't compute without full params).</li>
+        <li><strong>Profile before tuning.</strong> Use torch.profiler → TensorBoard trace. Look for gaps in compute stream = exposed communication.</li>
+        <li><strong>Tuning priority:</strong> (1) HSDP topology, (2) batch size, (3) NCCL env vars, (4) FSDP unit granularity. Most gains come from (1) and (2).</li>
+    </ol>
+
+    <h2>Primary Source</h2>
+    <p>Study the <a href="https://pytorch.org/tutorials/intermediate/dist_tuto.html">PyTorch Distributed Tutorial's profiling section</a> and the <a href="https://github.com/pytorch/torchtitan/blob/main/docs/performance.md">torchtitan performance documentation</a> which discusses overlap tuning in the context of FSDP2 + TP. For NCCL internals, the <a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html">NCCL Environment Variables documentation</a> is the canonical reference for tuning knobs.</p>
+
+
+    <script>
+        function checkAnswer(btn, correct) {
+            const quiz = btn.closest('.quiz');
+            const buttons = quiz.querySelectorAll('button');
+            const explanation = quiz.querySelector('.explanation');
+            buttons.forEach(b => { b.disabled = true; b.classList.remove('correct', 'incorrect'); });
+            if (correct) {
+                btn.classList.add('correct');
+            } else {
+                btn.classList.add('incorrect');
+                buttons.forEach(b => { if (b.getAttribute('onclick').includes('true')) b.classList.add('correct'); });
+            }
+            explanation.style.display = 'block';
+        }
+    </script>
+
+
+        
+        <!-- _includes/tutorial-nav.html -->
+
+
+
+
+
+
+
+
+
+
+
+
+<nav class="tutorial-nav" aria-label="Lesson navigation">
+    
+    <a href="/heap/fsdp2/007/" class="tutorial-nav-btn tutorial-nav-prev">
+        <span class="tutorial-nav-label">← Previous</span>
+        <span class="tutorial-nav-title">007 — Activation Checkpointing + FSDP2 Composition</span>
+    </a>
+    
+
+    
+    <a href="/heap/fsdp2/009/" class="tutorial-nav-btn tutorial-nav-next">
+        <span class="tutorial-nav-label">Next →</span>
+        <span class="tutorial-nav-title">009 — HSDP: Hybrid Sharding on Your NVLink/IB Cluster</span>
+    </a>
+    
+</nav>
+        
+    </article>
+
+</div>
+  </div>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <div class="footer-links">
+      <a href="https://github.com/g4br1el">GitHub</a>
+      <a href="https://www.linkedin.com/in/gadax">LinkedIn</a>
+      <a href="mailto:gdax.science@gmail.com">Email</a>
+      <a href="/files/CV-Gabriel_Dax.pdf">Resume ↓</a>
+    </div>
+    <p class="footer-copyright">© 2026 Gabriel Dax</p>
+  </div>
+</footer>
+
+
+
+</body>
+</html>
