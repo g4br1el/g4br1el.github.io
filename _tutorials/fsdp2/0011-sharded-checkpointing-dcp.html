@@ -1,0 +1,886 @@
+---
+layout: tutorial
+tutorial: fsdp2
+type: lesson
+lesson: 11
+total: 18
+title: "Sharded Checkpointing with Distributed Checkpoint (DCP)"
+tags: [Production, Checkpointing]
+permalink: /heap/fsdp2/011/
+---
+
+<p><em>Saving and loading model state without gathering to rank 0 — the production approach for large models on FSDP2.</em></p>
+
+<h2>The Checkpointing Problem</h2>
+
+<p>With DDP, checkpointing is simple: <code>torch.save(model.state_dict(), path)</code> on rank 0. The full model lives on every rank, so rank 0 has everything.</p>
+
+<p>With FSDP2, this approach has three problems:</p>
+
+<table>
+    <thead>
+    <tr><th>Problem</th><th>Impact</th><th>Scale</th></tr>
+    </thead>
+    <tbody>
+    <tr>
+        <td>No rank has the full model</td>
+        <td>Must all-gather before saving → defeats memory savings</td>
+        <td>ViT-Huge: 2.4 GB suddenly needs to fit on one rank</td>
+    </tr>
+    <tr>
+        <td>All-gather to rank 0 is slow</td>
+        <td>Training stalls while saving</td>
+        <td>At billion+ scale: minutes per checkpoint</td>
+    </tr>
+    <tr>
+        <td>Resuming with different world_size</td>
+        <td>If you trained on 4 GPUs but resume on 8, shards don't match</td>
+        <td>Common in HPC (cluster availability changes)</td>
+    </tr>
+    </tbody>
+</table>
+
+<p><strong>Distributed Checkpoint (DCP)</strong> solves all three: each rank saves its own shard independently. No gathering. No single-point bottleneck. Resharding on load handles world_size changes.</p>
+
+<h2>DCP Architecture</h2>
+
+<div class="diagram">
+    Traditional checkpoint (DDP):
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    Rank 0: full model → torch.save("checkpoint.pt")
+    Rank 1: (waits)
+    Rank 2: (waits)
+    Rank 3: (waits)
+
+    Result: one large file on disk
+    Load: rank 0 loads → broadcasts? Or all ranks load same file?
+
+
+    DCP (FSDP2):
+    ━━━━━━━━━━━━
+
+    Rank 0: saves shard_0 → checkpoint_dir/__0_0.distcp
+    Rank 1: saves shard_1 → checkpoint_dir/__1_0.distcp
+    Rank 2: saves shard_2 → checkpoint_dir/__2_0.distcp
+    Rank 3: saves shard_3 → checkpoint_dir/__3_0.distcp
+    + metadata file:         checkpoint_dir/.metadata
+
+    Result: directory with N shard files + metadata
+    Load: each rank loads what it needs (may differ from save topology)
+</div>
+
+<div class="callout">
+    <strong>Key insight:</strong> DCP saves a <em>directory</em>, not a single file. The directory contains per-rank shard files plus metadata that describes how the global tensors are partitioned. On load, DCP reads the metadata, determines which bytes each rank needs, and loads only those bytes — even if the load topology differs from the save topology.
+</div>
+
+<h2>Basic Save and Load</h2>
+
+<pre><code class="language-python">import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint.state_dict import (
+    get_model_state_dict,
+    get_optimizer_state_dict,
+    set_model_state_dict,
+    set_optimizer_state_dict,
+    StateDictOptions,
+)
+
+
+def save_checkpoint(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    step: int,
+    checkpoint_dir: str,
+) -> None:
+    """
+    Save sharded checkpoint. Each rank writes its own shard.
+    All ranks must call this collectively (it's a distributed operation).
+    """
+    # Get sharded state dicts (no gathering — each rank's view)
+    model_state = get_model_state_dict(model)
+    optim_state = get_optimizer_state_dict(model, optimizer)
+
+    # Bundle everything to save
+    state_dict = {
+        "model": model_state,
+        "optimizer": optim_state,
+        "epoch": epoch,
+        "step": step,
+    }
+
+    # Save — each rank writes its shard to the directory
+    dcp.save(state_dict, checkpoint_id=checkpoint_dir)
+
+    if dist.get_rank() == 0:
+        print(f"[Checkpoint] Saved to {checkpoint_dir}")
+
+
+def load_checkpoint(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    checkpoint_dir: str,
+) -> dict:
+    """
+    Load sharded checkpoint. Handles resharding if world_size changed.
+    All ranks must call this collectively.
+    """
+    # Prepare state dict containers (with current model/optimizer structure)
+    model_state = get_model_state_dict(model)
+    optim_state = get_optimizer_state_dict(model, optimizer)
+
+    state_dict = {
+        "model": model_state,
+        "optimizer": optim_state,
+        "epoch": 0,
+        "step": 0,
+    }
+
+    # Load — DCP handles resharding automatically
+    dcp.load(state_dict, checkpoint_id=checkpoint_dir)
+
+    # Apply loaded state to model and optimizer
+    set_model_state_dict(model, state_dict["model"])
+    set_optimizer_state_dict(model, optimizer, state_dict["optimizer"])
+
+    if dist.get_rank() == 0:
+        print(f"[Checkpoint] Loaded from {checkpoint_dir} "
+              f"(epoch={state_dict['epoch']}, step={state_dict['step']})")
+
+    return {"epoch": state_dict["epoch"], "step": state_dict["step"]}
+</code></pre>
+
+<div class="callout warning">
+    <strong><code>dcp.save()</code> and <code>dcp.load()</code> are collective operations.</strong> ALL ranks must call them. If only rank 0 calls save, you'll deadlock. This is because each rank writes/reads its own shard, and coordination is needed for the metadata file.
+</div>
+
+<h2>What's Inside a DCP Checkpoint Directory</h2>
+
+<pre><code class="language-bash">$ ls -la checkpoints/epoch_0/
+total 2.5G
+-rw-r--r-- 1 user group  12K .metadata          # Global tensor shapes, shard mapping
+-rw-r--r-- 1 user group 620M __0_0.distcp       # Rank 0's shard (model + optimizer)
+-rw-r--r-- 1 user group 620M __1_0.distcp       # Rank 1's shard
+-rw-r--r-- 1 user group 620M __2_0.distcp       # Rank 2's shard
+-rw-r--r-- 1 user group 620M __3_0.distcp       # Rank 3's shard
+
+# .metadata contains (JSON-like):
+# {
+#   "model.blocks.0.attn.q_proj.weight": {
+#     "global_shape": [1280, 1280],
+#     "dtype": "float32",
+#     "chunks": [
+#       {"rank": 0, "offset": [0, 0], "size": [320, 1280]},
+#       {"rank": 1, "offset": [320, 0], "size": [320, 1280]},
+#       {"rank": 2, "offset": [640, 0], "size": [320, 1280]},
+#       {"rank": 3, "offset": [960, 0], "size": [320, 1280]},
+#     ]
+#   },
+#   ...
+# }
+</code></pre>
+
+<div class="callout">
+    <strong>The metadata is the key to resharding.</strong> It describes for every parameter: the global shape and which bytes live in which file at which offset. When loading with a different world_size (e.g., 8 GPUs instead of 4), DCP reads the metadata, computes what each new rank needs, and reads the appropriate slices from potentially multiple shard files.
+</div>
+
+<h2>Resharding: Loading with Different World Size</h2>
+
+<p>This is DCP's killer feature for HPC workflows where cluster availability varies:</p>
+
+<pre><code class="language-python"># Scenario: saved with 4 GPUs, loading with 8 GPUs
+#
+# Saved state (4 GPUs, Shard(0)):
+#   Rank 0: param[0:320, :]     → __0_0.distcp
+#   Rank 1: param[320:640, :]   → __1_0.distcp
+#   Rank 2: param[640:960, :]   → __2_0.distcp
+#   Rank 3: param[960:1280, :]  → __3_0.distcp
+#
+# Loading state (8 GPUs, Shard(0)):
+#   New Rank 0 needs: param[0:160, :]     → reads from __0_0.distcp, rows 0-160
+#   New Rank 1 needs: param[160:320, :]   → reads from __0_0.distcp, rows 160-320
+#   New Rank 2 needs: param[320:480, :]   → reads from __1_0.distcp, rows 0-160
+#   New Rank 3 needs: param[480:640, :]   → reads from __1_0.distcp, rows 160-320
+#   ...
+#
+# DCP handles this automatically. You don't write resharding logic.
+# Just call dcp.load() with the current model (sharded on 8 GPUs) and
+# point it at the 4-GPU checkpoint directory.
+
+# The ONLY requirement: the model architecture must match.
+# Parameter names and shapes must be identical.
+# The sharding topology can differ freely.
+</code></pre>
+
+<div class="callout success">
+    <strong>This is critical for your Fraunhofer workflow:</strong> You might train on 2 nodes (8 GPUs) one day, lose a node to another job, and need to resume on 1 node (4 GPUs). With DCP, this just works — no manual resharding scripts, no checkpoint conversion. <code>dcp.load()</code> reads the metadata, computes what the new topology needs, and loads the right bytes.
+</div>
+
+<h2>HSDP Checkpointing</h2>
+
+<p>With HSDP (2-D mesh), checkpointing has a nuance: the model is <em>replicated</em> across replica groups. Each replica holds the same shards. DCP handles this efficiently:</p>
+
+<pre><code class="language-python"># HSDP (2, 4): 2 replicas × 4 shards
+# Ranks 0-3 (replica 0) hold the same 4 shards as ranks 4-7 (replica 1)
+#
+# Naive save: 8 ranks each write a file → 2× redundant data on disk
+# Smart save: only replica 0 writes, replica 1 skips
+#
+# DCP handles this automatically via the DTensor placements.
+# It detects that some ranks hold Replicate() placements and deduplicates.
+# Only one copy of each unique shard is written to disk.
+#
+# Result: checkpoint directory has 4 shard files (not 8), same as 1-D with 4 GPUs.
+
+# On load with HSDP:
+# DCP loads the 4 unique shards and replicates to both replica groups.
+# Again, automatic — you just call dcp.load().
+
+# Explicitly, you can control this behavior:
+from torch.distributed.checkpoint.state_dict import StateDictOptions
+
+# Full state dict on one rank (for export/inference — gathers everything)
+options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+full_state = get_model_state_dict(model, options=options)
+# Now full_state on rank 0 contains the complete ungathered model (for export)
+</code></pre>
+
+<h2>Saving Optimizer State</h2>
+
+<p>Optimizer state (Adam m, v) is often 2× the model size. DCP handles it identically:</p>
+
+<pre><code class="language-python"># Optimizer state dict with FSDP2:
+# Each rank's optimizer holds states for its SHARDED parameters.
+# Adam's exp_avg (m) and exp_avg_sq (v) are shard-sized.
+#
+# get_optimizer_state_dict() returns these sharded states directly.
+# No gathering needed.
+#
+# Structure on rank 0 (4 GPUs):
+# {
+#   "state": {
+#     0: {  # param index 0
+#       "exp_avg": tensor([320, 1280]),      # Shard of Adam m
+#       "exp_avg_sq": tensor([320, 1280]),   # Shard of Adam v
+#       "step": tensor(100),
+#     },
+#     1: { ... },
+#   },
+#   "param_groups": [ {"lr": 1e-4, "weight_decay": 0.05, ...} ]
+# }
+#
+# Total optimizer checkpoint size per rank:
+#   2 × (P/N × 4 bytes) = 2 × 632M/4 × 4 = 1.2 GB per rank
+#   Total across all ranks: 2 × 632M × 4 = 4.8 GB (but distributed!)
+</code></pre>
+
+<h2>Full Checkpoint/Resume Integration</h2>
+
+<pre><code class="language-python">"""
+Checkpoint integration for production FSDP2 training.
+Supports: sharded save/load, resume with different world_size, periodic saving.
+"""
+import os
+import torch
+import torch.distributed as dist
+import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint.state_dict import (
+    get_model_state_dict,
+    get_optimizer_state_dict,
+    set_model_state_dict,
+    set_optimizer_state_dict,
+    StateDictOptions,
+)
+from pathlib import Path
+
+
+class CheckpointManager:
+    """Manages sharded checkpoints for FSDP2 training."""
+
+    def __init__(
+        self,
+        checkpoint_dir: str,
+        save_interval_steps: int = 500,
+        keep_last_n: int = 3,
+    ):
+        self.checkpoint_dir = Path(checkpoint_dir)
+        self.save_interval_steps = save_interval_steps
+        self.keep_last_n = keep_last_n
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    def save(
+        self,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        epoch: int,
+        step: int,
+        loss: float,
+    ) -> None:
+        """Save sharded checkpoint. All ranks must call."""
+        save_dir = self.checkpoint_dir / f"step_{step:07d}"
+
+        state_dict = {
+            "model": get_model_state_dict(model),
+            "optimizer": get_optimizer_state_dict(model, optimizer),
+            "train_state": {
+                "epoch": epoch,
+                "step": step,
+                "loss": loss,
+            },
+        }
+
+        dcp.save(state_dict, checkpoint_id=str(save_dir))
+
+        if dist.get_rank() == 0:
+            print(f"[Checkpoint] Saved step {step} to {save_dir}")
+            self._cleanup_old_checkpoints()
+
+    def load_latest(
+        self,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+    ) -> dict | None:
+        """
+        Load the latest checkpoint if one exists.
+        Returns train_state dict or None if no checkpoint found.
+        """
+        latest = self._find_latest_checkpoint()
+        if latest is None:
+            if dist.get_rank() == 0:
+                print("[Checkpoint] No existing checkpoint found. Starting fresh.")
+            return None
+
+        if dist.get_rank() == 0:
+            print(f"[Checkpoint] Resuming from {latest}")
+
+        # Prepare state containers
+        state_dict = {
+            "model": get_model_state_dict(model),
+            "optimizer": get_optimizer_state_dict(model, optimizer),
+            "train_state": {"epoch": 0, "step": 0, "loss": 0.0},
+        }
+
+        # Load (handles resharding automatically)
+        dcp.load(state_dict, checkpoint_id=str(latest))
+
+        # Apply to model and optimizer
+        set_model_state_dict(model, state_dict["model"])
+        set_optimizer_state_dict(model, optimizer, state_dict["optimizer"])
+
+        train_state = state_dict["train_state"]
+
+        if dist.get_rank() == 0:
+            print(f"[Checkpoint] Resumed: epoch={train_state['epoch']}, "
+                  f"step={train_state['step']}, loss={train_state['loss']:.4f}")
+
+        return train_state
+
+    def should_save(self, step: int) -> bool:
+        """Check if we should save at this step."""
+        return step > 0 and step % self.save_interval_steps == 0
+
+    def _find_latest_checkpoint(self) -> Path | None:
+        """Find the latest valid checkpoint directory."""
+        if not self.checkpoint_dir.exists():
+            return None
+
+        checkpoints = sorted(
+            [d for d in self.checkpoint_dir.iterdir()
+             if d.is_dir() and d.name.startswith("step_")],
+            key=lambda p: int(p.name.split("_")[1]),
+        )
+
+        # Return the latest that has a .metadata file (valid checkpoint)
+        for ckpt in reversed(checkpoints):
+            if (ckpt / ".metadata").exists():
+                return ckpt
+
+        return None
+
+    def _cleanup_old_checkpoints(self) -> None:
+        """Keep only the last N checkpoints. Rank 0 only."""
+        if dist.get_rank() != 0:
+            return
+
+        checkpoints = sorted(
+            [d for d in self.checkpoint_dir.iterdir()
+             if d.is_dir() and d.name.startswith("step_")],
+            key=lambda p: int(p.name.split("_")[1]),
+        )
+
+        while len(checkpoints) > self.keep_last_n:
+            oldest = checkpoints.pop(0)
+            import shutil
+            shutil.rmtree(oldest)
+            print(f"[Checkpoint] Removed old checkpoint: {oldest.name}")
+</code></pre>
+
+<h3>Usage in Training Loop</h3>
+
+<pre><code class="language-python">def main():
+    # ... setup (dist, mesh, model, FSDP2, optimizer, dataloader) ...
+
+    ckpt_manager = CheckpointManager(
+        checkpoint_dir="./checkpoints/vit_huge_run1",
+        save_interval_steps=500,
+        keep_last_n=3,
+    )
+
+    # Resume from latest checkpoint (if exists)
+    train_state = ckpt_manager.load_latest(model, optimizer)
+    start_epoch = train_state["epoch"] if train_state else 0
+    global_step = train_state["step"] if train_state else 0
+
+    # Training loop
+    for epoch in range(start_epoch, num_epochs):
+        dataloader.sampler.set_epoch(epoch)
+
+        for batch_idx, (images, labels) in enumerate(dataloader):
+            # Skip batches we've already processed (for mid-epoch resume)
+            if train_state and epoch == start_epoch and batch_idx < (global_step % len(dataloader)):
+                continue
+
+            images = images.to(local_rank, non_blocking=True)
+            labels = labels.to(local_rank, non_blocking=True)
+
+            outputs = model(images)
+            loss = nn.functional.cross_entropy(outputs, labels)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+
+            global_step += 1
+
+            # Periodic checkpoint
+            if ckpt_manager.should_save(global_step):
+                ckpt_manager.save(model, optimizer, epoch, global_step, loss.item())
+
+    # Final checkpoint
+    ckpt_manager.save(model, optimizer, num_epochs, global_step, loss.item())
+</code></pre>
+
+<h2>Converting Sharded → Full State Dict (For Export)</h2>
+
+<p>For inference, you typically need a single non-sharded state dict (to load into a non-distributed model). Two approaches:</p>
+
+<h3>Approach 1: Gather In-Memory (Small-Medium Models)</h3>
+
+<pre><code class="language-python">def export_full_state_dict(
+    model: torch.nn.Module,
+    output_path: str,
+) -> None:
+    """
+    Gather full state dict to rank 0 and save as standard .pt file.
+    Use for models that fit in single-GPU memory (ViT-Huge: 2.4 GB — fits).
+    """
+    options = StateDictOptions(
+        full_state_dict=True,   # Gather to rank 0
+        cpu_offload=True,       # Put gathered tensors on CPU (save GPU memory)
+    )
+
+    full_state = get_model_state_dict(model, options=options)
+
+    # Only rank 0 has the full state dict
+    if dist.get_rank() == 0:
+        torch.save(full_state, output_path)
+        print(f"[Export] Full state dict saved to {output_path}")
+        print(f"  Size: {os.path.getsize(output_path) / 1e9:.2f} GB")
+
+    # Barrier to ensure file is written before other ranks proceed
+    dist.barrier()
+</code></pre>
+
+<h3>Approach 2: Offline Conversion (Large Models)</h3>
+
+<pre><code class="language-python">"""
+convert_checkpoint.py — Offline conversion from DCP sharded → full .pt
+Run this as a single-process script (no torchrun needed).
+"""
+import torch
+import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint.format_utils import dcp_to_torch_save
+
+
+def convert_dcp_to_full(
+    dcp_dir: str,
+    output_path: str,
+) -> None:
+    """
+    Convert a DCP checkpoint directory to a standard torch.save file.
+
+    This reads all shard files, assembles the full tensors, and saves
+    as a single .pt file. Does NOT require a distributed environment.
+
+    Note: Requires enough CPU RAM to hold the full model + optimizer state.
+    For ViT-Huge: ~10 GB CPU RAM needed.
+    """
+    # PyTorch 2.5+ provides this utility:
+    dcp_to_torch_save(dcp_dir, output_path)
+    print(f"Converted {dcp_dir} → {output_path}")
+
+
+# Alternative manual approach (more control):
+def convert_dcp_to_full_manual(
+    dcp_dir: str,
+    output_path: str,
+    model_key: str = "model",
+) -> None:
+    """Manual conversion with filtering (e.g., extract only model, skip optimizer)."""
+    from torch.distributed.checkpoint import FileSystemReader
+    from torch.distributed.checkpoint.metadata import Metadata
+
+    # Read metadata to get tensor names and shapes
+    reader = FileSystemReader(dcp_dir)
+    metadata = reader.read_metadata()
+
+    # Build empty state dict with correct shapes
+    state_dict = {}
+    for fqn, tensor_meta in metadata.state_dict_metadata.items():
+        if fqn.startswith(model_key):
+            # Create empty tensor with global shape
+            state_dict[fqn] = torch.empty(
+                tensor_meta.size, dtype=tensor_meta.properties.dtype
+            )
+
+    # Load into the empty state dict (DCP assembles from shards)
+    dcp.load(state_dict, checkpoint_id=dcp_dir, no_dist=True)
+
+    # Strip the "model." prefix for clean state dict keys
+    clean_state = {k.replace(f"{model_key}.", "", 1): v for k, v in state_dict.items()}
+
+    torch.save(clean_state, output_path)
+    print(f"Saved model-only state dict ({len(clean_state)} keys) to {output_path}")
+
+
+if __name__ == "__main__":
+    import sys
+    convert_dcp_to_full(sys.argv[1], sys.argv[2])
+</code></pre>
+
+<h2>Loading a Full Checkpoint INTO FSDP2</h2>
+
+<p>The reverse direction: you have a pretrained model (single .pt file from timm/HuggingFace) and want to fine-tune with FSDP2:</p>
+
+<pre><code class="language-python">def load_pretrained_into_fsdp2(
+    model: torch.nn.Module,
+    pretrained_path: str,
+) -> None:
+    """
+    Load a non-sharded pretrained checkpoint into an FSDP2 model.
+
+    Key: Load on CPU, then FSDP2's distribute_tensor handles sharding.
+
+    Call BEFORE fully_shard() — load into the unsharded model on CPU,
+    then shard it.
+    """
+    # Load full state dict on CPU
+    state_dict = torch.load(pretrained_path, map_location="cpu", weights_only=True)
+
+    # Load into model (still on CPU, not yet sharded)
+    model.load_state_dict(state_dict, strict=False)
+    # strict=False: ok if pretrained has different head (fine-tuning)
+
+    if dist.get_rank() == 0:
+        print(f"[Load] Pretrained weights from {pretrained_path}")
+
+    # Now shard the model (AFTER loading pretrained weights)
+    # fully_shard() will distribute the loaded weights across ranks
+    return model
+
+
+# Usage:
+model = timm.create_model("vit_huge_patch14_224", pretrained=False, num_classes=1000)
+model = load_pretrained_into_fsdp2(model, "pretrained_vit_huge.pt")
+model.set_grad_checkpointing(enable=True)
+for block in model.blocks:
+    fully_shard(block, mesh=mesh, mp_policy=mp_policy)
+fully_shard(model, mesh=mesh, mp_policy=mp_policy)
+</code></pre>
+
+<div class="callout">
+    <strong>Alternative: Load directly into sharded model.</strong> If CPU RAM is too small for the full model (not the case for ViT-Huge, but relevant for multi-billion param models), you can convert the pretrained .pt to DCP format first (using the offline converter), then load via <code>dcp.load()</code> into the already-sharded model. This avoids ever materializing the full model on any single node.
+</div>
+
+<h2>Checkpoint Performance: Async Saving</h2>
+
+<p>Checkpoint saving blocks training. For large models, this can be seconds per checkpoint. Async saving overlaps checkpoint I/O with the next training steps:</p>
+
+<pre><code class="language-python">from torch.distributed.checkpoint import async_save
+
+
+def save_checkpoint_async(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    step: int,
+    checkpoint_dir: str,
+) -> "Future":
+    """
+    Non-blocking checkpoint save. Returns a future.
+    Training can continue immediately while I/O happens in background.
+
+    IMPORTANT: Must call future.result() before the NEXT save
+    to ensure previous save completed.
+    """
+    state_dict = {
+        "model": get_model_state_dict(model),
+        "optimizer": get_optimizer_state_dict(model, optimizer),
+        "train_state": {"epoch": epoch, "step": step},
+    }
+
+    # async_save returns immediately; I/O happens in background threads
+    future = async_save(state_dict, checkpoint_id=checkpoint_dir)
+
+    return future
+
+
+# Usage in training loop:
+save_future = None
+
+for step in range(num_steps):
+    # ... training step ...
+
+    if step % save_interval == 0:
+        # Wait for previous save to complete (if any)
+        if save_future is not None:
+            save_future.result()  # Blocks until previous save done
+
+        # Start new async save
+        save_dir = f"./checkpoints/step_{step:07d}"
+        save_future = save_checkpoint_async(model, optimizer, epoch, step, save_dir)
+        # Training continues immediately!
+
+# Final: ensure last save completes
+if save_future is not None:
+    save_future.result()
+</code></pre>
+
+<div class="callout warning">
+    <strong>Async save caveat:</strong> The state dict tensors are <em>captured by reference</em> at the time of the async_save call. If the optimizer modifies parameter values before the I/O completes, you might save inconsistent state. In practice, DCP makes copies of the tensor data before returning the future, so this is safe. But verify this behavior for your PyTorch version — the exact semantics have evolved across releases.
+</div>
+
+<h2>Filesystem Considerations for HPC</h2>
+
+<pre><code class="language-python"># Checkpoint storage on your Slurm cluster:
+
+# Option A: Parallel filesystem (Lustre, GPFS, BeeGFS)
+# + All nodes can write simultaneously
+# + Good aggregate bandwidth
+# - Metadata operations (mkdir, stat) can be slow
+# - Many small files perform poorly
+# DCP recommendation: use this for production checkpoints.
+# DCP writes N large files (one per rank) → good bandwidth utilization.
+CHECKPOINT_DIR = "/lustre/project/fsdp2_checkpoints/"
+
+# Option B: Node-local NVMe (fastest write, but not shared)
+# + Very fast I/O (3+ GB/s per node)
+# - Not accessible from other nodes
+# - Lost if node fails
+# Use only for temporary checkpoints (e.g., preemption recovery)
+LOCAL_CHECKPOINT_DIR = "/local/tmp/checkpoints/"
+
+# Option C: Shared NFS (worst option for large distributed checkpoints)
+# - Single server bottleneck
+# - N ranks writing simultaneously → thrashing
+# Avoid for training checkpoints. Ok for small final exports.
+
+# Performance expectations for ViT-Huge (4 GPUs, ~2.5 GB total checkpoint):
+#   Lustre (parallel): ~2-4 seconds per save
+#   Local NVMe: < 1 second per save
+#   NFS: 5-15 seconds per save (avoid!)
+</code></pre>
+
+<pre><code class="language-python"># Robust checkpoint saving pattern for Slurm (handles preemption):
+
+import signal
+import functools
+
+
+def setup_preemption_handler(
+    model, optimizer, checkpoint_dir, epoch, step
+):
+    """
+    Save checkpoint when Slurm sends SIGTERM (preemption signal).
+    Slurm gives ~30-120s grace period before killing the job.
+    """
+    def handler(signum, frame, model=model, optimizer=optimizer):
+        if dist.get_rank() == 0:
+            print("[PREEMPT] Received SIGTERM — saving emergency checkpoint...")
+
+        save_dir = f"{checkpoint_dir}/preempt_step_{step}"
+        save_checkpoint(model, optimizer, epoch, step, save_dir)
+
+        if dist.get_rank() == 0:
+            print(f"[PREEMPT] Emergency checkpoint saved to {save_dir}")
+
+        dist.destroy_process_group()
+        exit(0)
+
+    signal.signal(signal.SIGTERM, handler)
+    # Also handle SIGUSR1 (some clusters use this for preemption warning)
+    signal.signal(signal.SIGUSR1, handler)
+</code></pre>
+
+<h2>Common Checkpointing Patterns</h2>
+
+<table>
+    <thead>
+    <tr><th>Scenario</th><th>Pattern</th><th>DCP API</th></tr>
+    </thead>
+    <tbody>
+    <tr>
+        <td>Periodic training checkpoints</td>
+        <td>Save every N steps, keep last K</td>
+        <td><code>dcp.save()</code></td>
+    </tr>
+    <tr>
+        <td>Resume after preemption</td>
+        <td>Load latest checkpoint, skip processed batches</td>
+        <td><code>dcp.load()</code> (handles resharding)</td>
+    </tr>
+    <tr>
+        <td>Scale up (4 GPU → 8 GPU)</td>
+        <td>Load 4-GPU checkpoint into 8-GPU setup</td>
+        <td><code>dcp.load()</code> (automatic resharding)</td>
+    </tr>
+    <tr>
+        <td>Export for inference</td>
+        <td>Gather full state dict or offline convert</td>
+        <td><code>get_model_state_dict(full_state_dict=True)</code></td>
+    </tr>
+    <tr>
+        <td>Load pretrained into FSDP2</td>
+        <td>Load .pt on CPU → then fully_shard()</td>
+        <td>Standard <code>torch.load()</code> + <code>load_state_dict()</code></td>
+    </tr>
+    <tr>
+        <td>Fine-tune subset of layers</td>
+        <td>Load full pretrained, freeze layers, shard only trainable</td>
+        <td><code>torch.load()</code> → freeze → <code>fully_shard()</code></td>
+    </tr>
+    </tbody>
+</table>
+
+<h2>Verifying Checkpoint Correctness</h2>
+
+<pre><code class="language-python">def verify_checkpoint(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    checkpoint_dir: str,
+    local_rank: int,
+) -> None:
+    """
+    Verify save/load round-trip produces identical state.
+    Call after model + optimizer are fully configured.
+    """
+    # Save current state
+    save_checkpoint(model, optimizer, epoch=0, step=0, checkpoint_dir=checkpoint_dir)
+
+    # Record current param values
+    pre_load_params = {
+        name: p._local_tensor.clone() if hasattr(p, '_local_tensor') else p.clone()
+        for name, p in model.named_parameters()
+    }
+
+    # Perturb parameters (simulate continued training)
+    with torch.no_grad():
+        for p in model.parameters():
+            if hasattr(p, '_local_tensor'):
+                p._local_tensor.add_(torch.randn_like(p._local_tensor))
+            else:
+                p.add_(torch.randn_like(p))
+
+    # Reload checkpoint
+    load_checkpoint(model, optimizer, checkpoint_dir)
+
+    # Verify params match pre-save values
+    max_diff = 0.0
+    for name, p in model.named_parameters():
+        local = p._local_tensor if hasattr(p, '_local_tensor') else p
+        diff = (local - pre_load_params[name]).abs().max().item()
+        max_diff = max(max_diff, diff)
+
+    if local_rank == 0:
+        assert max_diff == 0.0, f"Checkpoint round-trip failed! Max diff: {max_diff}"
+        print(f"[Verify] Checkpoint round-trip correct (max diff: {max_diff})")
+</code></pre>
+
+<h2 id="quiz">Check Your Understanding</h2>
+
+<div class="quiz">
+    <h3>Q1: You trained ViT-Huge on 4 GPUs and saved a DCP checkpoint. Now you want to resume on 8 GPUs. What do you need to change in your code?</h3>
+    <button onclick="checkAnswer(this, true)">Nothing — call dcp.load() with the 8-GPU sharded model pointing to the 4-GPU checkpoint directory; DCP reshards automatically</button>
+    <button onclick="checkAnswer(this, false)">Convert the checkpoint from 4-shard to 8-shard format using a conversion script before loading</button>
+    <button onclick="checkAnswer(this, false)">Load the 4-GPU checkpoint on 4 GPUs, export to full state dict, then reload on 8 GPUs</button>
+    <button onclick="checkAnswer(this, false)">Use a special flag: dcp.load(..., reshard=True) to enable cross-topology loading</button>
+    <div class="explanation">
+        <strong>Correct.</strong> DCP handles resharding transparently. It reads the .metadata file to learn the original sharding layout (4 shards), then computes what each of the 8 new ranks needs, reading appropriate byte ranges from the shard files. Your code is identical — just call <code>dcp.load(state_dict, checkpoint_id=checkpoint_dir)</code> with the model already sharded on 8 GPUs. DCP figures out the rest.
+    </div>
+</div>
+
+<div class="quiz">
+    <h3>Q2: With HSDP (2 replicas × 4 shards), how many unique shard files does DCP write to disk?</h3>
+    <button onclick="checkAnswer(this, false)">8 files — one per rank, with replicated data duplicated across replica groups</button>
+    <button onclick="checkAnswer(this, true)">4 files — DCP deduplicates the replicated shards, writing only one copy per unique shard</button>
+    <button onclick="checkAnswer(this, false)">2 files — one per replica group, each containing all 4 shards for that group</button>
+    <button onclick="checkAnswer(this, false)">1 file — DCP gathers everything to rank 0 before writing regardless of topology</button>
+    <div class="explanation">
+        <strong>Correct.</strong> In HSDP, ranks 0-3 (replica 0) hold the same data as ranks 4-7 (replica 1). DCP detects the Replicate() placement on mesh dimension 0 and writes only one copy of each unique shard. The result is 4 shard files + metadata — identical in structure to a 1-D 4-GPU checkpoint. On load, DCP replicates to both groups.
+    </div>
+</div>
+
+<div class="quiz">
+    <h3>Q3: Why must you call <code>dcp.save()</code> from ALL ranks, not just rank 0?</h3>
+    <button onclick="checkAnswer(this, false)">Rank 0 doesn't have enough CPU memory to assemble the full state dict from all shards</button>
+    <button onclick="checkAnswer(this, true)">Each rank writes its own shard file to disk independently — the operation is distributed, and metadata coordination requires collective communication</button>
+    <button onclick="checkAnswer(this, false)">DCP uses a voting mechanism across ranks to verify checkpoint integrity before finalizing</button>
+    <button onclick="checkAnswer(this, false)">Only rank 0 actually writes to disk, but other ranks must call save() to release their NCCL resources</button>
+    <div class="explanation">
+        <strong>Correct.</strong> DCP is a parallel I/O operation. Each rank writes its own shard (its local portion of model + optimizer state) to a separate file. Additionally, all ranks participate in creating the metadata file (which requires knowing everyone's shard boundaries — a collective operation). If rank 0 called save() alone, it would only write 1/N of the data and hang waiting for metadata from other ranks.
+    </div>
+</div>
+
+<div class="quiz">
+    <h3>Q4: You want to deploy your FSDP2-trained ViT-Huge for inference on a single GPU. What's the simplest path?</h3>
+    <button onclick="checkAnswer(this, false)">Load the DCP checkpoint into a 1-GPU FSDP2 model (mesh size 1) and run inference with FSDP2 active</button>
+    <button onclick="checkAnswer(this, true)">Use get_model_state_dict with full_state_dict=True and cpu_offload=True on rank 0, save as standard .pt, then load normally for inference</button>
+    <button onclick="checkAnswer(this, false)">Write a custom script that reads all shard files and concatenates tensors along dimension 0 manually</button>
+    <button onclick="checkAnswer(this, false)">Use dcp_to_torch_save() offline converter then load the resulting file with torch.load() on the inference GPU</button>
+    <div class="explanation">
+        <strong>Correct.</strong> For a model that fits on a single GPU (ViT-Huge: 2.4 GB fp32), the simplest path is <code>get_model_state_dict(model, StateDictOptions(full_state_dict=True, cpu_offload=True))</code> which gathers the full state dict to rank 0's CPU. Save that as a .pt file and load it normally anywhere. Answer D is also valid (offline conversion without distributed runtime), but requires additional tooling. Answer A works but is unnecessary overhead for inference.
+    </div>
+</div>
+
+<h2>Key Takeaways</h2>
+<ol>
+    <li><strong>DCP saves a directory of shard files + metadata.</strong> Each rank writes independently. No gathering. No single-point bottleneck.</li>
+    <li><strong>Resharding on load is automatic.</strong> Save with 4 GPUs, load with 8 GPUs — DCP reads metadata and fetches the right bytes. Zero code changes.</li>
+    <li><strong>HSDP deduplication:</strong> replicated shards are written once, not N times. Checkpoint size matches the unique data, not total GPU count.</li>
+    <li><strong><code>dcp.save()</code> and <code>dcp.load()</code> are collective.</strong> All ranks must call them. Calling from only rank 0 → deadlock.</li>
+    <li><strong>Use <code>get_model_state_dict(full_state_dict=True)</code> for export.</strong> Gathers to rank 0 for inference deployment.</li>
+    <li><strong>Async save</strong> (<code>async_save</code>) overlaps checkpoint I/O with training — minimizes checkpoint-induced stalls.</li>
+    <li><strong>Loading pretrained into FSDP2:</strong> load on CPU first (standard <code>torch.load</code> + <code>load_state_dict</code>), THEN <code>fully_shard()</code>.</li>
+    <li><strong>For HPC/Slurm:</strong> use parallel filesystem (Lustre), handle preemption via SIGTERM handler, keep last N checkpoints.</li>
+</ol>
+
+<h2>Primary Source</h2>
+<p>Read the <a href="https://pytorch.org/docs/stable/distributed.checkpoint.html">PyTorch Distributed Checkpoint documentation</a> — specifically the "Getting Started" and "Saving and Loading" sections. Then study <a href="https://github.com/pytorch/torchtitan/blob/main/torchtitan/checkpoint.py">torchtitan's checkpoint.py</a> for the production pattern (async save, training state tracking, cleanup). The <a href="https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html">DCP Recipe</a> provides additional examples of resharding and format conversion.</p>
+
+
+
+<script>
+    function checkAnswer(btn, correct) {
+        const quiz = btn.closest('.quiz');
+        const buttons = quiz.querySelectorAll('button');
+        const explanation = quiz.querySelector('.explanation');
+        buttons.forEach(b => { b.disabled = true; b.classList.remove('correct', 'incorrect'); });
+        if (correct) {
+            btn.classList.add('correct');
+        } else {
+            btn.classList.add('incorrect');
+            buttons.forEach(b => { if (b.getAttribute('onclick').includes('true')) b.classList.add('correct'); });
+        }
+        explanation.style.display = 'block';
+    }
+</script>

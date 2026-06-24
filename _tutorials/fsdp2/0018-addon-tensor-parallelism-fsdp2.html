@@ -1,0 +1,402 @@
+---
+layout: tutorial
+tutorial: fsdp2
+type: lesson
+lesson: 18
+total: 18
+title: "Tensor Parallelism + FSDP2 Composition"
+tags: [Add-On, Advanced, Tensor Parallelism]
+permalink: /heap/fsdp2/0018/
+---
+
+<p><em>When a single layer doesn't fit on one GPU, you split the operation itself — and compose this with FSDP2 via multi-dimensional meshes.</em></p>
+
+<h2>When You Need Tensor Parallelism</h2>
+
+<p>FSDP2 shards parameters <strong>at rest</strong> and reconstructs them for compute. This means each GPU must temporarily hold an entire FSDP unit's parameters (one block) during forward/backward. If a single layer's parameters exceed GPU memory:</p>
+
+<pre><code class="language-python"># Example: Llama-65B attention layer
+# hidden_dim = 8192, num_heads = 64, head_dim = 128
+# Q/K/V projections: 3 × [8192, 8192] = 3 × 256 MB (fp16) = 768 MB per layer
+# MLP: [8192, 22016] + [22016, 8192] = 344 MB + 344 MB = 688 MB
+# Total per block in fp16: ~1.5 GB (one block!)
+#
+# On V100-32GB: 1.5 GB unsharded block is fine.
+# But for Llama-405B (hidden=16384, MLP=53248):
+#   MLP alone: [16384, 53248] × 2 bytes = 1.7 GB for ONE weight matrix
+#   One block: ~6 GB unsharded
+#   → Exceeds what a V100 can hold alongside activations
+
+# FSDP2 alone can't help: it must unshard the FULL block for compute.
+# Tensor Parallelism splits the OPERATION across GPUs — each GPU
+# computes part of the matrix multiply, never holding the full weight.
+</code></pre>
+
+<div class="callout">
+    <strong>Rule of thumb:</strong> If your largest single FSDP unit (typically one transformer block) exceeds ~30% of GPU memory when unsharded in fp16, you need tensor parallelism. For V100-32GB: blocks up to ~8 GB are fine. For ViT-Huge: blocks are ~38 MB — no TP needed. For Llama-70B+: TP is required.
+</div>
+
+<h2>How Tensor Parallelism Works</h2>
+
+<div class="diagram">
+    Standard (no TP): one GPU holds full weight, computes full output
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    Input: [batch, seq, hidden]              ← Full on one GPU
+    Weight: [hidden, 4×hidden]               ← Full on one GPU
+    Output: input @ weight = [batch, seq, 4×hidden]  ← Full output
+
+    Column-Parallel TP (2 GPUs): split weight along OUTPUT dimension
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    GPU 0:  Input (replicated) @ Weight[:, :2×hidden] → Output[:, :2×hidden]
+    GPU 1:  Input (replicated) @ Weight[:, 2×hidden:] → Output[:, 2×hidden:]
+
+    Each GPU holds HALF the weight and produces HALF the output.
+    For downstream use: either keep split, or all-gather the outputs.
+
+    Row-Parallel TP (2 GPUs): split weight along INPUT dimension
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    GPU 0:  Input[:, :hidden/2] @ Weight[:hidden/2, :] → Partial output
+    GPU 1:  Input[:, hidden/2:] @ Weight[hidden/2:, :] → Partial output
+
+    Each GPU holds HALF the weight, computes a PARTIAL sum.
+    Final output = all-reduce(partial_0 + partial_1)
+</div>
+    </code></pre>
+
+    <h3>TP Applied to a Transformer Block (Megatron-Style)</h3>
+
+    <div class="diagram">
+        MLP with Tensor Parallelism (2-way):
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+        Input x: [batch, seq, H]  (replicated on both GPUs)
+
+        FC1 (Column-parallel):
+        GPU 0: x @ W1[:, :2H]  → [batch, seq, 2H]  (half of intermediate)
+        GPU 1: x @ W1[:, 2H:]  → [batch, seq, 2H]  (other half)
+
+        GELU: applied locally (no communication)
+
+        FC2 (Row-parallel):
+        GPU 0: gelu_0 @ W2[:2H, :]  → partial output [batch, seq, H]
+        GPU 1: gelu_1 @ W2[2H:, :]  → partial output [batch, seq, H]
+
+        All-reduce: output = partial_0 + partial_1  ← ONE all-reduce per MLP
+
+        Communication: 1 all-reduce per MLP (vs 0 without TP)
+        Memory: each GPU holds only HALF of W1 and W2
+    </div>
+        </code></pre>
+
+        <h2>Composing TP with FSDP2: The 3-D Mesh</h2>
+
+        <p>TP and FSDP2 operate on <strong>different mesh dimensions</strong>. You need a 3-D (or at least 2-D) mesh that separates the TP group from the FSDP group:</p>
+
+        <pre><code class="language-python">from torch.distributed.device_mesh import init_device_mesh
+
+# 8 GPUs: 2-way TP × 4-way FSDP
+# TP group: GPUs that split a single operation (need FAST link — NVLink)
+# FSDP group: GPUs that shard parameters (can be any link)
+
+mesh_2d = init_device_mesh(
+    "cuda",
+    (4, 2),  # (FSDP shard group size, TP group size)
+    mesh_dim_names=("dp", "tp"),
+)
+
+# Rank layout (8 GPUs, 2 nodes × 4 GPUs/node):
+#   TP pairs: [0,1], [2,3], [4,5], [6,7]  ← NVLink within each pair
+#   FSDP groups: [0,2,4,6], [1,3,5,7]     ← across TP peers
+
+# Or full 3-D: (replicate, FSDP-shard, TP)
+# For 32 GPUs: (4 replicas, 4 FSDP-shards, 2 TP-ranks)
+mesh_3d = init_device_mesh(
+    "cuda",
+    (4, 4, 2),
+    mesh_dim_names=("replicate", "shard", "tp"),
+)
+</code></pre>
+
+        <div class="diagram">
+            3-D Mesh: (2 replicas × 2 FSDP shards × 2 TP ranks) = 8 GPUs
+            ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+            TP rank 0          TP rank 1
+            ─────────          ─────────
+            FSDP shard 0: [GPU0]             [GPU1]       ← TP pair, NVLink
+            FSDP shard 1: [GPU2]             [GPU3]       ← TP pair, NVLink
+            ├── Replica 0 ────────────────┤
+
+            FSDP shard 0: [GPU4]             [GPU5]       ← TP pair, NVLink
+            FSDP shard 1: [GPU6]             [GPU7]       ← TP pair, NVLink
+            ├── Replica 1 ────────────────┤
+
+            Communication:
+            TP (dim 2):        all-reduce within [0,1], [2,3], [4,5], [6,7] — NVLink
+            FSDP (dim 1):     all-gather/reduce-scatter within [0,2], [1,3], [4,6], [5,7]
+            Replicate (dim 0): gradient all-reduce within [0,4], [1,5], [2,6], [3,7] — IB
+        </div>
+            </code></pre>
+
+            <h2>Applying TP with PyTorch's API</h2>
+
+            <pre><code class="language-python">from torch.distributed.tensor.parallel import (
+    parallelize_module,
+    ColwiseParallel,
+    RowwiseParallel,
+    PrepareModuleInput,
+)
+
+
+def apply_tp_to_transformer_block(block, tp_mesh):
+    """
+    Apply Megatron-style tensor parallelism to a transformer block.
+
+    Pattern:
+      Attention Q/K/V projections: Column-parallel (split heads across GPUs)
+      Attention output projection: Row-parallel (reduce across GPUs)
+      MLP FC1: Column-parallel (split intermediate dim)
+      MLP FC2: Row-parallel (reduce back to hidden dim)
+    """
+    parallelize_module(
+        block,
+        tp_mesh,
+        parallelize_plan={
+            # Attention
+            "attn.qkv": ColwiseParallel(),    # Split Q,K,V across TP ranks
+            "attn.proj": RowwiseParallel(),   # Reduce attention output
+            # MLP
+            "mlp.fc1": ColwiseParallel(),     # Split intermediate
+            "mlp.fc2": RowwiseParallel(),     # Reduce back
+        },
+    )
+    return block
+
+
+def apply_tp_fsdp2_combined(model, mesh_3d):
+    """
+    Apply TP first, then FSDP2. Order matters.
+    TP modifies the module (splits weights). FSDP2 then shards the split weights.
+    """
+    tp_mesh = mesh_3d["tp"]         # 1-D sub-mesh for TP
+    dp_mesh = mesh_3d["dp", "shard"]  # 2-D sub-mesh for FSDP (if using HSDP)
+    # OR for simpler 2-D: dp_mesh = mesh_3d["dp"]
+
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=torch.float16,
+        reduce_dtype=torch.float32,
+    )
+
+    for block in model.layers:
+        # 1. Apply TP (splits weights across TP group)
+        apply_tp_to_transformer_block(block, tp_mesh)
+
+        # 2. Apply FSDP2 (shards the TP-split weights across FSDP group)
+        fully_shard(block, mesh=dp_mesh, mp_policy=mp_policy)
+
+    # Root
+    fully_shard(model, mesh=dp_mesh, mp_policy=mp_policy)
+
+    return model
+</code></pre>
+
+            <div class="callout warning">
+                <strong>Order: TP first, FSDP2 second.</strong> TP modifies parameter shapes (splits them). FSDP2 then shards these already-split parameters. If you reversed the order, FSDP2 would shard the full parameter, and TP would try to split an already-sharded DTensor — which doesn't work correctly.
+            </div>
+
+            <h2>Memory and Communication Analysis</h2>
+
+            <pre><code class="language-python"># Example: Llama-70B, 32 GPUs, mesh (4, 4, 2) = (replicate, FSDP, TP)
+#
+# Per-block parameters: ~1.5 GB (fp16)
+# With 2-way TP: each GPU holds 750 MB per block (half the weights)
+# With 4-way FSDP on top: each GPU holds 750/4 = 187.5 MB per block at rest
+# Unsharded during compute: 750 MB (half-weight, after FSDP all-gather)
+#
+# Communication per block:
+#   TP: 1 all-reduce of [batch, seq, hidden] per MLP + 1 per attention = 2 all-reduces
+#       Data: batch × seq × hidden × 2 bytes = 16 × 4096 × 8192 × 2 = ~1 GB
+#       Link: NVLink (within TP pair) — fast
+#   FSDP: all-gather of 750 MB (fp32) + reduce-scatter of 750 MB
+#       Link: depends on FSDP topology (NVLink or IB)
+#
+# Total per-GPU memory:
+#   Model-prop: 70B × 16 / (4 FSDP × 2 TP) = 70B × 16 / 8 = 134 GB...
+#   Wait — 70B params × 16 bytes / 8 GPUs_sharing = 134 GB per GPU
+#   That's still way too much for V100-32GB!
+#
+#   With all 32 GPUs sharing (dp=4, fsdp=4, tp=2):
+#   70B × 16 / 32 = 33.6 GB per GPU (model-prop only!)
+#   → Doesn't fit on V100. Need A100-80GB for 70B models.
+#
+# For V100-32GB: TP is useful for models in the 3-10B range
+# where FSDP alone has tight unsharding headroom.
+</code></pre>
+
+            <h2>When TP Helps on V100</h2>
+
+            <table>
+                <thead>
+                <tr><th>Model size</th><th>FSDP only (4 GPUs)</th><th>FSDP + TP-2 (4 GPUs = 2 FSDP × 2 TP)</th><th>Benefit</th></tr>
+                </thead>
+                <tbody>
+                <tr>
+                    <td>632M (ViT-Huge)</td>
+                    <td>Block unshard: 38 MB ✓</td>
+                    <td>Unnecessary — blocks are tiny</td>
+                    <td>None</td>
+                </tr>
+                <tr>
+                    <td>3B (ViT-22B subset)</td>
+                    <td>Block unshard: ~180 MB ✓</td>
+                    <td>Unnecessary — still fits easily</td>
+                    <td>None</td>
+                </tr>
+                <tr>
+                    <td>7B (Llama-7B)</td>
+                    <td>Block unshard: ~500 MB ✓</td>
+                    <td>Block unshard: ~250 MB</td>
+                    <td>Marginal — saves 250 MB headroom for activations</td>
+                </tr>
+                <tr>
+                    <td>13B (Llama-13B)</td>
+                    <td>Block unshard: ~900 MB 🔶</td>
+                    <td>Block unshard: ~450 MB ✓</td>
+                    <td>Meaningful — frees 450 MB for batch size</td>
+                </tr>
+                </tbody>
+            </table>
+
+            <div class="callout">
+                <strong>For your V100 cluster:</strong> TP becomes relevant only if you train models ≥ 7B parameters. For ViT-Huge (632M) and even a 3B vision model, FSDP2 alone handles everything. TP adds communication overhead (all-reduce per layer) that's only justified when the memory savings are necessary.
+            </div>
+
+            <h2>The Key Trade-Off: TP Communication Cost</h2>
+
+            <pre><code class="language-python"># TP adds all-reduce INSIDE the forward/backward computation
+# (not overlappable — it's on the critical path)
+#
+# FSDP communication: overlappable with compute (prefetch)
+# TP communication: NOT overlappable (output needed immediately for next op)
+#
+# This is why TP should use the FASTEST link (NVLink within a node)
+# and its group size should be small (2 or 4 — not 8)
+#
+# Performance model:
+#   Without TP: compute_time + (FSDP_comm, overlapped)
+#   With TP-2:  compute_time/2 + TP_allreduce_time + (FSDP_comm, overlapped)
+#
+# TP only helps throughput if: compute_savings > TP_comm_cost
+# For large hidden dims (8192+) on NVLink: usually yes
+# For small hidden dims (1280 ViT-Huge) on NVLink: NO — overhead dominates
+</code></pre>
+
+            <h2>Practical Implementation Reference (torchtitan Pattern)</h2>
+
+            <pre><code class="language-python"># The canonical TP + FSDP2 implementation is in torchtitan.
+# Simplified version of their approach:
+
+def parallelize_llama(model, world_mesh):
+    """
+    From torchtitan: apply TP then FSDP2 to Llama.
+    world_mesh: DeviceMesh with dims ("dp", "tp") or ("dp", "fsdp", "tp")
+    """
+    tp_mesh = world_mesh["tp"]
+    dp_mesh = world_mesh["dp"]  # or world_mesh["dp", "fsdp"] for HSDP
+
+    # TP plans per layer type
+    layer_plan = {
+        "attention.wq": ColwiseParallel(),
+        "attention.wk": ColwiseParallel(),
+        "attention.wv": ColwiseParallel(),
+        "attention.wo": RowwiseParallel(),
+        "feed_forward.w1": ColwiseParallel(),
+        "feed_forward.w2": RowwiseParallel(),
+        "feed_forward.w3": ColwiseParallel(),
+    }
+
+    for layer in model.layers:
+        # TP first
+        parallelize_module(layer, tp_mesh, layer_plan)
+        # FSDP second
+        fully_shard(layer, mesh=dp_mesh, mp_policy=mp_policy)
+
+    # Handle embedding and output (these have special TP treatment)
+    parallelize_module(
+        model, tp_mesh,
+        {"tok_embeddings": RowwiseParallel(), "output": ColwiseParallel()}
+    )
+    fully_shard(model, mesh=dp_mesh, mp_policy=mp_policy)
+</code></pre>
+
+            <h2>Decision Framework: When to Add TP</h2>
+
+            <div class="diagram">
+                Do you need Tensor Parallelism?
+                ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+                Single block unsharded (fp16) < 25% of GPU memory?
+                │
+                ├── YES → Don't use TP. FSDP2 alone is sufficient.
+                │         (ViT-Huge, ViT-22B, models up to ~3B on V100)
+                │
+                └── NO → Does adding TP-2 bring it under 25%?
+                │
+                ├── YES → Use TP-2 (2-way) on NVLink pairs + FSDP for rest
+                │         (7B-13B models on V100)
+                │
+                └── NO → Need TP-4 or larger GPUs (A100/H100)
+                (70B+ models — not feasible on V100)
+            </div>
+                </code></pre>
+
+                <h2>Summary: The Full Parallelism Stack</h2>
+
+                <table>
+                    <thead>
+                    <tr><th>Technique</th><th>What it splits</th><th>Communication</th><th>When to use</th></tr>
+                    </thead>
+                    <tbody>
+                    <tr>
+                        <td><strong>Data Parallel (DDP)</strong></td>
+                        <td>Data (batch) across GPUs</td>
+                        <td>All-reduce gradients</td>
+                        <td>Model fits on one GPU</td>
+                    </tr>
+                    <tr>
+                        <td><strong>FSDP2</strong></td>
+                        <td>Parameters + optimizer at rest</td>
+                        <td>All-gather before compute, reduce-scatter after</td>
+                        <td>Model state doesn't fit; individual layers still fit</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Tensor Parallel</strong></td>
+                        <td>Individual operations (matmul)</td>
+                        <td>All-reduce within each layer's forward</td>
+                        <td>Single layer doesn't fit on one GPU</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Pipeline Parallel</strong></td>
+                        <td>Model layers across stages</td>
+                        <td>Point-to-point between stages</td>
+                        <td>Very deep models; high inter-node latency</td>
+                    </tr>
+                    <tr>
+                        <td><strong>FSDP2 + TP (composed)</strong></td>
+                        <td>TP splits layer; FSDP shards the split pieces</td>
+                        <td>TP all-reduce + FSDP all-gather/reduce-scatter</td>
+                        <td>10B+ params where individual layers are large</td>
+                    </tr>
+                    </tbody>
+                </table>
+
+                <div class="callout success">
+                    <strong>For your current work (ViT-Huge, defect detection, remote sensing on V100):</strong> FSDP2 alone covers all your needs. TP is relevant only when you scale to LLM-class models (7B+) or very large vision backbones (ViT-22B). The knowledge here is future-proofing for when you move to A100/H100 clusters or tackle foundation model training. When that day comes, the composition pattern (TP first on NVLink pairs, FSDP2 second across the rest) is the standard approach — as implemented in torchtitan.
+                </div>
+
+                <h2>Primary Source</h2>
+                <p><a href="https://github.com/pytorch/torchtitan/blob/main/torchtitan/parallelisms/parallelize_llama.py">torchtitan parallelize_llama.py</a> — the canonical implementation of TP + FSDP2 composition. For the theory: <a href="https://arxiv.org/abs/1909.08053">Megatron-LM paper</a> (Shoeybi et al., 2019) defines column/row parallelism for transformers. PyTorch's <a href="https://pytorch.org/docs/stable/distributed.tensor.parallel.html">Tensor Parallel API docs</a> cover ColwiseParallel/RowwiseParallel.</p>
+

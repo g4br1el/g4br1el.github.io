@@ -1,0 +1,932 @@
+---
+layout: tutorial
+tutorial: fsdp2
+type: lesson
+lesson: 9
+total: 18
+title: "HSDP: Hybrid Sharding on Your NVLink/IB Cluster"
+tags: [Performance, Multi-Node]
+permalink: /heap/fsdp2/009/
+---
+
+<p><em>A complete multi-node training script with topology-aware sharding, plus benchmarking to prove HSDP wins.</em></p>
+
+<h2>Recap: Why HSDP</h2>
+
+<p>From Lessons 005 and 008, you have the full picture:</p>
+
+<ul>
+    <li><strong>1-D mesh across 2+ nodes:</strong> all-gathers cross InfiniBand → ratio drops to ~0.2× → communication exposed, throughput tanks</li>
+    <li><strong>2-D HSDP mesh:</strong> all-gathers stay on NVLink (intra-node) → ratio stays ~4.5× → communication hidden. Only gradient sync crosses InfiniBand, and it's only P/N_shard data.</li>
+</ul>
+
+<p>This lesson makes it concrete: a runnable multi-node script, a benchmarking harness that compares topologies, and the production patterns you'd use in the Fraunhofer framework.</p>
+
+<h2>The Complete Multi-Node HSDP Script</h2>
+
+<pre><code class="language-python">"""
+train_fsdp2_hsdp.py — ViT-Huge with HSDP on multi-node V100 cluster.
+
+Topology-aware: shards within NVLink domain, replicates across InfiniBand.
+
+Launch (2 nodes, 4 GPUs/node):
+    srun torchrun --nnodes=2 --nproc_per_node=4 \
+         --rdzv_id=$SLURM_JOB_ID --rdzv_backend=c10d \
+         --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
+         train_fsdp2_hsdp.py
+
+Requirements: torch >= 2.4.0, timm >= 1.0.0
+"""
+import os
+import time
+import json
+from dataclasses import dataclass, asdict
+from typing import Optional
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, DistributedSampler
+from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
+from torch.distributed.device_mesh import init_device_mesh, DeviceMesh
+import torch.distributed as dist
+
+import timm
+
+
+# ─── Configuration ────────────────────────────────────────────────────────────
+
+@dataclass
+class TrainConfig:
+    """Single source of truth for training configuration."""
+    # Model
+    model_name: str = "vit_huge_patch14_224"
+    num_classes: int = 1000
+
+    # Training
+    batch_size_per_gpu: int = 32
+    num_epochs: int = 3
+    lr: float = 1e-4
+    weight_decay: float = 0.05
+    max_grad_norm: float = 1.0
+
+    # Distributed
+    mesh_type: str = "auto"  # "auto", "1d", "hsdp"
+
+    # Precision
+    param_dtype: str = "float16"  # V100: fp16 only
+    reduce_dtype: str = "float32"
+
+    # Memory
+    activation_checkpointing: bool = True
+
+    # Benchmark
+    benchmark_steps: int = 30
+    warmup_steps: int = 5
+
+
+# ─── Distributed Setup ────────────────────────────────────────────────────────
+
+def setup_distributed() -> tuple[int, int, int, int]:
+    """Returns (local_rank, global_rank, world_size, local_world_size)."""
+    dist.init_process_group(backend="nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    global_rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", torch.cuda.device_count()))
+    torch.cuda.set_device(local_rank)
+    return local_rank, global_rank, world_size, local_world_size
+
+
+def create_device_mesh(
+    world_size: int,
+    local_world_size: int,
+    mesh_type: str = "auto",
+) -> DeviceMesh:
+    """
+    Create DeviceMesh based on cluster topology.
+
+    Args:
+        world_size: Total number of GPUs across all nodes
+        local_world_size: GPUs per node
+        mesh_type: "auto" (detect), "1d" (flat shard), "hsdp" (2-D hybrid)
+
+    Returns:
+        DeviceMesh appropriate for the topology
+    """
+    num_nodes = world_size // local_world_size
+
+    if mesh_type == "auto":
+        # Decision logic:
+        # - Single node → 1-D (no hierarchy to exploit)
+        # - Multi-node AND model fits in 1/local_world_size per GPU → HSDP
+        #   (For ViT-Huge: P×16/4 = 2.4 GB << 32 GB → HSDP is optimal)
+        mesh_type = "1d" if num_nodes == 1 else "hsdp"
+
+    if mesh_type == "1d":
+        mesh = init_device_mesh("cuda", (world_size,))
+        if dist.get_rank() == 0:
+            print(f"[Mesh] 1-D flat shard: {world_size} GPUs")
+
+    elif mesh_type == "hsdp":
+        assert num_nodes > 1, "HSDP requires multiple nodes"
+        mesh = init_device_mesh(
+            "cuda",
+            (num_nodes, local_world_size),
+            mesh_dim_names=("replicate", "shard"),
+        )
+        if dist.get_rank() == 0:
+            print(f"[Mesh] 2-D HSDP: {num_nodes} replicas × "
+                  f"{local_world_size} shards/replica")
+            print(f"  Shard communication: NVLink (intra-node)")
+            print(f"  Replica sync: InfiniBand (inter-node)")
+    else:
+        raise ValueError(f"Unknown mesh_type: {mesh_type}")
+
+    return mesh
+
+
+# ─── Model ────────────────────────────────────────────────────────────────────
+
+def build_model(cfg: TrainConfig) -> nn.Module:
+    """Build model on CPU with optional activation checkpointing."""
+    model = timm.create_model(
+        cfg.model_name,
+        pretrained=False,
+        num_classes=cfg.num_classes,
+    )
+
+    if cfg.activation_checkpointing:
+        model.set_grad_checkpointing(enable=True)
+
+    return model
+
+
+def apply_fsdp2(model: nn.Module, mesh: DeviceMesh, cfg: TrainConfig) -> nn.Module:
+    """Apply FSDP2 with topology-aware sharding."""
+    dtype_map = {"float16": torch.float16, "float32": torch.float32}
+
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=dtype_map[cfg.param_dtype],
+        reduce_dtype=dtype_map[cfg.reduce_dtype],
+    )
+
+    # Per-block sharding
+    for block in model.blocks:
+        fully_shard(block, mesh=mesh, mp_policy=mp_policy)
+
+    # Root module
+    fully_shard(model, mesh=mesh, mp_policy=mp_policy)
+
+    return model
+
+
+# ─── Data ─────────────────────────────────────────────────────────────────────
+
+class SyntheticImageDataset(torch.utils.data.Dataset):
+    """Synthetic data for benchmarking. Zero I/O overhead."""
+    def __init__(self, num_samples: int = 10_000, image_size: int = 224,
+                 num_classes: int = 1000):
+        self.num_samples = num_samples
+        self.image_size = image_size
+        self.num_classes = num_classes
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, int]:
+        image = torch.randn(3, self.image_size, self.image_size)
+        label = torch.randint(0, self.num_classes, (1,)).item()
+        return image, label
+
+
+def build_dataloader(cfg: TrainConfig, world_size: int, rank: int) -> DataLoader:
+    dataset = SyntheticImageDataset(num_samples=10_000, num_classes=cfg.num_classes)
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
+    return DataLoader(
+        dataset,
+        batch_size=cfg.batch_size_per_gpu,
+        sampler=sampler,
+        num_workers=4,
+        pin_memory=True,
+        drop_last=True,
+    )
+
+
+# ─── Training ─────────────────────────────────────────────────────────────────
+
+def train_step(
+    model: nn.Module,
+    images: torch.Tensor,
+    labels: torch.Tensor,
+    optimizer: torch.optim.Optimizer,
+    max_grad_norm: float,
+) -> float:
+    """Single training step. Returns loss value."""
+    outputs = model(images)
+    loss = nn.functional.cross_entropy(outputs, labels)
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+    optimizer.step()
+    optimizer.zero_grad()
+    return loss.item()
+
+
+def benchmark(
+    model: nn.Module,
+    dataloader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    cfg: TrainConfig,
+    local_rank: int,
+    world_size: int,
+) -> dict:
+    """
+    Run benchmark steps and collect timing statistics.
+    Returns metrics dict with step times, throughput, memory.
+    """
+    model.train()
+    data_iter = iter(dataloader)
+
+    # Warm-up (includes prefetch learning on step 1)
+    for _ in range(cfg.warmup_steps):
+        images, labels = next(data_iter)
+        images = images.to(local_rank, non_blocking=True)
+        labels = labels.to(local_rank, non_blocking=True)
+        train_step(model, images, labels, optimizer, cfg.max_grad_norm)
+
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    # Timed steps
+    step_times = []
+    losses = []
+
+    for step in range(cfg.benchmark_steps):
+        images, labels = next(data_iter)
+        images = images.to(local_rank, non_blocking=True)
+        labels = labels.to(local_rank, non_blocking=True)
+
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+
+        loss_val = train_step(model, images, labels, optimizer, cfg.max_grad_norm)
+
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+
+        step_times.append(t1 - t0)
+        losses.append(loss_val)
+
+    # Collect metrics
+    avg_step = sum(step_times) / len(step_times)
+    std_step = (sum((t - avg_step)**2 for t in step_times) / len(step_times)) ** 0.5
+    throughput = cfg.batch_size_per_gpu * world_size / avg_step
+    peak_mem_gb = torch.cuda.max_memory_allocated(local_rank) / 1e9
+
+    metrics = {
+        "avg_step_ms": avg_step * 1000,
+        "std_step_ms": std_step * 1000,
+        "throughput_img_per_sec": throughput,
+        "per_gpu_throughput": throughput / world_size,
+        "peak_memory_gb": peak_mem_gb,
+        "avg_loss": sum(losses) / len(losses),
+        "batch_size_per_gpu": cfg.batch_size_per_gpu,
+        "effective_batch_size": cfg.batch_size_per_gpu * world_size,
+        "world_size": world_size,
+        "step_times_ms": [t * 1000 for t in step_times],
+    }
+
+    return metrics
+
+
+# ─── Reporting ─────────────────────────────────────────────────────────────────
+
+def print_metrics(metrics: dict, mesh_type: str, rank: int) -> None:
+    """Pretty-print benchmark results."""
+    if rank != 0:
+        return
+
+    print("\n" + "═" * 60)
+    print(f"  BENCHMARK RESULTS — Mesh: {mesh_type}")
+    print("═" * 60)
+    print(f"  World size:           {metrics['world_size']} GPUs")
+    print(f"  Batch (per GPU):      {metrics['batch_size_per_gpu']}")
+    print(f"  Effective batch:      {metrics['effective_batch_size']}")
+    print(f"  Avg step time:        {metrics['avg_step_ms']:.2f} ± {metrics['std_step_ms']:.2f} ms")
+    print(f"  Throughput:           {metrics['throughput_img_per_sec']:.0f} img/s")
+    print(f"  Per-GPU throughput:   {metrics['per_gpu_throughput']:.0f} img/s")
+    print(f"  Peak memory:          {metrics['peak_memory_gb']:.2f} GB")
+    print(f"  Avg loss:             {metrics['avg_loss']:.4f}")
+    print("═" * 60 + "\n")
+
+
+def save_metrics(metrics: dict, mesh_type: str, output_dir: str = "./benchmark_results") -> None:
+    """Save metrics to JSON for comparison across runs."""
+    if dist.get_rank() != 0:
+        return
+
+    os.makedirs(output_dir, exist_ok=True)
+    world_size = metrics["world_size"]
+    filename = f"{output_dir}/fsdp2_{mesh_type}_{world_size}gpu.json"
+
+    with open(filename, "w") as f:
+        json.dump(metrics, f, indent=2)
+
+    print(f"  Metrics saved to: {filename}")
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    cfg = TrainConfig()
+
+    # Parse mesh_type from environment (for benchmarking different topologies)
+    cfg.mesh_type = os.environ.get("FSDP_MESH_TYPE", "auto")
+
+    # Setup
+    local_rank, global_rank, world_size, local_world_size = setup_distributed()
+
+    if global_rank == 0:
+        print(f"[Config] {cfg}")
+        print(f"[Cluster] {world_size} GPUs, {world_size // local_world_size} nodes, "
+              f"{local_world_size} GPUs/node")
+        print(f"[Device] {torch.cuda.get_device_name(local_rank)}")
+        print(f"[PyTorch] {torch.__version__}")
+
+    # Create topology-aware mesh
+    mesh = create_device_mesh(world_size, local_world_size, cfg.mesh_type)
+
+    # Build and configure model
+    model = build_model(cfg)
+
+    if global_rank == 0:
+        n_params = sum(p.numel() for p in model.parameters())
+        print(f"[Model] {cfg.model_name}: {n_params:,} params")
+        if mesh.ndim == 1:
+            print(f"  Model-prop memory/GPU: {n_params * 16 / world_size / 1e9:.2f} GB")
+        else:
+            shard_size = mesh.size(mesh.get_dim_by_name("shard"))
+            print(f"  Model-prop memory/GPU (shard group={shard_size}): "
+                  f"{n_params * 16 / shard_size / 1e9:.2f} GB")
+
+    # Apply FSDP2
+    model = apply_fsdp2(model, mesh, cfg)
+
+    # Verify sharding
+    if global_rank == 0:
+        p = next(model.parameters())
+        print(f"[FSDP2] Parameter type: {type(p).__name__}")
+        print(f"  Global shape: {list(p.shape)}")
+        print(f"  Local shape:  {list(p._local_tensor.shape)}")
+        print(f"  Placements:   {p.placements}")
+        print(f"  Mesh ndim:    {p.device_mesh.ndim}")
+
+    # Optimizer (after sharding)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
+    )
+
+    # Data
+    dataloader = build_dataloader(cfg, world_size, global_rank)
+
+    # Benchmark
+    metrics = benchmark(model, dataloader, optimizer, cfg, local_rank, world_size)
+
+    # Report
+    effective_mesh_type = cfg.mesh_type if cfg.mesh_type != "auto" else (
+        "1d" if mesh.ndim == 1 else "hsdp"
+    )
+    print_metrics(metrics, effective_mesh_type, global_rank)
+    save_metrics(metrics, effective_mesh_type)
+
+    # Cleanup
+    dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
+</code></pre>
+
+<h2>Benchmarking Script: Compare Topologies</h2>
+
+<pre><code class="language-bash">#!/bin/bash
+# benchmark_topologies.sh
+# Run on 2 nodes (8 GPUs total) to compare 1-D vs HSDP
+#
+# Usage: sbatch benchmark_topologies.sh
+
+#SBATCH --job-name=fsdp2_topology_bench
+#SBATCH --nodes=2
+#SBATCH --ntasks-per-node=1
+#SBATCH --gpus-per-node=4
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=128G
+#SBATCH --time=00:30:00
+#SBATCH --partition=gpu
+#SBATCH --output=bench_%j.log
+
+export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n1)
+export MASTER_PORT=29500
+
+COMMON_ARGS="--nnodes=$SLURM_NNODES --nproc_per_node=4 \
+    --rdzv_id=$SLURM_JOB_ID --rdzv_backend=c10d \
+    --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT"
+
+echo "========================================"
+echo "  Benchmark: 1-D flat mesh (8 GPUs)"
+echo "========================================"
+FSDP_MESH_TYPE=1d srun torchrun $COMMON_ARGS train_fsdp2_hsdp.py
+
+# Wait for NCCL cleanup
+sleep 5
+
+echo ""
+echo "========================================"
+echo "  Benchmark: HSDP (2 replicas × 4 shards)"
+echo "========================================"
+FSDP_MESH_TYPE=hsdp srun torchrun $COMMON_ARGS train_fsdp2_hsdp.py
+
+echo ""
+echo "========================================"
+echo "  Results comparison:"
+echo "========================================"
+echo "  See ./benchmark_results/ for JSON files"
+python3 -c "
+import json, glob
+files = sorted(glob.glob('./benchmark_results/*.json'))
+for f in files:
+    with open(f) as fh:
+        m = json.load(fh)
+    name = f.split('/')[-1].replace('.json','')
+    print(f'  {name}: {m[\"throughput_img_per_sec\"]:.0f} img/s, '
+          f'step={m[\"avg_step_ms\"]:.1f}ms, peak={m[\"peak_memory_gb\"]:.1f}GB')
+"
+</code></pre>
+
+<h2>What Happens Differently: 1-D vs HSDP Communication</h2>
+
+<p>Let's trace the exact communication pattern for one training step in both configurations (8 GPUs, 2 nodes):</p>
+
+<div class="diagram">
+    1-D Mesh (8,) — Single all-gather group spanning both nodes:
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    Per block (32 blocks × this):
+    Forward:   all-gather across [GPU0..7] — 7/8 × P_block × 4 bytes
+    → Some data crosses InfiniBand (GPUs 0-3 ↔ GPUs 4-7)
+    → Bottleneck: IB bandwidth (~12.5 GB/s)
+    → Time: 76 MB × 7/8 / 12.5 GB/s ≈ 5.3 ms per block ← SLOW
+
+    Backward:  all-gather again: +5.3 ms
+    reduce-scatter across [GPU0..7]: +5.3 ms
+
+    Total comms per step: 32 × 3 × 5.3 ms ≈ 509 ms (theoretical)
+    With overlap: exposed tail ≈ 100-200 ms (significant!)
+
+
+    HSDP (2, 4) — Shard within node, replicate across nodes:
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    Per block (32 blocks × this):
+    Forward:   all-gather within [GPU0..3] OR [GPU4..7] — NVLink only!
+    → 3/4 × P_block × 4 bytes
+    → Bandwidth: ~200 GB/s (NVLink, effective for AG)
+    → Time: 76 MB × 3/4 / 200 GB/s ≈ 0.28 ms per block ← FAST
+
+    Backward:  all-gather (NVLink): +0.28 ms
+    reduce-scatter (NVLink): +0.28 ms
+
+    Per-block comms: 3 × 0.28 ms = 0.84 ms (fully hidden by 3.4 ms compute)
+
+    THEN, once per step (after all blocks):
+    Gradient all-reduce across replica groups [GPU_i, GPU_{i+4}]:
+    → P/4 × 4 bytes = 632M/4 × 4 = 600 MB per rank
+    → Ring all-reduce between 2 ranks over IB: 600 MB / 12.5 GB/s ≈ 48 ms
+    → But only ONE all-reduce per step (not per block!)
+
+    Total comms per step: per-block (hidden) + 48 ms (gradient sync, partially overlappable)
+    Exposed tail ≈ 20-40 ms
+</div>
+
+<div class="callout success">
+    <strong>The numbers tell the story:</strong> 1-D exposes ~100-200 ms of communication per step. HSDP exposes ~20-40 ms. On a ~150 ms compute step, that's the difference between 85% and 95% scaling efficiency.
+</div>
+
+<h2>HSDP Gradient Synchronization: The Details</h2>
+
+<p>The gradient all-reduce across replicas is the only InfiniBand communication in HSDP. Understanding its timing:</p>
+
+<pre><code class="language-python"># After all blocks complete backward (all per-block reduce-scatters done):
+#   Each rank holds its sharded gradient: shape [P/4, ...]
+#   But this is only the sum from THIS replica's data
+#
+#   For correct training, we need the sum across ALL replicas:
+#   true_grad_shard = rank's_grad_shard + corresponding_grad_from_other_replicas
+
+# FSDP2 handles this automatically via the "replicate" mesh dimension:
+#   The DTensor system knows placements are (Replicate(), Shard(0))
+#   After reduce-scatter within shard group: grad is (Partial(sum), Shard(0))
+#     → Partial on dim 0 (replicate): needs all-reduce across replicas
+#     → Shard on dim 1: already reduced within shard group
+#
+#   FSDP2 issues: all-reduce on grad across the replicate ProcessGroup
+#   This is the ONLY cross-node communication
+
+# When does this all-reduce happen?
+#   After the LAST block's post-backward hook completes
+#   It uses the "replicate" dimension's ProcessGroup
+#   On your cluster: groups [0,4], [1,5], [2,6], [3,7] over InfiniBand
+#
+# Can it overlap with compute?
+#   Partially — if you have a subsequent operation (e.g., gradient clipping)
+#   that doesn't depend on ALL shards immediately, some overlap is possible.
+#   In practice, the optimizer step follows immediately → limited overlap.
+#
+#   This is a known optimization opportunity: "bucketed" gradient all-reduce
+#   can start as soon as the last blocks finish, overlapping earlier blocks'
+#   gradient sync with later blocks' backward. FSDP2 does bucket this.
+</code></pre>
+
+<h3>Bucketed Gradient Sync</h3>
+
+<pre><code class="language-python"># FSDP2 doesn't wait until ALL gradients are ready before starting
+# the replica sync. It can start all-reducing earlier blocks' gradients
+# while later blocks are still in backward:
+#
+# Timeline (backward):
+#   Block 31 backward → grad_31 ready → start all-reduce for grad_31 over IB
+#   Block 30 backward → grad_30 ready → start all-reduce for grad_30 over IB
+#   ...
+#   Block 0 backward → grad_0 ready → start all-reduce for grad_0 over IB
+#
+# This "streams" the gradient sync over the entire backward pass,
+# overlapping with block-level backward compute.
+#
+# Net effect: the 48 ms total gradient sync is spread across the backward,
+# and much of it overlaps with the next blocks' backward computation.
+# Exposed tail: only the LAST bucket's sync time (a few ms).
+
+# This is why measured HSDP overhead is often better than the raw
+# "48 ms for gradient sync" calculation suggests.
+</code></pre>
+
+<div class="callout">
+    <strong>FSDP2 automatically pipelines the replica gradient sync with backward computation.</strong> You don't configure this — it happens because each FSDP unit's post-backward hook independently triggers both the intra-shard reduce-scatter AND the cross-replica all-reduce for that unit's gradients. The all-reduce for block 31 can run while block 30 is still computing.
+</div>
+
+<h2>Verifying HSDP Correctness</h2>
+
+<p>A common fear: does HSDP produce the same result as full-shard 1-D training? Yes — mathematically equivalent. But let's verify:</p>
+
+<pre><code class="language-python">def verify_hsdp_correctness(
+    model_1d: nn.Module,
+    model_hsdp: nn.Module,
+    dataloader: DataLoader,
+    local_rank: int,
+    num_steps: int = 5,
+) -> None:
+    """
+    Verify that 1-D FSDP and HSDP produce identical gradients and losses.
+
+    Both must:
+    1. Use same random seed for model init
+    2. See same data (same DistributedSampler with same seed)
+    3. Use same optimizer config
+
+    Then losses and gradient norms should match within fp precision.
+    """
+    for step, (images, labels) in enumerate(dataloader):
+        if step >= num_steps:
+            break
+
+        images = images.to(local_rank, non_blocking=True)
+        labels = labels.to(local_rank, non_blocking=True)
+
+        # Forward both models
+        loss_1d = nn.functional.cross_entropy(model_1d(images), labels)
+        loss_hsdp = nn.functional.cross_entropy(model_hsdp(images), labels)
+
+        # Check loss matches
+        loss_diff = abs(loss_1d.item() - loss_hsdp.item())
+        assert loss_diff < 1e-5, f"Step {step}: loss mismatch {loss_diff}"
+
+        # Backward
+        loss_1d.backward()
+        loss_hsdp.backward()
+
+        # Compare gradient norms (aggregate across all params)
+        gnorm_1d = torch.nn.utils.clip_grad_norm_(model_1d.parameters(), float('inf'))
+        gnorm_hsdp = torch.nn.utils.clip_grad_norm_(model_hsdp.parameters(), float('inf'))
+
+        gnorm_diff = abs(gnorm_1d.item() - gnorm_hsdp.item()) / max(gnorm_1d.item(), 1e-8)
+        assert gnorm_diff < 1e-4, f"Step {step}: gnorm mismatch {gnorm_diff:.6f}"
+
+        model_1d.zero_grad()
+        model_hsdp.zero_grad()
+
+        if local_rank == 0:
+            print(f"  Step {step}: loss_diff={loss_diff:.2e}, "
+                  f"gnorm_diff={gnorm_diff:.2e} ✓")
+
+    if local_rank == 0:
+        print("  HSDP correctness verified ✓")
+</code></pre>
+
+<div class="callout">
+    <strong>In practice, differences of ~1e-6 to 1e-5 in loss are normal</strong> due to: (1) different reduction orders in all-reduce vs reduce-scatter (floating point is not associative), (2) NCCL's internal buffering that may reorder partial sums. These are negligible and don't affect convergence. If you see differences > 1e-3, something is wrong (likely a mesh misconfiguration).
+</div>
+
+<h2>HSDP with Different Shard Group Sizes</h2>
+
+<p>On an 8-node cluster (32 GPUs), you have choices beyond (8, 4):</p>
+
+<pre><code class="language-python"># 32 GPUs across 8 nodes (4 GPUs/node):
+
+# Option A: HSDP (8, 4) — shard within node, replicate across 8 nodes
+mesh_a = init_device_mesh("cuda", (8, 4), mesh_dim_names=("replicate", "shard"))
+# Memory: P×16/4 = 2.4 GB per GPU
+# Grad sync: all-reduce across 8 replicas over IB → more IB traffic
+
+# Option B: HSDP (4, 8) — shard across 2 nodes, replicate across 4 groups
+mesh_b = init_device_mesh("cuda", (4, 8), mesh_dim_names=("replicate", "shard"))
+# Memory: P×16/8 = 1.2 GB per GPU (2× less model-prop memory)
+# BUT: shard group spans 2 nodes → all-gathers cross InfiniBand!
+# Some all-gathers are NVLink (intra-node), some are IB (cross-node)
+# Trade-off: less memory per GPU, slower all-gathers
+
+# Option C: HSDP (2, 16) — shard across 4 nodes, replicate across 2 groups
+mesh_c = init_device_mesh("cuda", (2, 16), mesh_dim_names=("replicate", "shard"))
+# Memory: P×16/16 = 0.6 GB per GPU
+# All-gathers span 4 nodes → heavily IB-bound
+# Only useful if model doesn't fit at shard_group=4 or 8
+
+# Decision framework for your cluster:
+def choose_shard_group_size(
+    param_count: int,
+    gpu_memory_gb: float = 32.0,
+    gpus_per_node: int = 4,
+    num_nodes: int = 8,
+    target_activation_headroom_gb: float = 20.0,
+) -> int:
+    """Choose smallest shard group that fits in memory."""
+
+    model_prop_per_gpu = param_count * 16  # bytes
+    available_for_model = (gpu_memory_gb - target_activation_headroom_gb) * 1e9
+
+    # Try shard group = gpus_per_node first (NVLink only)
+    if model_prop_per_gpu / gpus_per_node <= available_for_model:
+        return gpus_per_node  # Ideal: shard within node
+
+    # Try shard group = 2 × gpus_per_node (spans 2 nodes)
+    if model_prop_per_gpu / (2 * gpus_per_node) <= available_for_model:
+        return 2 * gpus_per_node  # Acceptable: some IB all-gathers
+
+    # Fall back to full shard across all GPUs
+    return gpus_per_node * num_nodes
+
+# For ViT-Huge (632M params):
+# model_prop = 632M × 16 = 9.6 GB
+# Available = 32 - 20 = 12 GB
+# 9.6 GB / 4 = 2.4 GB < 12 GB → shard_group = 4 (NVLink only) ✓
+</code></pre>
+
+<h2>Handling Non-Aligned Node Counts</h2>
+
+<pre><code class="language-python"># What if you request 3 nodes (12 GPUs) but want HSDP?
+# Mesh must be rectangular. Options:
+#
+# (3, 4): 3 replicas × 4 shards
+#   → Works! Each node is one shard group
+#   → Grad sync: all-reduce across 3 replicas over IB (groups of size 3)
+#   → Perfectly valid
+
+# (2, 6): 2 replicas × 6 shards
+#   → Shard group spans 1.5 nodes — impossible to align to NVLink
+#   → BAD: some intra-group communication crosses IB
+#   → Don't use
+
+# (4, 3): 4 replicas × 3 shards
+#   → Shard group is 3 GPUs within a 4-GPU node
+#   → Works but wastes 1 GPU per node (only 3 of 4 are in the shard group)
+#   → Actually NO — this means 4×3=12 ranks total, all GPUs used
+#   → But shard group [0,1,2] might span partial nodes depending on rank mapping
+#   → Risky — validate rank-to-node mapping
+
+# RULE: always make shard_group_size = GPUs_per_node for clean NVLink alignment
+#        replicate_size = num_nodes
+#        This guarantees shard groups align to physical node boundaries.
+
+def create_mesh_safe(world_size: int, local_world_size: int) -> DeviceMesh:
+    """Always align shard group to node boundaries."""
+    num_nodes = world_size // local_world_size
+
+    if num_nodes == 1:
+        return init_device_mesh("cuda", (world_size,))
+
+    # Shard group = local_world_size (one node)
+    # Replicate = num_nodes
+    return init_device_mesh(
+        "cuda",
+        (num_nodes, local_world_size),
+        mesh_dim_names=("replicate", "shard"),
+    )
+</code></pre>
+
+<h2>Production Pattern: Config-Driven Topology</h2>
+
+<pre><code class="language-python"># Pattern for your Fraunhofer framework integration:
+# Make mesh topology configurable via YAML/CLI, with sensible defaults.
+
+import argparse
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mesh-type", choices=["auto", "1d", "hsdp"], default="auto")
+    parser.add_argument("--shard-group-size", type=int, default=None,
+                        help="Override shard group size. Default: GPUs per node.")
+    return parser.parse_args()
+
+
+def create_mesh_from_args(args, world_size, local_world_size):
+    num_nodes = world_size // local_world_size
+
+    if args.mesh_type == "1d" or num_nodes == 1:
+        return init_device_mesh("cuda", (world_size,))
+
+    shard_size = args.shard_group_size or local_world_size
+    assert world_size % shard_size == 0
+    num_replicas = world_size // shard_size
+
+    return init_device_mesh(
+        "cuda",
+        (num_replicas, shard_size),
+        mesh_dim_names=("replicate", "shard"),
+    )
+</code></pre>
+
+<h2>Memory Report: 1-D vs HSDP</h2>
+
+<p>Both configurations produce different memory profiles due to different shard sizes:</p>
+
+<table>
+    <thead>
+    <tr><th>Component</th><th>1-D Mesh (8 GPUs)</th><th>HSDP (2,4) — 4 per shard</th><th>Explanation</th></tr>
+    </thead>
+    <tbody>
+    <tr>
+        <td>Master weight shard</td>
+        <td>632M/8 × 4 = 316 MB</td>
+        <td>632M/4 × 4 = 632 MB</td>
+        <td>HSDP shards over fewer GPUs</td>
+    </tr>
+    <tr>
+        <td>Gradient shard</td>
+        <td>316 MB</td>
+        <td>632 MB</td>
+        <td>Same as above</td>
+    </tr>
+    <tr>
+        <td>Adam m shard</td>
+        <td>316 MB</td>
+        <td>632 MB</td>
+        <td>Same</td>
+    </tr>
+    <tr>
+        <td>Adam v shard</td>
+        <td>316 MB</td>
+        <td>632 MB</td>
+        <td>Same</td>
+    </tr>
+    <tr>
+        <td><strong>Model-prop total</strong></td>
+        <td><strong>1.2 GB</strong></td>
+        <td><strong>2.4 GB</strong></td>
+        <td>2× more with HSDP</td>
+    </tr>
+    <tr>
+        <td>Unsharded block (transient)</td>
+        <td>38 MB (fp16)</td>
+        <td>38 MB (fp16)</td>
+        <td>Same (full block either way)</td>
+    </tr>
+    <tr>
+        <td>Activations (batch=32, AC)</td>
+        <td>~2.5 GB</td>
+        <td>~2.5 GB</td>
+        <td>Same batch/GPU</td>
+    </tr>
+    <tr>
+        <td><strong>Total peak</strong></td>
+        <td><strong>~5 GB</strong></td>
+        <td><strong>~6.2 GB</strong></td>
+        <td>HSDP uses ~1.2 GB more</td>
+    </tr>
+    </tbody>
+</table>
+
+<div class="callout">
+    <strong>HSDP uses more memory per GPU (2.4 vs 1.2 GB model-prop) because it shards across fewer GPUs (4 vs 8).</strong> The extra 1.2 GB is the price for keeping all-gathers on NVLink. On V100-32GB with 6.2 GB peak (batch=32 + AC), you have 26 GB headroom — this trade-off is extremely worthwhile.
+</div>
+
+<h2>Scaling Behavior Prediction</h2>
+
+<table>
+    <thead>
+    <tr><th>Nodes</th><th>GPUs</th><th>Mesh (HSDP)</th><th>Expected throughput</th><th>Scaling from 1 node</th><th>Limiting factor</th></tr>
+    </thead>
+    <tbody>
+    <tr><td>1</td><td>4</td><td>1-D (4,)</td><td>~440 img/s</td><td>1.0×</td><td>Compute</td></tr>
+    <tr><td>2</td><td>8</td><td>(2, 4)</td><td>~840 img/s</td><td>1.91×</td><td>IB grad sync (minor)</td></tr>
+    <tr><td>4</td><td>16</td><td>(4, 4)</td><td>~1580 img/s</td><td>3.59×</td><td>IB grad sync (growing)</td></tr>
+    <tr><td>8</td><td>32</td><td>(8, 4)</td><td>~2800 img/s</td><td>6.36×</td><td>IB all-reduce across 8 replicas</td></tr>
+    </tbody>
+</table>
+
+<p>Scaling degrades slightly as replica count increases because:</p>
+<ol>
+    <li>All-reduce latency grows with group size (ring algorithm: latency × (N-1)/N)</li>
+    <li>InfiniBand bandwidth is shared across more concurrent all-reduce groups</li>
+    <li>The bucketed pipelining helps but can't fully hide the final bucket</li>
+</ol>
+
+<div class="callout">
+    <strong>At 8 nodes (32 GPUs):</strong> 6.36× on ideal 8× is 79% scaling efficiency. This is typical for HSDP on IB-connected V100 clusters. To improve beyond this, you'd need either faster interconnect (NDR InfiniBand, NVSwitch) or overlap the gradient sync more aggressively (larger batch → longer backward → more overlap opportunity).
+</div>
+
+<h2 id="quiz">Check Your Understanding</h2>
+
+<div class="quiz">
+    <h3>Q1: With HSDP (2, 4) on your 2-node cluster, each FSDP unit triggers three collectives per step. Over which physical links does each collective travel?</h3>
+    <button onclick="checkAnswer(this, true)">All-gather (fwd): NVLink. All-gather (bwd): NVLink. Reduce-scatter: NVLink. Gradient all-reduce: InfiniBand.</button>
+    <button onclick="checkAnswer(this, false)">All-gather (fwd): InfiniBand. All-gather (bwd): InfiniBand. Reduce-scatter: NVLink. Gradient all-reduce: NVLink.</button>
+    <button onclick="checkAnswer(this, false)">All collectives use InfiniBand — NVLink is only used for intra-GPU data transfers.</button>
+    <button onclick="checkAnswer(this, false)">All-gather: mixed NVLink+IB. Reduce-scatter: NVLink only. Gradient all-reduce: IB only.</button>
+    <div class="explanation">
+        <strong>Correct.</strong> In HSDP, the "shard" dimension's collectives (all-gather, reduce-scatter) operate within the 4-GPU NVLink group. These happen per-block (32× per step). The "replicate" dimension's collective (gradient all-reduce) operates across nodes over InfiniBand. This happens once per parameter group (bucketed across backward, but logically once per step).
+    </div>
+</div>
+
+<div class="quiz">
+    <h3>Q2: HSDP uses 2× more model-proportional memory per GPU compared to 1-D full sharding (on the same total GPU count). Under what condition would this force you to use 1-D instead?</h3>
+    <button onclick="checkAnswer(this, false)">When training for more than 100 epochs (memory fragmentation accumulates)</button>
+    <button onclick="checkAnswer(this, true)">When P×16/GPUs_per_node exceeds available memory after accounting for activations (model doesn't fit with only intra-node sharding)</button>
+    <button onclick="checkAnswer(this, false)">When InfiniBand bandwidth exceeds 50 GB/s (fast enough to make 1-D competitive)</button>
+    <button onclick="checkAnswer(this, false)">When using gradient accumulation (HSDP's replica sync conflicts with accumulated gradients)</button>
+    <div class="explanation">
+        <strong>Correct.</strong> HSDP shards across only GPUs_per_node (e.g., 4). If the model-proportional memory per GPU at that shard factor (P×16/4) doesn't leave enough room for activations on V100-32GB, you're forced to shard across more GPUs (larger shard group spanning nodes), which means InfiniBand all-gathers. For ViT-Huge, P×16/4 = 2.4 GB, leaving ~29 GB — no issue. For a 6B param model: P×16/4 = 24 GB, leaving only 8 GB for activations — might not be enough at reasonable batch sizes.
+    </div>
+</div>
+
+<div class="quiz">
+    <h3>Q3: FSDP2 pipelines the gradient all-reduce (replica sync) with backward computation. How does this work mechanically?</h3>
+    <button onclick="checkAnswer(this, false)">FSDP2 batches all gradient shards into one large all-reduce at the end of backward, then overlaps it with the optimizer step</button>
+    <button onclick="checkAnswer(this, true)">Each FSDP unit's post-backward hook triggers both reduce-scatter (intra-shard) and all-reduce (cross-replica) independently, allowing early blocks' replica sync to overlap with later blocks' backward</button>
+    <button onclick="checkAnswer(this, false)">The gradient all-reduce runs on a dedicated CPU thread that communicates via shared memory with the GPU's backward computation</button>
+    <button onclick="checkAnswer(this, false)">PyTorch's autograd engine detects the replica dimension and automatically splits backward into parallel streams per replica</button>
+    <div class="explanation">
+        <strong>Correct.</strong> Each FSDP unit (block) independently completes its backward, fires post-backward hook → reduce-scatter within shard group → then immediately issues the all-reduce across replicas for that block's gradient shard. Block 31's gradient all-reduce starts while blocks 30, 29, ... are still in backward. This pipelines the InfiniBand traffic across the entire backward pass rather than concentrating it at the end.
+    </div>
+</div>
+
+<div class="quiz">
+    <h3>Q4: You run the benchmarking script and find that 1-D (8 GPUs) achieves 620 img/s while HSDP (2,4) achieves 780 img/s. You expected HSDP to be even faster (~840). What might explain the gap?</h3>
+    <button onclick="checkAnswer(this, false)">HSDP has a bug that causes redundant all-gathers across the replicate dimension</button>
+    <button onclick="checkAnswer(this, true)">The bucketed gradient all-reduce isn't fully overlapping with backward — either the final buckets expose InfiniBand latency, or the batch size is too small for complete overlap</button>
+    <button onclick="checkAnswer(this, false)">The benchmark uses synthetic data, which doesn't stress the InfiniBand enough to show the difference</button>
+    <button onclick="checkAnswer(this, false)">HSDP requires double the number of NCCL process groups, and the group management overhead slows everything down</button>
+    <div class="explanation">
+        <strong>Correct.</strong> The gap between measured (780) and theoretical (840) is the exposed portion of the gradient all-reduce over InfiniBand. Even with pipelining, the last few blocks' gradient sync has limited backward compute to overlap with. Increasing batch size (more backward compute time) or using gradient accumulation steps would give more overlap runway and close the gap toward 840.
+    </div>
+</div>
+
+<h2>Key Takeaways</h2>
+<ol>
+    <li><strong>HSDP script requires only a mesh change from 1-D:</strong> <code>init_device_mesh("cuda", (num_nodes, gpus_per_node), mesh_dim_names=("replicate", "shard"))</code>. All other code (fully_shard, training loop) is identical.</li>
+    <li><strong>Always align shard groups to node boundaries.</strong> Shard group size = GPUs per node guarantees all per-block communication uses NVLink.</li>
+    <li><strong>Memory trade-off:</strong> HSDP uses P×16/GPUs_per_node per GPU (vs P×16/total_GPUs for 1-D). For ViT-Huge on V100: 2.4 GB vs 1.2 GB — both trivially fit.</li>
+    <li><strong>Gradient sync is pipelined:</strong> each block's replica all-reduce starts as soon as that block's backward completes, overlapping with subsequent blocks' backward computation.</li>
+    <li><strong>Expected 2-node HSDP speedup: ~1.9×</strong> (vs ideal 2×). The ~5% loss is InfiniBand gradient sync tail.</li>
+    <li><strong>Benchmark with the provided script</strong> to get exact numbers for your cluster. Environment variable <code>FSDP_MESH_TYPE</code> switches topologies without code changes.</li>
+    <li><strong>1-D vs HSDP decision:</strong> if P×16/GPUs_per_node fits → always use HSDP on multi-node. If it doesn't → must use larger shard groups (possibly 1-D).</li>
+</ol>
+
+<h2>Primary Source</h2>
+<p>Study how <a href="https://github.com/pytorch/torchtitan/blob/main/torchtitan/parallelisms/parallelize_llama.py">torchtitan configures HSDP</a> — look for the <code>data_parallel_shard</code> and <code>data_parallel_replicate</code> mesh dimensions. Also read the <a href="https://engineering.fb.com/2024/01/24/production-engineering/fully-sharded-data-parallel-fsdp2-meta/">Meta engineering blog post on FSDP2</a> which discusses HSDP scaling results at production scale.</p>
+
+
+
+<script>
+    function checkAnswer(btn, correct) {
+        const quiz = btn.closest('.quiz');
+        const buttons = quiz.querySelectorAll('button');
+        const explanation = quiz.querySelector('.explanation');
+        buttons.forEach(b => { b.disabled = true; b.classList.remove('correct', 'incorrect'); });
+        if (correct) {
+            btn.classList.add('correct');
+        } else {
+            btn.classList.add('incorrect');
+            buttons.forEach(b => { if (b.getAttribute('onclick').includes('true')) b.classList.add('correct'); });
+        }
+        explanation.style.display = 'block';
+    }
+</script>

@@ -1,0 +1,372 @@
+---
+layout: tutorial
+tutorial: fsdp2
+type: lesson
+lesson: 16
+total: 18
+title: "Custom CUDA Kernels + FSDP2"
+tags: [Add-On, Advanced, Advanced]
+permalink: /heap/fsdp2/0016/
+---
+
+<p><em>How pybind11/Triton custom ops interact with sharded parameters, and the patterns to make them work.</em></p>
+
+<h2>The Core Problem</h2>
+
+<p>Custom CUDA kernels (pybind11, C++ extensions, Triton) receive raw memory pointers. They don't go through PyTorch's DTensor dispatch — they have no idea parameters are sharded. Two scenarios:</p>
+
+<table>
+    <thead>
+    <tr><th>Scenario</th><th>Risk</th><th>Your case</th></tr>
+    </thead>
+    <tbody>
+    <tr>
+        <td>Kernel operates on <strong>activations</strong> (local tensors)</td>
+        <td>None — activations are local, never DTensors</td>
+        <td>Your NMS kernel ✓ (operates on detection outputs)</td>
+    </tr>
+    <tr>
+        <td>Kernel operates on <strong>model parameters</strong> (DTensors)</td>
+        <td>High — kernel sees shard, not full tensor</td>
+        <td>Custom attention, custom normalization, custom convolution</td>
+    </tr>
+    </tbody>
+</table>
+
+<h2>Pattern 1: Kernel Inside forward() — Safest</h2>
+
+<p>If your custom kernel runs inside a module's <code>forward()</code>, FSDP2's pre-forward hook has already all-gathered the parameters to Replicate. The kernel sees the full parameter:</p>
+
+<pre><code class="language-python">class CustomAttentionBlock(nn.Module):
+    """Block with a custom CUDA kernel for attention computation."""
+
+    def __init__(self, dim: int, num_heads: int):
+        super().__init__()
+        self.qkv = nn.Linear(dim, 3 * dim)
+        self.proj = nn.Linear(dim, dim)
+        self.num_heads = num_heads
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # At this point, self.qkv.weight is ALREADY unsharded (Replicate)
+        # because FSDP2's pre-forward hook fired before this forward() runs.
+
+        qkv = self.qkv(x)  # Standard linear — uses full weight
+        q, k, v = qkv.chunk(3, dim=-1)
+
+        # Custom CUDA kernel for attention (e.g., flash-attention variant)
+        # This receives regular tensors (activations) — no DTensor issues
+        attn_output = my_custom_attention_cuda(q, k, v, self.num_heads)
+
+        return self.proj(attn_output)
+
+
+# FSDP2 application — works without modification:
+for block in model.blocks:
+    fully_shard(block, mesh=mesh, mp_policy=mp_policy)
+fully_shard(model, mesh=mesh, mp_policy=mp_policy)
+
+# The custom kernel never sees DTensors. It receives:
+# - q, k, v: local activation tensors (standard torch.Tensor)
+# - weight matrices: accessed via nn.Linear, which FSDP2 handles transparently
+</code></pre>
+
+<div class="callout success">
+    <strong>Rule: If your kernel consumes only activations or module outputs (not raw parameters), it works with zero changes.</strong> This covers 90% of custom kernel use cases: custom attention, custom normalization, custom loss functions, NMS, ROI pooling, etc.
+</div>
+
+<h2>Pattern 2: Kernel That Directly Accesses Parameters</h2>
+
+<p>Rare but exists — a kernel that takes a weight matrix as an explicit argument:</p>
+
+<pre><code class="language-python">import my_custom_ops  # pybind11 extension
+
+class CustomLinearWithFusedActivation(nn.Module):
+    """Custom kernel that fuses linear + activation, taking weight directly."""
+
+    def __init__(self, in_features: int, out_features: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.zeros(out_features))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # PROBLEM: self.weight is a DTensor after fully_shard()
+        # The custom kernel expects a regular contiguous tensor.
+
+        # SOLUTION: Inside forward(), FSDP2 has already all-gathered.
+        # But we need to extract the underlying tensor for the kernel.
+
+        weight = self.weight
+        bias = self.bias
+
+        # If params are DTensor (FSDP2 active), extract the full tensor
+        # During forward, they're Replicate — full data is available
+        if hasattr(weight, '_local_tensor'):
+            # During forward (post all-gather), _local_tensor IS the full tensor
+            # because placement is Replicate
+            weight = weight._local_tensor
+        if hasattr(bias, '_local_tensor'):
+            bias = bias._local_tensor
+
+        # Ensure contiguous for the CUDA kernel
+        weight = weight.contiguous()
+        bias = bias.contiguous()
+
+        # Call custom CUDA kernel with raw tensors
+        return my_custom_ops.fused_linear_gelu(x, weight, bias)
+</code></pre>
+
+<div class="callout warning">
+    <strong>Accessing <code>._local_tensor</code> inside forward() when placement is Replicate gives you the full parameter.</strong> This is safe because FSDP2's pre-forward hook has already run. But do NOT access <code>._local_tensor</code> outside forward — you'd get only the shard (1/N of the parameter), which would produce garbage results.
+</div>
+
+<h2>Pattern 3: Registering Custom Ops for torch.compile Compatibility</h2>
+
+<p>If you also use <code>torch.compile</code>, unregistered custom ops cause graph breaks. Register them with <code>torch.library</code>:</p>
+
+<pre><code class="language-python">import torch
+from torch.library import Library, impl
+
+# Define the custom op schema
+my_lib = Library("my_ops", "DEF")
+my_lib.define("fused_linear_gelu(Tensor x, Tensor weight, Tensor bias) -> Tensor")
+
+# Register the implementation (calls your CUDA kernel)
+@impl(my_lib, "fused_linear_gelu", "CUDA")
+def fused_linear_gelu_cuda(x, weight, bias):
+    return my_custom_ops.fused_linear_gelu(x, weight, bias)
+
+# Register a fake implementation for tracing (tells compiler output shape/dtype)
+@impl(my_lib, "fused_linear_gelu", "Meta")
+def fused_linear_gelu_meta(x, weight, bias):
+    # Return empty tensor with correct shape (no actual computation)
+    out_features = weight.shape[0]
+    return torch.empty(*x.shape[:-1], out_features, dtype=x.dtype, device="meta")
+
+
+# Now torch.compile can trace through this op without graph breaks:
+class CustomLinearGELU(nn.Module):
+    def __init__(self, in_f, out_f):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(out_f, in_f))
+        self.bias = nn.Parameter(torch.zeros(out_f))
+
+    def forward(self, x):
+        w = self.weight._local_tensor if hasattr(self.weight, '_local_tensor') else self.weight
+        b = self.bias._local_tensor if hasattr(self.bias, '_local_tensor') else self.bias
+        return torch.ops.my_ops.fused_linear_gelu(x, w.contiguous(), b.contiguous())
+</code></pre>
+
+<h2>Pattern 4: Shard-Parallel Custom Ops</h2>
+
+<p>Some operations can naturally operate on shards independently (no inter-element dependencies across the shard dimension):</p>
+
+<pre><code class="language-python"># Example: per-parameter quantization or sparsification
+# These operations are ELEMENT-WISE on the parameter → work on shards directly
+
+class CustomQuantizedLinear(nn.Module):
+    """Custom kernel that quantizes weights on-the-fly."""
+
+    def __init__(self, in_f, out_f):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(out_f, in_f))
+        self.scale = nn.Parameter(torch.ones(out_f))
+
+    def forward(self, x):
+        # Here weight is Replicate (inside forward, post all-gather)
+        # But if you wanted to quantize AT REST (on the shard), you could:
+        pass
+
+    def quantize_weights_inplace(self):
+        """
+        Apply custom quantization to sharded weights.
+        Call OUTSIDE forward — works on the local shard directly.
+        This is safe because it's element-wise (no cross-element dependency).
+        """
+        with torch.no_grad():
+            local_w = self.weight._local_tensor  # The shard
+            # Custom CUDA kernel for quantization (element-wise)
+            quantized = my_custom_ops.symmetric_quantize_int8(local_w, self.scale._local_tensor)
+            self.weight._local_tensor.copy_(quantized)
+</code></pre>
+
+<div class="callout">
+    <strong>Shard-parallel ops</strong> (element-wise, row-wise on the shard dim) can safely access <code>._local_tensor</code> at any time. They don't need the full parameter because each element is independent. Examples: quantization, pruning masks, weight normalization per-row.
+</div>
+
+<h2>Pattern 5: Triton Kernels (Recommended for New Custom Ops)</h2>
+
+<pre><code class="language-python">import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_layernorm_gelu_kernel(
+    x_ptr, weight_ptr, bias_ptr, out_ptr,
+    N: tl.constexpr, eps: tl.constexpr,
+):
+    """Fused LayerNorm + GELU in one Triton kernel."""
+    row_idx = tl.program_id(0)
+    col_offsets = tl.arange(0, N)
+
+    # Load row
+    x = tl.load(x_ptr + row_idx * N + col_offsets)
+
+    # LayerNorm
+    mean = tl.sum(x, axis=0) / N
+    var = tl.sum((x - mean) ** 2, axis=0) / N
+    x_norm = (x - mean) / tl.sqrt(var + eps)
+
+    # Scale + shift
+    w = tl.load(weight_ptr + col_offsets)
+    b = tl.load(bias_ptr + col_offsets)
+    x_normed = x_norm * w + b
+
+    # GELU
+    out = x_normed * 0.5 * (1.0 + tl.math.tanh(
+        0.7978845608 * (x_normed + 0.044715 * x_normed * x_normed * x_normed)
+    ))
+
+    tl.store(out_ptr + row_idx * N + col_offsets, out)
+
+
+class TritonFusedNormGELU(nn.Module):
+    """Uses Triton kernel — works with FSDP2 because it receives activations."""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.bias = nn.Parameter(torch.zeros(dim))
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Extract weight/bias (Replicate inside forward)
+        w = self.weight._local_tensor if hasattr(self.weight, '_local_tensor') else self.weight
+        b = self.bias._local_tensor if hasattr(self.bias, '_local_tensor') else self.bias
+
+        out = torch.empty_like(x)
+        n_rows = x.shape[0] * x.shape[1] if x.ndim == 3 else x.shape[0]
+
+        fused_layernorm_gelu_kernel[(n_rows,)](
+            x.reshape(-1, self.dim), w, b, out.reshape(-1, self.dim),
+            N=self.dim, eps=1e-5,
+        )
+        return out
+</code></pre>
+
+<div class="callout success">
+    <strong>Triton kernels are the recommended path for new custom ops.</strong> They integrate with torch.compile naturally (Inductor can fuse around them), they're written in Python (easier to maintain than C++/CUDA), and they follow the same patterns as pybind11 kernels w.r.t. FSDP2: receive tensors, operate, return tensors. The FSDP2 interaction rules are identical.
+</div>
+
+<h2>Decision Flowchart</h2>
+
+<div class="diagram">
+    Does your custom kernel access model PARAMETERS directly?
+    │
+    ┌───────┴───────┐
+    No              Yes
+    │               │
+    ┌───────┴───────┐       │
+    │ Kernel uses   │   Is the operation element-wise
+    │ only local    │   (no cross-element dependency)?
+    │ activations   │       │
+    │               │   ┌───┴───┐
+    │ → Works as-is │   Yes     No
+    │   No changes  │   │       │
+    └───────────────┘   │   ┌───┴──────────────────┐
+    │   │ Call kernel inside    │
+    │   │ forward() — params    │
+    │   │ are Replicate there.  │
+    │   │ Extract via           │
+    │   │ ._local_tensor        │
+    │   └──────────────────────┘
+    │
+    ┌───────┴──────────────┐
+    │ Can operate on shard  │
+    │ directly (any time).  │
+    │ Access ._local_tensor │
+    │ outside forward too.  │
+    └──────────────────────┘
+</div>
+
+<h2>Autograd Integration for Custom Backward</h2>
+
+<pre><code class="language-python">class CustomOpFunction(torch.autograd.Function):
+    """
+    Custom autograd function that works with FSDP2.
+
+    Key: the forward receives REGULAR tensors (FSDP2 already unsharded).
+    The backward produces gradients that FSDP2's post-backward hook
+    will reduce-scatter normally.
+    """
+
+    @staticmethod
+    def forward(ctx, x, weight):
+        # x: activation (regular tensor)
+        # weight: extracted from DTensor (regular tensor, full size)
+        ctx.save_for_backward(x, weight)
+        return my_custom_ops.forward(x, weight)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, weight = ctx.saved_tensors
+        grad_x, grad_weight = my_custom_ops.backward(grad_output, x, weight)
+        return grad_x, grad_weight
+
+
+class CustomModule(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(dim, dim))
+
+    def forward(self, x):
+        # Extract full weight (Replicate during forward)
+        w = self.weight
+        if hasattr(w, '_local_tensor'):
+            w = w._local_tensor
+
+        # Custom autograd function
+        return CustomOpFunction.apply(x, w.contiguous())
+</code></pre>
+
+<div class="callout warning">
+    <strong>The gradient returned for weight by your custom backward will be full-sized (same shape as the all-gathered weight).</strong> FSDP2's post-backward hook intercepts this gradient and reduce-scatters it to produce the sharded gradient for the optimizer. Your custom backward doesn't need to know about sharding — just return the standard full-sized gradient as if you were training on a single GPU.
+</div>
+
+<h2>Summary Table</h2>
+
+<table>
+    <thead>
+    <tr><th>Kernel type</th><th>Accesses params?</th><th>FSDP2 integration</th><th>torch.compile</th></tr>
+    </thead>
+    <tbody>
+    <tr>
+        <td>NMS, ROI pooling, custom loss</td>
+        <td>No (activations only)</td>
+        <td>Zero changes</td>
+        <td>Register with torch.library + Meta impl</td>
+    </tr>
+    <tr>
+        <td>Custom attention/conv (uses weight)</td>
+        <td>Yes (inside forward)</td>
+        <td>Extract <code>._local_tensor</code> inside forward()</td>
+        <td>Same + register op</td>
+    </tr>
+    <tr>
+        <td>Custom quantization/pruning</td>
+        <td>Yes (element-wise on shard)</td>
+        <td>Access <code>._local_tensor</code> directly (any time)</td>
+        <td>Typically outside compiled region</td>
+    </tr>
+    <tr>
+        <td>Triton fused ops</td>
+        <td>Varies</td>
+        <td>Same patterns as pybind11</td>
+        <td>Native Inductor integration</td>
+    </tr>
+    </tbody>
+</table>
+
+<h2>Primary Source</h2>
+<p><a href="https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html">PyTorch Custom Operators documentation</a> — covers torch.library registration, fake (Meta) implementations for compilation, and autograd.Function patterns. For Triton integration: <a href="https://triton-lang.org/main/getting-started/tutorials/">Triton tutorials</a>.</p>
+
+

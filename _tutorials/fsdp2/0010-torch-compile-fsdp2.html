@@ -1,0 +1,800 @@
+---
+layout: tutorial
+tutorial: fsdp2
+type: lesson
+lesson: 10
+total: 18
+title: "torch.compile + FSDP2: Tracing, Graph Breaks, Speedups"
+tags: [Performance, Compilation]
+permalink: /heap/fsdp2/010/
+---
+
+<p><em>How FSDP2's DTensor design enables compilation, where it still breaks, and the real speedup on V100.</em></p>
+
+<h2>Why Compilation Matters for FSDP2</h2>
+
+<p>From Lesson 008, you know that ViT-Huge on your V100 NVLink cluster is <strong>compute-bound</strong> (ratio ~9×). Communication is fully hidden. So the only way to further improve throughput is to make the compute faster. <code>torch.compile</code> does this by:</p>
+
+<ul>
+    <li><strong>Kernel fusion:</strong> Combines multiple small ops (LayerNorm → dropout → add → GELU) into single GPU kernels, reducing kernel launch overhead and memory round-trips</li>
+    <li><strong>Memory planning:</strong> Optimizes intermediate tensor allocation, reducing fragmentation and cudaMalloc calls</li>
+    <li><strong>Triton codegen:</strong> Generates optimized Triton kernels for fused operations (V100 supports Triton, though less optimally than Ampere+)</li>
+    <li><strong>Operator reordering:</strong> Reorders independent operations for better GPU occupancy</li>
+</ul>
+
+<p>On V100 with ViT-Huge, expect <strong>10–20% throughput improvement</strong> from compilation. On A100/H100 the gains are larger (20–40%) due to better Triton support and hardware features.</p>
+
+<h2>The FSDP1 Problem (Why It Didn't Work Before)</h2>
+
+<pre><code class="language-python"># FSDP1 + torch.compile: every FSDP boundary was a graph break
+#
+# torch.compile traces the forward pass as a graph:
+#   Input → Op1 → Op2 → ... → Output
+#
+# FSDP1's wrapper inserted Python-level hooks at each boundary:
+#   Input → [GRAPH BREAK: FSDP unflatten] → Op1 → Op2 → [GRAPH BREAK: FSDP reshard]
+#
+# Result: N tiny graphs instead of one large one.
+# Each graph break:
+#   - Exits compiled code → returns to Python interpreter
+#   - Triggers recompilation risk if shapes change
+#   - Prevents cross-boundary fusion (can't fuse across breaks)
+#
+# With 32 transformer blocks: 64+ graph breaks per forward pass.
+# Compilation overhead outweighed any speedup → net negative on FSDP1.
+</code></pre>
+
+<h2>FSDP2's Compilation Story</h2>
+
+<p>FSDP2 was <strong>designed with torch.compile in mind</strong>. DTensor operations have registered decompositions that the compiler understands:</p>
+
+<pre><code class="language-python"># FSDP2 + torch.compile: communication becomes graph nodes
+
+# What the compiler sees (conceptual FX graph):
+#
+# %sharded_param = placeholder(param)          # DTensor, Shard(0)
+# %full_param = all_gather(%sharded_param)     # Communication node
+# %fp16_param = cast(%full_param, float16)     # Dtype cast
+# %attn_out = scaled_dot_product_attention(%x, %fp16_param, ...)  # Fused attention
+# %mlp_out = fused_mlp(%attn_out, %mlp_weights)                  # Fused MLP
+# %grad = ... backward ...
+# %scattered_grad = reduce_scatter(%grad)      # Communication node
+#
+# The compiler can:
+# 1. Fuse everything BETWEEN communication nodes
+# 2. Keep communication nodes as-is (they call NCCL — can't be compiled)
+# 3. Optimize memory layout around communication boundaries
+</code></pre>
+
+<div class="callout success">
+    <strong>The key insight:</strong> FSDP2's communication ops (all-gather, reduce-scatter) become <em>opaque nodes</em> in the compiled graph. The compiler treats them as black-box functions with known input/output shapes and types. Everything between them — the actual model computation — is fully compiled and fused. No graph breaks at FSDP boundaries.
+</div>
+
+<h2>How to Apply torch.compile with FSDP2</h2>
+
+<pre><code class="language-python">import torch
+from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
+import timm
+
+
+def build_compiled_fsdp2_model(mesh, mp_policy):
+    """Build model with FSDP2 + torch.compile."""
+
+    # 1. Build model
+    model = timm.create_model("vit_huge_patch14_224", pretrained=False, num_classes=1000)
+
+    # 2. Activation checkpointing (before FSDP2)
+    model.set_grad_checkpointing(enable=True)
+
+    # 3. Apply FSDP2
+    for block in model.blocks:
+        fully_shard(block, mesh=mesh, mp_policy=mp_policy)
+    fully_shard(model, mesh=mesh, mp_policy=mp_policy)
+
+    # 4. Compile AFTER FSDP2
+    model = torch.compile(model)
+
+    return model
+</code></pre>
+
+<div class="callout warning">
+    <strong>Order: build → checkpoint → fully_shard → compile.</strong> This order is critical. <code>torch.compile</code> must come LAST because it wraps the model in a compiled callable. If you compile before sharding, <code>fully_shard()</code> would try to mutate a compiled module — which doesn't work reliably. If you shard before checkpointing, the hooks might not compose correctly with compilation. The canonical order from torchtitan is: <code>model → AC → FSDP2 → compile</code>.
+</div>
+
+<h2>Compilation Modes</h2>
+
+<pre><code class="language-python"># torch.compile offers several modes with different trade-offs:
+
+# Default mode: balanced compile time vs runtime performance
+model = torch.compile(model)
+
+# "reduce-overhead" mode: minimizes Python overhead, uses CUDA graphs
+# CAREFUL: CUDA graphs capture a fixed execution pattern — NCCL collectives
+# inside a CUDA graph can deadlock if not carefully managed.
+# As of PyTorch 2.5: this DOES work with FSDP2, but only in specific configs.
+model = torch.compile(model, mode="reduce-overhead")
+
+# "max-autotune" mode: tries many kernel variants, picks fastest
+# Longer compile time (minutes), best runtime. Good for production.
+model = torch.compile(model, mode="max-autotune")
+
+# Recommendation for V100:
+# Start with default mode. If compile time is acceptable (< 5 min),
+# try "max-autotune" for production runs.
+# Avoid "reduce-overhead" until you've verified it works with your
+# specific FSDP2 + NCCL configuration.
+</code></pre>
+
+<table>
+    <thead>
+    <tr><th>Mode</th><th>Compile time</th><th>Runtime speedup (V100)</th><th>Risk</th><th>Recommendation</th></tr>
+    </thead>
+    <tbody>
+    <tr>
+        <td><code>default</code></td>
+        <td>30s–2min</td>
+        <td>10–15%</td>
+        <td>Low</td>
+        <td>Start here</td>
+    </tr>
+    <tr>
+        <td><code>reduce-overhead</code></td>
+        <td>1–3min</td>
+        <td>15–20%</td>
+        <td>Medium (CUDA graph interaction)</td>
+        <td>Test carefully with FSDP2</td>
+    </tr>
+    <tr>
+        <td><code>max-autotune</code></td>
+        <td>5–15min</td>
+        <td>15–20%</td>
+        <td>Low (just slow to compile)</td>
+        <td>Production runs</td>
+    </tr>
+    </tbody>
+</table>
+
+<h2>Where Graph Breaks Still Occur</h2>
+
+<p>FSDP2 eliminates FSDP-boundary graph breaks, but other sources remain:</p>
+
+<pre><code class="language-python"># Common graph break sources in ViT + FSDP2 training:
+
+# 1. Python control flow that depends on tensor values
+#    BAD:
+if x.max() > threshold:  # Graph break! Compiler can't trace through this
+    x = special_handling(x)
+#    FIX: Use torch.where or masked operations instead
+
+# 2. Data-dependent shapes
+#    BAD:
+mask = x > 0
+filtered = x[mask]  # Dynamic shape → graph break
+#    FIX: Use fixed-size operations with masking
+
+# 3. print() or logging inside forward
+#    BAD:
+def forward(self, x):
+    print(f"input shape: {x.shape}")  # Graph break!
+    ...
+#    FIX: Remove or guard with if not torch.compiler.is_compiling():
+
+# 4. .item() or .numpy() calls (materialize to Python)
+#    BAD:
+loss_val = loss.item()  # Syncs GPU→CPU, breaks graph
+#    FIX: Only call .item() outside compiled region
+
+# 5. Custom ops without torch.library registration
+#    Your NMS kernel (pybind11) would cause a graph break if called
+#    inside compiled code. But since NMS runs post-model on predictions,
+#    it's outside the compiled region — no issue for you.
+</code></pre>
+
+<h3>Detecting Graph Breaks</h3>
+
+<pre><code class="language-python"># Method 1: Compile with fullgraph=True (strict mode — errors on any break)
+try:
+    model = torch.compile(model, fullgraph=True)
+    # If this succeeds → no graph breaks in forward/backward!
+    # If this fails → tells you exactly where the break is
+except Exception as e:
+    print(f"Graph break detected: {e}")
+
+# Method 2: Use TORCH_LOGS to see breaks during compilation
+# Set environment variable before running:
+# export TORCH_LOGS="+dynamo"
+# This prints detailed logs about what the compiler traced and where it broke.
+
+# Method 3: torch._dynamo.explain()
+import torch._dynamo
+explanation = torch._dynamo.explain(model)(sample_input)
+print(f"Graph breaks: {explanation.break_reasons}")
+print(f"Number of graphs: {explanation.graph_count}")
+# Ideal: graph_count = 1 (everything in one compiled graph)
+# Acceptable: graph_count = 2-3 (a few breaks, still major fusion benefit)
+# Bad: graph_count > 10 (too many breaks, compilation overhead dominates)
+</code></pre>
+
+<div class="callout">
+    <strong>For timm's ViT-Huge:</strong> Most timm models compile cleanly with zero or few graph breaks in default mode. The scaled_dot_product_attention, LayerNorm, GELU, and linear layers are all fully traceable. The main risk is custom modifications you've added to the model (custom attention patterns, conditional logic, etc.).
+</div>
+
+<h2>What Gets Fused in Practice</h2>
+
+<p>For a ViT transformer block, torch.compile typically fuses:</p>
+
+<div class="diagram">
+    Unfused (eager execution): ~15-20 separate CUDA kernel launches per block
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    LayerNorm  →  Q_proj  →  K_proj  →  V_proj  →  reshape  →
+    →  scaled_dot_product_attention  →  out_proj  →  dropout  →
+    →  residual_add  →  LayerNorm  →  FC1  →  GELU  →  FC2  →
+    →  dropout  →  residual_add
+
+    Each → is a kernel launch (overhead: ~5-10μs per launch on V100)
+    Total overhead: 15 × 7.5μs ≈ 112μs per block × 32 blocks ≈ 3.6ms per forward
+
+
+    Fused (compiled): ~4-6 kernel launches per block
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    [fused_norm_qkv_proj]  →  [sdpa_kernel]  →  [fused_out_proj_dropout_add]  →
+    →  [fused_norm_fc1_gelu]  →  [fused_fc2_dropout_add]
+
+    Kernel launches reduced from ~15 to ~5 per block
+    Overhead: 5 × 7.5μs ≈ 37μs per block × 32 blocks ≈ 1.2ms per forward
+    Saved: ~2.4ms in kernel launch overhead alone
+
+    Plus: fused kernels avoid writing/reading intermediate results to GPU memory
+    → Memory bandwidth savings → additional 5-10% speedup
+</div>
+
+<div class="callout">
+    <strong>The two sources of speedup:</strong> (1) Reduced kernel launch overhead (~2.4ms saved). (2) Reduced GPU memory bandwidth usage from fused kernels (intermediates stay in registers/shared memory instead of going to HBM and back). On V100 where HBM bandwidth is ~900 GB/s (less than A100's 2 TB/s), the memory bandwidth savings are proportionally more valuable.
+</div>
+
+<h2>Compilation and the Training Loop</h2>
+
+<pre><code class="language-python">"""
+train_fsdp2_compiled.py — Complete script with torch.compile.
+"""
+import os
+import time
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, DistributedSampler
+from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
+from torch.distributed.device_mesh import init_device_mesh
+import torch.distributed as dist
+
+import timm
+
+
+def main():
+    dist.init_process_group("nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = dist.get_world_size()
+    torch.cuda.set_device(local_rank)
+
+    mesh = init_device_mesh("cuda", (world_size,))
+    mp_policy = MixedPrecisionPolicy(param_dtype=torch.float16, reduce_dtype=torch.float32)
+
+    # Build model
+    model = timm.create_model("vit_huge_patch14_224", pretrained=False, num_classes=1000)
+    model.set_grad_checkpointing(enable=True)
+
+    # Apply FSDP2
+    for block in model.blocks:
+        fully_shard(block, mesh=mesh, mp_policy=mp_policy)
+    fully_shard(model, mesh=mesh, mp_policy=mp_policy)
+
+    # Compile (AFTER FSDP2)
+    model = torch.compile(model)
+
+    # Optimizer
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.05)
+
+    # Data
+    dataset = SyntheticImageDataset(10_000, 224, 1000)
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=dist.get_rank())
+    dataloader = DataLoader(
+        dataset, batch_size=32, sampler=sampler,
+        num_workers=4, pin_memory=True, drop_last=True,
+    )
+
+    # Training with compile warm-up awareness
+    model.train()
+    step_times = []
+
+    for epoch in range(2):
+        sampler.set_epoch(epoch)
+        for batch_idx, (images, labels) in enumerate(dataloader):
+            images = images.to(local_rank, non_blocking=True)
+            labels = labels.to(local_rank, non_blocking=True)
+
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+
+            outputs = model(images)
+            loss = nn.functional.cross_entropy(outputs, labels)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+
+            torch.cuda.synchronize()
+            t1 = time.perf_counter()
+
+            step_time_ms = (t1 - t0) * 1000
+            step_times.append(step_time_ms)
+
+            if batch_idx % 10 == 0 and local_rank == 0:
+                if batch_idx < 5:
+                    label = "(compiling)" if batch_idx == 0 else "(warm-up)"
+                else:
+                    label = ""
+                print(f"  [E{epoch}][B{batch_idx}] {step_time_ms:.1f}ms "
+                      f"loss={loss.item():.4f} {label}")
+
+    # Report (skip first 5 steps = compilation + warm-up)
+    if local_rank == 0:
+        steady_state = step_times[5:]
+        avg = sum(steady_state) / len(steady_state)
+        print(f"\nSteady-state avg step: {avg:.2f} ms")
+        print(f"Throughput: {32 * world_size / (avg / 1000):.0f} img/s")
+        print(f"Peak memory: {torch.cuda.max_memory_allocated(local_rank) / 1e9:.2f} GB")
+
+        # Show compilation cost
+        print(f"\nFirst step (compilation): {step_times[0]:.0f} ms")
+        print(f"Step 2 (warm-up):         {step_times[1]:.0f} ms")
+        print(f"Step 5+ (steady):         {avg:.1f} ms")
+
+    dist.destroy_process_group()
+
+
+class SyntheticImageDataset(torch.utils.data.Dataset):
+    def __init__(self, n, size, classes):
+        self.n, self.size, self.classes = n, size, classes
+    def __len__(self): return self.n
+    def __getitem__(self, i):
+        return torch.randn(3, self.size, self.size), torch.randint(0, self.classes, (1,)).item()
+
+
+if __name__ == "__main__":
+    main()
+</code></pre>
+
+<h2>The Compilation Warm-Up Cost</h2>
+
+<p>The first 1–3 steps are dramatically slower due to compilation:</p>
+
+<div class="diagram">
+    Typical step time profile with torch.compile:
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    Step 0:   ████████████████████████████████████████████  45,000 ms (compilation!)
+    Step 1:   ██████████████  2,500 ms (secondary traces, backward compilation)
+    Step 2:   ████████  800 ms (CUDA warm-up, caching)
+    Step 3:   ████  380 ms (approaching steady state)
+    Step 4+:  ███  340 ms (steady state) ← This is your actual throughput
+
+    Compilation cost: ~50 seconds for ViT-Huge
+    Amortized over 1000-step training: 50ms/step overhead (negligible)
+    Amortized over 100-step training: 500ms/step overhead (significant!)
+</div>
+    </code></pre>
+
+    <div class="callout warning">
+        <strong>Compilation is only worth it for long training runs.</strong> If you're running < 100 steps (debugging, hyperparameter search), disable compilation. The 45-second compile cost dominates. For production runs (thousands of steps), the 10-20% steady-state speedup easily amortizes.
+    </div>
+
+    <pre><code class="language-python"># Pattern: conditional compilation based on run length
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--compile", action="store_true", default=False)
+parser.add_argument("--compile-mode", default="default",
+                    choices=["default", "reduce-overhead", "max-autotune"])
+args = parser.parse_args()
+
+# After FSDP2 setup:
+if args.compile:
+    model = torch.compile(model, mode=args.compile_mode)
+    if local_rank == 0:
+        print(f"[Compile] Enabled, mode={args.compile_mode}")
+else:
+    if local_rank == 0:
+        print("[Compile] Disabled (use --compile for production runs)")
+</code></pre>
+
+    <h2>Interaction: torch.compile + FSDP2 Hooks</h2>
+
+    <p>Understanding how compilation interacts with FSDP2's hook mechanism:</p>
+
+    <pre><code class="language-python"># When you call torch.compile(model):
+# 1. The compiler wraps model.__call__ (which calls forward)
+# 2. On first invocation, it traces the forward pass
+# 3. FSDP2's pre-forward hooks fire BEFORE the compiled region starts
+#    (hooks are at module.__call__ level, not inside forward())
+# 4. The compiled graph sees parameters as already-unsharded (Replicate)
+# 5. Post-forward hooks fire AFTER the compiled forward returns
+
+# Visually:
+# model(input)
+#   → __call__ dispatch
+#     → PRE-FORWARD HOOK (FSDP2: all-gather) — NOT compiled, runs eagerly
+#     → compiled_forward(input)              — COMPILED, optimized
+#     → POST-FORWARD HOOK (FSDP2: free)      — NOT compiled, runs eagerly
+#   → return output
+
+# Implication: FSDP2's communication is OUTSIDE the compiled graph.
+# The compiler only sees and optimizes the compute between communication points.
+# This is by design — NCCL calls can't be compiled (they're side-effectful
+# communication with other processes).
+</code></pre>
+
+    <div class="callout">
+        <strong>The compiled region is the compute within each FSDP unit.</strong> For a transformer block, this includes: LayerNorm → Q/K/V projection → attention → output projection → residual → LayerNorm → MLP → residual. All of this is compiled and fused. The FSDP2 communication (all-gather, reduce-scatter) remains as eager Python/NCCL calls surrounding the compiled region.
+    </div>
+
+    <h2>Compile Per-Module vs Whole Model</h2>
+
+    <pre><code class="language-python"># Option A: Compile the whole model (recommended)
+model = torch.compile(model)
+# The compiler will trace through all blocks
+# Produces the largest possible compiled regions
+# Downside: longer initial compilation time
+
+# Option B: Compile individual blocks (faster compile, but less fusion)
+for block in model.blocks:
+    block.forward = torch.compile(block.forward)
+# Each block is compiled independently
+# Cannot fuse across block boundaries
+# Upside: faster compilation, easier debugging
+# Downside: ~5% less fusion benefit
+
+# Option C: Compile with dynamic=True for variable input shapes
+model = torch.compile(model, dynamic=True)
+# Allows different batch sizes without recompilation
+# Slightly less optimized kernels (can't hard-code shapes)
+# Useful during evaluation where batch size may vary
+
+# For your training with fixed batch size and image size:
+# Option A is best. Shapes are constant → compiler can specialize fully.
+</code></pre>
+
+    <h2>V100-Specific Compilation Considerations</h2>
+
+    <pre><code class="language-python"># V100 differences from A100/H100 for torch.compile:
+
+# 1. No native bf16 → all mixed-precision is fp16
+#    Compiler generates fp16 Triton kernels (works fine)
+
+# 2. Smaller L2 cache (6 MB vs 40-50 MB on A100)
+#    Fused kernels that fit in L2 on A100 might spill to HBM on V100
+#    Impact: some fusions less beneficial than on newer GPUs
+
+# 3. Older Triton support
+#    V100 (sm_70) has full Triton support but some advanced features
+#    (like TMA loads on H100) aren't available
+#    Impact: generated kernels are simpler, slightly less optimized
+
+# 4. Tensor Core instruction set (HMMA vs newer HFMA2)
+#    V100 Tensor Cores have different performance characteristics
+#    torch.compile respects this and generates appropriate kernels
+
+# 5. Limited GPU memory may constrain compilation memory
+#    Compilation itself can use significant GPU memory for autotuning
+#    If you OOM during compilation: try mode="default" instead of "max-autotune"
+
+# Net impact on V100:
+#   Expected speedup: 10-20% (vs 20-40% on A100/H100)
+#   Still very much worth it for production training runs.
+</code></pre>
+
+    <h2>Debugging Compilation Issues</h2>
+
+    <pre><code class="language-python"># Common issues and solutions:
+
+# Issue 1: "Can't compile, graph break at X"
+# Solution: Use torch._dynamo.explain() to find the source
+import torch._dynamo
+
+@torch._dynamo.explain
+def debug_forward(model, x):
+    return model(x)
+
+# Run with a sample input:
+sample = torch.randn(2, 3, 224, 224, device="cuda")
+result = debug_forward(model, sample)
+# Prints all graph breaks with reasons
+
+
+# Issue 2: Compilation takes too long (> 10 minutes)
+# Solutions:
+#   a. Use mode="default" instead of "max-autotune"
+#   b. Compile per-block instead of whole model
+#   c. Set cache: TORCHINDUCTOR_CACHE_DIR for persistent caching
+os.environ["TORCHINDUCTOR_CACHE_DIR"] = "/tmp/torch_compile_cache"
+#   Subsequent runs reuse compiled kernels (seconds instead of minutes)
+
+
+# Issue 3: Compiled model gives different numerical results
+# This is EXPECTED to a small degree (1e-5 to 1e-4 relative diff)
+# Causes:
+#   - Fused kernels may use different accumulation order
+#   - Triton kernels may use different intermediate precision
+# If differences are large (> 1e-3): likely a compiler bug, report it
+# Verification:
+def verify_compile_correctness(model_eager, model_compiled, sample_input):
+    with torch.no_grad():
+        out_eager = model_eager(sample_input)
+        out_compiled = model_compiled(sample_input)
+    diff = (out_eager - out_compiled).abs().max().item()
+    print(f"Max abs diff: {diff:.2e}")
+    assert diff < 1e-3, f"Compilation changed results too much: {diff}"
+
+
+# Issue 4: OOM during compilation (autotuning allocates temp buffers)
+# Solutions:
+#   a. Reduce batch_size during the first few steps (compilation steps)
+#   b. Use mode="default" (less autotuning memory)
+#   c. Set: torch._inductor.config.max_autotune_gemm_backends = "ATEN"
+#      (skips Triton autotuning for GEMMs — uses cuBLAS instead)
+
+
+# Issue 5: Recompilation on every step (shape changes)
+# Symptom: Every step is slow (not just the first)
+# Cause: Something in forward changes shape dynamically each step
+# Diagnosis:
+os.environ["TORCH_LOGS"] = "+recompiles"
+# This logs every recompilation event with the trigger
+# Fix: ensure all tensor shapes are constant across steps
+</code></pre>
+
+    <h2>Persistent Compilation Cache</h2>
+
+    <pre><code class="language-python"># For HPC/Slurm environments: cache compiled kernels across jobs
+
+# Set cache directory (shared filesystem accessible by all nodes)
+os.environ["TORCHINDUCTOR_CACHE_DIR"] = "/shared/torch_cache/vit_huge_fsdp2"
+
+# First run: compiles from scratch (45+ seconds)
+# Subsequent runs: loads from cache (< 5 seconds)
+# Cache is keyed on: model graph + shapes + dtypes + compile options
+
+# IMPORTANT: Cache invalidates when ANY of these change:
+#   - PyTorch version
+#   - Model architecture (any code change in forward)
+#   - Input shapes
+#   - Compile mode
+#   - GPU type (sm_70 vs sm_80)
+#
+# For your workflow: set cache to a persistent directory on your shared filesystem.
+# Clear it when you update PyTorch or change model architecture.
+</code></pre>
+
+    <div class="callout success">
+        <strong>Production pattern:</strong> Set <code>TORCHINDUCTOR_CACHE_DIR</code> to a path on your cluster's shared filesystem (e.g., <code>/lustre/user/torch_cache/</code>). The first job compiles and caches; all subsequent jobs start training immediately. This eliminates the compilation cost for iterative experiments.
+    </div>
+
+    <h2>Expected Performance: Compiled vs Uncompiled</h2>
+
+    <table>
+        <thead>
+        <tr><th>Config (ViT-Huge, 4× V100, batch=32, AC)</th><th>Step time</th><th>Throughput</th><th>Speedup</th></tr>
+        </thead>
+        <tbody>
+        <tr>
+            <td>FSDP2, no compile (eager)</td>
+            <td>~380 ms</td>
+            <td>~336 img/s</td>
+            <td>1.0×</td>
+        </tr>
+        <tr>
+            <td>FSDP2 + compile (default)</td>
+            <td>~330 ms</td>
+            <td>~387 img/s</td>
+            <td>1.13×</td>
+        </tr>
+        <tr>
+            <td>FSDP2 + compile (max-autotune)</td>
+            <td>~315 ms</td>
+            <td>~406 img/s</td>
+            <td>1.20×</td>
+        </tr>
+        </tbody>
+    </table>
+
+    <p>Where the speedup comes from on V100:</p>
+    <ul>
+        <li>~40% from kernel launch overhead reduction (fewer, larger kernels)</li>
+        <li>~35% from memory bandwidth savings (fused ops keep data in registers)</li>
+        <li>~25% from better GPU occupancy (compiler optimizes thread block sizes)</li>
+    </ul>
+
+    <h2>torch.compile + Activation Checkpointing Interaction</h2>
+
+    <pre><code class="language-python"># When both are active:
+# 1. Activation checkpointing discards intermediate activations
+# 2. During backward, it RE-RUNS forward for each checkpointed block
+# 3. torch.compile compiles BOTH:
+#    - The original forward (for the forward pass)
+#    - The re-computation (triggered during backward)
+#
+# The recomputation uses the SAME compiled kernels as the original forward
+# (same graph structure, same shapes). So:
+# - No additional compilation cost for checkpointing
+# - The recomputed forward is equally fast as the original
+# - Net: checkpointing's 33% compute overhead is on the COMPILED compute
+#   (which is 10-20% faster) → effective overhead with compile:
+#   33% × (1 - speedup) ≈ 33% × 0.85 ≈ 28% overhead
+
+# This is why compile + checkpointing compose well:
+# The recomputation is faster (compiled), partially offsetting the overhead.
+</code></pre>
+
+    <h2>Full Production Configuration</h2>
+
+    <pre><code class="language-python">"""
+Production-ready FSDP2 + compile configuration.
+All optimizations from lessons 003-010 combined.
+"""
+
+def build_production_model(
+    world_size: int,
+    local_world_size: int,
+    compile_model: bool = True,
+    compile_mode: str = "default",
+):
+    """
+    Canonical order:
+    1. Build model (CPU)
+    2. Activation checkpointing
+    3. FSDP2 (children first, root last)
+    4. torch.compile (last)
+    """
+    # Mesh (auto-detect topology)
+    num_nodes = world_size // local_world_size
+    if num_nodes == 1:
+        mesh = init_device_mesh("cuda", (world_size,))
+    else:
+        mesh = init_device_mesh(
+            "cuda", (num_nodes, local_world_size),
+            mesh_dim_names=("replicate", "shard"),
+        )
+
+    # Mixed precision (V100)
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=torch.float16,
+        reduce_dtype=torch.float32,
+    )
+
+    # Model
+    model = timm.create_model("vit_huge_patch14_224", pretrained=False, num_classes=1000)
+
+    # Activation checkpointing
+    model.set_grad_checkpointing(enable=True)
+
+    # FSDP2
+    for block in model.blocks:
+        fully_shard(block, mesh=mesh, mp_policy=mp_policy)
+    fully_shard(model, mesh=mesh, mp_policy=mp_policy)
+
+    # Compile
+    if compile_model:
+        model = torch.compile(model, mode=compile_mode)
+
+    return model, mesh
+</code></pre>
+
+    <h2>The torch.compile + FSDP2 Mental Model</h2>
+
+    <div class="diagram">
+        Complete picture: what runs where in one forward pass
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+        For each FSDP unit (transformer block):
+
+        ┌─── EAGER (Python) ─────────────────────────────────────────┐
+        │ Pre-forward hook: all-gather params (NCCL, comms stream)   │
+        │ Pre-forward hook: cast fp32 → fp16                         │
+        └────────────────────────────────────────────────────────────┘
+        ↓
+        ┌─── COMPILED (Inductor/Triton) ─────────────────────────────┐
+        │ Fused LayerNorm + Q/K/V projection                         │
+        │ Scaled dot-product attention (cuDNN/Triton)                │
+        │ Fused output projection + dropout + residual               │
+        │ Fused LayerNorm + FC1 + GELU                               │
+        │ Fused FC2 + dropout + residual                             │
+        └────────────────────────────────────────────────────────────┘
+        ↓
+        ┌─── EAGER (Python) ─────────────────────────────────────────┐
+        │ Post-forward hook: free unsharded params                   │
+        │ (Prefetch: start next block's all-gather on comms stream)  │
+        └────────────────────────────────────────────────────────────┘
+    </div>
+
+    <div class="callout">
+        <strong>This is the final performance picture:</strong> FSDP2 manages communication eagerly (hooks, NCCL), while torch.compile optimizes everything inside — the actual neural network computation. They're orthogonal optimizations that multiply: FSDP2 gives you memory scalability + communication overlap, compile gives you faster compute within each unit.
+    </div>
+
+    <h2 id="quiz">Check Your Understanding</h2>
+
+    <div class="quiz">
+        <h3>Q1: Why must <code>torch.compile(model)</code> be called AFTER <code>fully_shard()</code>?</h3>
+        <button onclick="checkAnswer(this, false)">torch.compile needs to see DTensor parameters to generate correct communication kernels</button>
+        <button onclick="checkAnswer(this, true)">fully_shard() mutates the module in-place (replaces params with DTensors, registers hooks); compile wraps the final configured module for tracing</button>
+        <button onclick="checkAnswer(this, false)">The compiler uses sharding information to determine which operations can be parallelized across GPUs</button>
+        <button onclick="checkAnswer(this, false)">FSDP2's hooks must be registered before compilation so they appear as nodes in the compiled graph</button>
+        <div class="explanation">
+            <strong>Correct.</strong> <code>fully_shard()</code> modifies the module's parameters (replaces with DTensors) and registers forward/backward hooks. <code>torch.compile()</code> then wraps the fully-configured module for graph tracing. If you compiled first, <code>fully_shard()</code> would try to mutate a compiled module — the hooks and parameter replacements wouldn't be visible to the compiler. Note: FSDP2 hooks are NOT inside the compiled graph — they run eagerly at the <code>__call__</code> level, surrounding the compiled forward.
+        </div>
+    </div>
+
+    <div class="quiz">
+        <h3>Q2: FSDP2's communication operations (all-gather, reduce-scatter) are NOT inside the compiled graph. What is compiled?</h3>
+        <button onclick="checkAnswer(this, false)">Only the optimizer step, which is the most computationally expensive part</button>
+        <button onclick="checkAnswer(this, false)">The entire forward + backward + communication, with NCCL calls as compiler intrinsics</button>
+        <button onclick="checkAnswer(this, true)">The model computation within each FSDP unit: attention, MLP, norms, activations — everything between the communication boundaries</button>
+        <button onclick="checkAnswer(this, false)">Only the forward pass; backward is always run in eager mode for correctness with autograd</button>
+        <div class="explanation">
+            <strong>Correct.</strong> The compiled region is the actual neural network computation within each FSDP unit's forward (and its corresponding backward). FSDP2's pre-forward hook (all-gather) runs eagerly BEFORE the compiled forward; post-forward hook (free params) runs eagerly AFTER. The compiler sees parameters as regular tensors (already unsharded and cast to fp16) and optimizes the math between communication points. Backward IS also compiled (torch.compile handles both directions).
+        </div>
+    </div>
+
+    <div class="quiz">
+        <h3>Q3: Your first training step takes 45 seconds with torch.compile. Steps 5+ take 330ms. You're running a 50-step hyperparameter search. Should you use compile?</h3>
+        <button onclick="checkAnswer(this, true)">No — 45s compilation + 50×330ms = 61.5s total vs 50×380ms = 19s without compile. Compilation cost dominates.</button>
+        <button onclick="checkAnswer(this, false)">Yes — the 13% speedup still matters because the compilation result is cached for future runs</button>
+        <button onclick="checkAnswer(this, false)">Yes — use fullgraph=True to reduce compilation time to under 5 seconds</button>
+        <button onclick="checkAnswer(this, false)">No — but only because V100's 10-20% speedup is too small; on A100 the answer would be yes</button>
+        <div class="explanation">
+            <strong>Correct.</strong> For 50 steps: compiled = 45s + 50×0.33s = 61.5s. Eager = 50×0.38s = 19s. Compilation makes the run 3× slower! Only enable compile when amortization makes sense (typically > 200-500 steps). However, if the TORCHINDUCTOR_CACHE_DIR has a warm cache from a previous run with the same model/shapes, compilation is near-instant — in that case, always compile. Answer B is partially valid only if the cache is pre-warmed.
+        </div>
+    </div>
+
+    <div class="quiz">
+        <h3>Q4: You observe that with torch.compile + FSDP2, throughput improved by 15% but peak memory increased by 8%. Why?</h3>
+        <button onclick="checkAnswer(this, false)">The compiled graph caches all intermediate activations even with activation checkpointing enabled</button>
+        <button onclick="checkAnswer(this, true)">torch.compile's memory planner may allocate larger buffers for fused kernels and the autograd graph stores additional metadata for compiled operations</button>
+        <button onclick="checkAnswer(this, false)">The compiled model stores duplicate parameters — one for eager hooks and one for the compiled graph</button>
+        <button onclick="checkAnswer(this, false)">NCCL allocates larger communication buffers when it detects compiled code to enable better overlap</button>
+        <div class="explanation">
+            <strong>Correct.</strong> Compilation can increase memory usage because: (1) Fused kernels may use larger workspace buffers than individual kernels. (2) The Inductor memory planner pre-allocates buffer pools for known-size intermediates rather than using the default allocator's more conservative approach. (3) The autograd graph for compiled regions stores additional nodes for the decomposed operations. The 8% increase is typical and expected — it's the trade-off for 15% faster compute. If memory is tight, this might force you to reduce batch size, partially offsetting the throughput gain.
+        </div>
+    </div>
+
+    <h2>Key Takeaways</h2>
+    <ol>
+        <li><strong>Canonical order: build → AC → fully_shard → compile.</strong> Compile always comes last.</li>
+        <li><strong>FSDP2 was designed for torch.compile.</strong> DTensor ops have compiler support; no graph breaks at FSDP boundaries (unlike FSDP1).</li>
+        <li><strong>Communication stays eager; compute is compiled.</strong> Pre/post-forward hooks (NCCL) run outside the compiled graph. Everything between (attention, MLP, norms) is compiled and fused.</li>
+        <li><strong>Expected V100 speedup: 10–20%.</strong> Sources: kernel fusion (40%), memory bandwidth savings (35%), better occupancy (25%).</li>
+        <li><strong>Compilation cost: 30–60s first step.</strong> Only amortizes over long runs (>200 steps). Use <code>TORCHINDUCTOR_CACHE_DIR</code> for persistent caching across jobs.</li>
+        <li><strong>Compile may increase memory by 5–10%.</strong> Fused kernels use larger workspace buffers. Factor this into your batch size calculations.</li>
+        <li><strong>Use <code>torch._dynamo.explain()</code> to find graph breaks.</strong> timm ViTs compile cleanly; custom models may need fixes (remove .item(), control flow on tensor values, etc.).</li>
+        <li><strong>Compile + checkpointing compose well:</strong> recomputation uses the same compiled kernels, making the recomputed forward faster. Effective overhead drops from 33% to ~28%.</li>
+    </ol>
+
+    <h2>Primary Source</h2>
+    <p>Study the <a href="https://pytorch.org/tutorials/intermediate/torch_compile_tutorial.html">torch.compile tutorial</a> for the compilation fundamentals, then examine <a href="https://github.com/pytorch/torchtitan/blob/main/torchtitan/train.py">torchtitan's train.py</a> to see how they apply <code>torch.compile</code> after FSDP2 setup in production. The <a href="https://dev-discuss.pytorch.org/t/torchinductor-a-pytorch-native-compiler-with-define-by-run-ir-and-symbolic-shapes/747">TorchInductor design doc</a> explains the fusion and codegen pipeline in detail.</p>
+
+
+    <script>
+        function checkAnswer(btn, correct) {
+            const quiz = btn.closest('.quiz');
+            const buttons = quiz.querySelectorAll('button');
+            const explanation = quiz.querySelector('.explanation');
+            buttons.forEach(b => { b.disabled = true; b.classList.remove('correct', 'incorrect'); });
+            if (correct) {
+                btn.classList.add('correct');
+            } else {
+                btn.classList.add('incorrect');
+                buttons.forEach(b => { if (b.getAttribute('onclick').includes('true')) b.classList.add('correct'); });
+            }
+            explanation.style.display = 'block';
+        }
+    </script>

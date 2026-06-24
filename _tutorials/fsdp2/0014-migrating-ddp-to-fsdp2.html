@@ -1,0 +1,916 @@
+---
+layout: tutorial
+tutorial: fsdp2
+type: lesson
+lesson: 14
+total: 18
+title: "Migrating an Existing DDP Pipeline to FSDP2"
+tags: [Integration, Migration]
+permalink: /heap/fsdp2/0014/
+---
+
+<p><em>A systematic process for converting your Fraunhofer training framework from DDP to FSDP2 with minimal disruption and full correctness verification.</em></p>
+
+<h2>Migration Philosophy</h2>
+
+<p>The goal is NOT to rewrite your training pipeline. It's to <strong>surgically replace</strong> the distribution strategy while keeping everything else (data loading, logging, evaluation, model definition) unchanged. FSDP2's composable design makes this possible — but you need a structured approach to avoid subtle bugs.</p>
+
+<p>The migration has <strong>7 discrete steps</strong>. Each step is independently testable. You can stop at any step and have a working system.</p>
+
+<h2>Step 0: Audit Your Current DDP Pipeline</h2>
+
+<p>Before changing anything, document what your existing DDP code does:</p>
+
+<pre><code class="language-python"># Typical DDP pipeline structure (what you likely have):
+
+def main():
+    # 1. Distributed setup
+    dist.init_process_group("nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+
+    # 2. Model construction
+    model = build_model()
+    model = model.cuda()  # ← Full model on GPU
+
+    # 3. DDP wrapping
+    model = torch.nn.parallel.DistributedDataParallel(
+        model, device_ids=[local_rank]
+    )
+
+    # 4. Optimizer
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+
+    # 5. AMP setup
+    scaler = torch.cuda.amp.GradScaler()
+
+    # 6. Data
+    sampler = DistributedSampler(dataset)
+    dataloader = DataLoader(dataset, sampler=sampler, ...)
+
+    # 7. Training loop
+    for epoch in range(num_epochs):
+        sampler.set_epoch(epoch)
+        for images, labels in dataloader:
+            with torch.cuda.amp.autocast(dtype=torch.float16):
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.module.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+
+    # 8. Checkpoint
+    if local_rank == 0:
+        torch.save(model.module.state_dict(), "checkpoint.pt")
+</code></pre>
+
+<h3>Identify DDP-Specific Patterns to Remove</h3>
+
+<pre><code class="language-python"># Patterns that MUST change:
+patterns_to_remove = {
+    "torch.nn.parallel.DistributedDataParallel": "Replaced by fully_shard()",
+    "model.module.XXX": "FSDP2 doesn't wrap → use model.XXX directly",
+    "torch.cuda.amp.GradScaler": "Not needed with MixedPrecisionPolicy",
+    "torch.cuda.amp.autocast": "Not needed — FSDP2 handles precision",
+    "scaler.scale(loss)": "Just call loss.backward() directly",
+    "scaler.step(optimizer)": "Just call optimizer.step() directly",
+    "model.cuda()": "Let fully_shard() handle device placement",
+    "torch.save(model.module.state_dict())": "Use DCP for sharded saves",
+}
+
+# Patterns that stay UNCHANGED:
+patterns_unchanged = {
+    "dist.init_process_group('nccl')": "Same",
+    "DistributedSampler": "Same — data distribution is unchanged",
+    "sampler.set_epoch(epoch)": "Same",
+    "optimizer.zero_grad()": "Same",
+    "torch.nn.utils.clip_grad_norm_": "Same (works on DTensor grads)",
+    "DataLoader(..., drop_last=True)": "Same",
+    "loss.backward()": "Same (FSDP2 hooks handle the rest)",
+}
+</code></pre>
+
+<h2>Step 1: Remove DDP Wrapping, Add FSDP2</h2>
+
+<p>The minimal change — replace the distribution strategy:</p>
+
+<pre><code class="language-python"># BEFORE (DDP):
+model = build_model()
+model = model.cuda()
+model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
+
+# AFTER (FSDP2):
+from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
+from torch.distributed.device_mesh import init_device_mesh
+
+model = build_model()  # On CPU — do NOT call .cuda()
+
+mesh = init_device_mesh("cuda", (world_size,))
+mp_policy = MixedPrecisionPolicy(param_dtype=torch.float16, reduce_dtype=torch.float32)
+
+# Apply per-block sharding (identify the repeated blocks in your model)
+for block in get_transformer_blocks(model):  # You define this helper
+    fully_shard(block, mesh=mesh, mp_policy=mp_policy)
+fully_shard(model, mesh=mesh, mp_policy=mp_policy)
+</code></pre>
+
+<div class="callout">
+    <strong>The critical helper: <code>get_transformer_blocks()</code>.</strong> You need to identify which submodules are the repeated units to shard individually. For timm models: <code>model.blocks</code>. For HuggingFace ViT: <code>model.vit.encoder.layer</code>. For custom models: whatever your repeated layer container is. This is the ONE model-specific knowledge you need.
+</div>
+
+<h3>Finding the Sharding Units in Any Model</h3>
+
+<pre><code class="language-python">def find_sharding_units(model: nn.Module) -> list[nn.Module]:
+    """
+    Heuristic: find repeated modules that should be individual FSDP units.
+    Works for most transformer architectures.
+    """
+    # Strategy: find the largest repeated submodule class
+    from collections import Counter
+
+    class_counts = Counter()
+    class_modules = {}
+
+    for name, module in model.named_modules():
+        cls_name = type(module).__name__
+        class_counts[cls_name] += 1
+        if cls_name not in class_modules:
+            class_modules[cls_name] = []
+        class_modules[cls_name].append((name, module))
+
+    # Find the most-repeated class with substantial parameters
+    candidates = []
+    for cls_name, count in class_counts.most_common():
+        if count < 4:  # At least 4 repetitions
+            continue
+        modules = class_modules[cls_name]
+        param_count = sum(p.numel() for p in modules[0][1].parameters())
+        if param_count > 1_000_000:  # At least 1M params per unit
+            candidates.append((cls_name, count, param_count, modules))
+
+    if not candidates:
+        print("⚠️ No obvious sharding units found. Shard root only.")
+        return []
+
+    # Pick the one with most params × count (total contribution)
+    best = max(candidates, key=lambda x: x[1] * x[2])
+    cls_name, count, param_count, modules = best
+
+    print(f"[Auto-detect] Sharding unit: {cls_name} "
+          f"({count} instances, {param_count:,} params each)")
+
+    return [m for _, m in modules]
+
+
+# Usage:
+units = find_sharding_units(model)
+for unit in units:
+    fully_shard(unit, mesh=mesh, mp_policy=mp_policy)
+fully_shard(model, mesh=mesh, mp_policy=mp_policy)
+</code></pre>
+
+<h2>Step 2: Remove AMP / GradScaler</h2>
+
+<pre><code class="language-python"># BEFORE (DDP + AMP):
+scaler = torch.cuda.amp.GradScaler()
+
+for images, labels in dataloader:
+    with torch.cuda.amp.autocast(dtype=torch.float16):
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+
+    scaler.scale(loss).backward()
+    scaler.unscale_(optimizer)
+    torch.nn.utils.clip_grad_norm_(model.module.parameters(), max_norm=1.0)
+    scaler.step(optimizer)
+    scaler.update()
+    optimizer.zero_grad()
+
+
+# AFTER (FSDP2 — precision handled by mp_policy):
+for images, labels in dataloader:
+    outputs = model(images)           # No autocast needed
+    loss = criterion(outputs, labels)
+
+    loss.backward()                   # No scaler needed
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # No .module!
+    optimizer.step()                  # Direct step
+    optimizer.zero_grad()
+</code></pre>
+
+<div class="callout success">
+    <strong>Simplification win:</strong> Five lines of AMP/scaler ceremony collapse to zero. The <code>MixedPrecisionPolicy</code> you passed to <code>fully_shard()</code> handles all dtype transitions internally. Your training loop becomes cleaner and less error-prone.
+</div>
+
+<h2>Step 3: Remove model.module References</h2>
+
+<pre><code class="language-python"># DDP wraps the model, so you access the original via model.module:
+#   model.module.state_dict()
+#   model.module.parameters()
+#   model.module.encoder.layers[0]
+
+# FSDP2 does NOT wrap. The model IS the model:
+#   model.state_dict()        ← works (returns sharded DTensors)
+#   model.parameters()        ← works (yields sharded DTensors)
+#   model.encoder.layers[0]   ← works (module tree preserved)
+
+# Find and replace all occurrences:
+# Before:  model.module.whatever
+# After:   model.whatever
+
+# Common locations:
+#   - Checkpoint saving/loading
+#   - Gradient clipping
+#   - Custom LR schedulers that access model internals
+#   - Evaluation/inference code
+#   - Logging hooks
+</code></pre>
+
+<h2>Step 4: Update Checkpoint Code</h2>
+
+<pre><code class="language-python"># BEFORE (DDP):
+# Save
+if local_rank == 0:
+    torch.save({
+        "model": model.module.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "epoch": epoch,
+    }, "checkpoint.pt")
+
+# Load
+ckpt = torch.load("checkpoint.pt", map_location=f"cuda:{local_rank}")
+model.module.load_state_dict(ckpt["model"])
+optimizer.load_state_dict(ckpt["optimizer"])
+
+
+# AFTER (FSDP2 + DCP):
+import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint.state_dict import (
+    get_model_state_dict, get_optimizer_state_dict,
+    set_model_state_dict, set_optimizer_state_dict,
+)
+
+# Save (ALL ranks must call)
+state_dict = {
+    "model": get_model_state_dict(model),
+    "optimizer": get_optimizer_state_dict(model, optimizer),
+    "epoch": epoch,
+}
+dcp.save(state_dict, checkpoint_id="./checkpoints/step_N")
+
+# Load (ALL ranks must call)
+state_dict = {
+    "model": get_model_state_dict(model),
+    "optimizer": get_optimizer_state_dict(model, optimizer),
+    "epoch": 0,
+}
+dcp.load(state_dict, checkpoint_id="./checkpoints/step_N")
+set_model_state_dict(model, state_dict["model"])
+set_optimizer_state_dict(model, optimizer, state_dict["optimizer"])
+</code></pre>
+
+<div class="callout warning">
+    <strong>Breaking change:</strong> DDP checkpoints (.pt files) are NOT directly loadable by FSDP2 (they're full state dicts, FSDP2 expects sharded). To migrate existing checkpoints: load the .pt on CPU into the unsharded model BEFORE calling <code>fully_shard()</code>, then save with DCP for future use.
+</div>
+
+<h3>Migrating Existing Checkpoints</h3>
+
+<pre><code class="language-python">def migrate_ddp_checkpoint_to_fsdp2(
+    ddp_checkpoint_path: str,
+    model: nn.Module,
+    mesh,
+    mp_policy,
+    output_dcp_dir: str,
+):
+    """
+    One-time migration: load old DDP checkpoint, save as DCP.
+    Run this once, then use DCP checkpoints going forward.
+    """
+    # 1. Load DDP checkpoint into unsharded model (on CPU)
+    state_dict = torch.load(ddp_checkpoint_path, map_location="cpu", weights_only=True)
+
+    # Handle model.module prefix if saved from DDP
+    if any(k.startswith("module.") for k in state_dict.keys()):
+        state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+
+    model.load_state_dict(state_dict, strict=True)
+
+    if dist.get_rank() == 0:
+        print(f"[Migrate] Loaded DDP checkpoint: {ddp_checkpoint_path}")
+
+    # 2. Apply FSDP2 (this distributes the loaded weights)
+    for block in find_sharding_units(model):
+        fully_shard(block, mesh=mesh, mp_policy=mp_policy)
+    fully_shard(model, mesh=mesh, mp_policy=mp_policy)
+
+    # 3. Save as DCP
+    from torch.distributed.checkpoint.state_dict import get_model_state_dict
+    state = {"model": get_model_state_dict(model)}
+    dcp.save(state, checkpoint_id=output_dcp_dir)
+
+    if dist.get_rank() == 0:
+        print(f"[Migrate] Saved DCP checkpoint: {output_dcp_dir}")
+
+    return model
+</code></pre>
+
+<h2>Step 5: Update Evaluation / Inference Code</h2>
+
+<pre><code class="language-python"># BEFORE (DDP evaluation):
+model.eval()
+with torch.no_grad():
+    for images, labels in val_loader:
+        images = images.cuda()
+        with torch.cuda.amp.autocast(dtype=torch.float16):
+            outputs = model(images)
+        # ... compute metrics ...
+
+
+# AFTER (FSDP2 evaluation):
+model.eval()
+with torch.no_grad():
+    for images, labels in val_loader:
+        images = images.to(local_rank, non_blocking=True)
+        outputs = model(images)  # FSDP2 handles precision internally
+        # ... compute metrics (same as before) ...
+
+# Key differences:
+# 1. No autocast needed (mp_policy handles it)
+# 2. No model.module (model IS the model)
+# 3. Validation still needs DistributedSampler or equivalent
+#    (each rank evaluates its shard of val data, then aggregate metrics)
+# 4. All-gathers still fire during eval forward (params are sharded)
+#    This is unavoidable — params must be gathered for compute
+</code></pre>
+
+<h3>Single-GPU Inference After Training</h3>
+
+<pre><code class="language-python"># For deployment: export full state dict, load into plain model
+
+# During training (add at the end):
+from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
+
+if dist.get_rank() == 0:
+    options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+    full_state = get_model_state_dict(model, options=options)
+    torch.save(full_state, "model_for_inference.pt")
+
+# At inference (no distributed setup needed):
+model = build_model()
+state_dict = torch.load("model_for_inference.pt", map_location="cuda:0")
+model.load_state_dict(state_dict)
+model.eval()
+model.cuda()
+# Use normally — no FSDP2, no distributed, just a regular model
+</code></pre>
+
+<h2>Step 6: Handle Framework-Specific Patterns</h2>
+
+<p>Your Fraunhofer framework likely has custom patterns. Here are common ones and their FSDP2 equivalents:</p>
+
+<table>
+    <thead>
+    <tr><th>DDP Pattern</th><th>FSDP2 Equivalent</th><th>Notes</th></tr>
+    </thead>
+    <tbody>
+    <tr>
+        <td><code>model.no_sync()</code> for grad accum</td>
+        <td>Not needed — just accumulate</td>
+        <td>FSDP2 must all-gather every forward anyway; reduce-scatter still happens per micro-batch</td>
+    </tr>
+    <tr>
+        <td>Custom LR scheduler accessing <code>model.module</code></td>
+        <td>Access <code>model</code> directly</td>
+        <td>No .module indirection</td>
+    </tr>
+    <tr>
+        <td>EMA (Exponential Moving Average) model</td>
+        <td>EMA on sharded params (see below)</td>
+        <td>Requires care with DTensor</td>
+    </tr>
+    <tr>
+        <td>Multi-task heads with different LR</td>
+        <td>Use param_groups with sharded params</td>
+        <td>Works identically — param_groups reference the sharded DTensors</td>
+    </tr>
+    <tr>
+        <td>Gradient penalty (accessing params in forward)</td>
+        <td>Works — params are Replicate during forward</td>
+        <td>Access params inside forward() as normal</td>
+    </tr>
+    <tr>
+        <td>torch.cuda.amp.autocast in specific submodules</td>
+        <td>Remove — mp_policy handles globally</td>
+        <td>Per-module precision via different mp_policy per FSDP unit if needed</td>
+    </tr>
+    <tr>
+        <td>SyncBatchNorm</td>
+        <td>Same — SyncBN works with FSDP2</td>
+        <td>Ensure SyncBN uses the correct process group</td>
+    </tr>
+    <tr>
+        <td>Custom backward hooks (<code>register_hook</code>)</td>
+        <td>Works on DTensor grads</td>
+        <td>Hook receives sharded grad tensor; handle accordingly</td>
+    </tr>
+    </tbody>
+</table>
+
+<h3>EMA with FSDP2 (Common in Vision)</h3>
+
+<pre><code class="language-python">class ShardedEMA:
+    """
+    Exponential Moving Average compatible with FSDP2 sharded parameters.
+
+    Key insight: EMA state is maintained as SHARDED tensors matching
+    the training model's sharding. No gathering needed.
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.decay = decay
+        # Store EMA of sharded params (same shape as model params)
+        self.shadow = {}
+        for name, param in model.named_parameters():
+            if hasattr(param, '_local_tensor'):
+                # DTensor: store EMA of the local shard
+                self.shadow[name] = param._local_tensor.detach().clone()
+            else:
+                self.shadow[name] = param.detach().clone()
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        """Update EMA after optimizer step."""
+        for name, param in model.named_parameters():
+            if name not in self.shadow:
+                continue
+
+            local = param._local_tensor if hasattr(param, '_local_tensor') else param
+            self.shadow[name].lerp_(local, 1.0 - self.decay)
+
+    def apply_to(self, model: nn.Module) -> None:
+        """Replace model params with EMA values (for evaluation)."""
+        for name, param in model.named_parameters():
+            if name not in self.shadow:
+                continue
+
+            if hasattr(param, '_local_tensor'):
+                param._local_tensor.copy_(self.shadow[name])
+            else:
+                param.data.copy_(self.shadow[name])
+
+    def state_dict(self) -> dict:
+        """For checkpointing EMA state."""
+        return {"shadow": self.shadow, "decay": self.decay}
+
+    def load_state_dict(self, state: dict) -> None:
+        self.shadow = state["shadow"]
+        self.decay = state["decay"]
+
+
+# Usage:
+ema = ShardedEMA(model, decay=0.9999)
+
+for step, (images, labels) in enumerate(dataloader):
+    # ... forward, backward, optimizer step ...
+    ema.update(model)
+
+# For evaluation:
+ema.apply_to(model)
+# ... evaluate ...
+# Restore original weights after eval if continuing training
+</code></pre>
+
+<h2>Step 7: Verify Correctness</h2>
+
+<p>The most critical step. After migration, you must verify that FSDP2 produces the same results as DDP (within fp precision):</p>
+
+<pre><code class="language-python">def verify_migration_correctness(
+    ddp_checkpoint: str,
+    fsdp2_model: nn.Module,
+    sample_batch: tuple[torch.Tensor, torch.Tensor],
+    local_rank: int,
+    tolerance: float = 1e-4,
+):
+    """
+    Verify that FSDP2 model produces same output as DDP for same input.
+
+    Run this once after migration, on the same input data.
+    """
+    images, labels = sample_batch
+    images = images.to(local_rank)
+    labels = labels.to(local_rank)
+
+    # --- FSDP2 forward ---
+    fsdp2_model.eval()
+    with torch.no_grad():
+        fsdp2_output = fsdp2_model(images)
+        fsdp2_loss = nn.functional.cross_entropy(fsdp2_output, labels)
+
+    # --- DDP reference (single GPU, same weights) ---
+    if local_rank == 0:
+        from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
+
+        # Get full weights from FSDP2 model
+        options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+        full_state = get_model_state_dict(fsdp2_model, options=options)
+
+        # Build reference model
+        ref_model = build_model().cuda()
+        ref_model.load_state_dict(full_state)
+        ref_model.eval()
+
+        with torch.no_grad():
+            with torch.cuda.amp.autocast(dtype=torch.float16):  # Match FSDP2's mp
+                ref_output = ref_model(images)
+                ref_loss = nn.functional.cross_entropy(ref_output, labels)
+
+        # Compare
+        output_diff = (fsdp2_output - ref_output).abs().max().item()
+        loss_diff = abs(fsdp2_loss.item() - ref_loss.item())
+
+        print(f"[Verify] Output max diff: {output_diff:.2e} (tolerance: {tolerance})")
+        print(f"[Verify] Loss diff: {loss_diff:.2e}")
+
+        if output_diff < tolerance and loss_diff < tolerance:
+            print("[Verify] ✓ Migration correctness verified!")
+        else:
+            print("[Verify] ⚠️ Differences exceed tolerance — investigate!")
+            print("  Common causes: different autocast scope, missing weight loading,")
+            print("  different dropout state, or batch normalization running stats.")
+</code></pre>
+
+<h2>Complete Migration Diff</h2>
+
+<p>Here's a side-by-side comparison showing the minimal changes for a typical pipeline:</p>
+
+<pre><code class="language-python"># ═══════════════════════════════════════════════════════════════════
+# BEFORE: DDP Pipeline
+# ═══════════════════════════════════════════════════════════════════
+
+import torch
+import torch.nn as nn
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler
+
+def main():
+    dist.init_process_group("nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+
+    model = build_model().cuda()                          # ← GPU
+    model = DDP(model, device_ids=[local_rank])           # ← DDP wrap
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    scaler = torch.cuda.amp.GradScaler()                  # ← GradScaler
+
+    sampler = DistributedSampler(dataset)
+    dataloader = DataLoader(dataset, batch_size=16, sampler=sampler, drop_last=True)
+
+    for epoch in range(num_epochs):
+        sampler.set_epoch(epoch)
+        for images, labels in dataloader:
+            images = images.cuda()
+            labels = labels.cuda()
+
+            with torch.cuda.amp.autocast(torch.float16):  # ← autocast
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+
+            scaler.scale(loss).backward()                 # ← scaled backward
+            scaler.unscale_(optimizer)                    # ← unscale
+            torch.nn.utils.clip_grad_norm_(
+                model.module.parameters(), 1.0            # ← .module
+            )
+            scaler.step(optimizer)                        # ← scaler step
+            scaler.update()                               # ← scaler update
+            optimizer.zero_grad()
+
+        if local_rank == 0:
+            torch.save(model.module.state_dict(), f"ckpt_e{epoch}.pt")  # ← .module
+
+
+# ═══════════════════════════════════════════════════════════════════
+# AFTER: FSDP2 Pipeline
+# ═══════════════════════════════════════════════════════════════════
+
+import torch
+import torch.nn as nn
+import torch.distributed as dist
+import torch.distributed.checkpoint as dcp
+from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.checkpoint.state_dict import get_model_state_dict
+from torch.utils.data import DataLoader, DistributedSampler
+
+def main():
+    dist.init_process_group("nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = dist.get_world_size()
+    torch.cuda.set_device(local_rank)
+
+    model = build_model()                                 # ← CPU (no .cuda())
+    model.set_grad_checkpointing(enable=True)             # ← Optional: AC
+
+    mesh = init_device_mesh("cuda", (world_size,))        # ← NEW: mesh
+    mp_policy = MixedPrecisionPolicy(                     # ← NEW: replaces autocast
+        param_dtype=torch.float16, reduce_dtype=torch.float32
+    )
+
+    for block in model.blocks:                            # ← NEW: per-block shard
+        fully_shard(block, mesh=mesh, mp_policy=mp_policy)
+    fully_shard(model, mesh=mesh, mp_policy=mp_policy)    # ← NEW: root shard
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)  # ← AFTER shard
+    # (no GradScaler)
+
+    sampler = DistributedSampler(dataset)
+    dataloader = DataLoader(dataset, batch_size=32, sampler=sampler, drop_last=True)
+                                                          # ↑ can increase batch!
+
+    for epoch in range(num_epochs):
+        sampler.set_epoch(epoch)
+        for images, labels in dataloader:
+            images = images.to(local_rank, non_blocking=True)
+            labels = labels.to(local_rank, non_blocking=True)
+
+            outputs = model(images)                       # ← No autocast
+            loss = criterion(outputs, labels)
+
+            loss.backward()                               # ← Direct backward
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(), 1.0                   # ← No .module
+            )
+            optimizer.step()                              # ← Direct step
+            optimizer.zero_grad()
+
+        # Sharded checkpoint (all ranks)
+        state = {"model": get_model_state_dict(model), "epoch": epoch}
+        dcp.save(state, checkpoint_id=f"./ckpts/epoch_{epoch}")  # ← DCP
+</code></pre>
+
+<h2>Migration Checklist</h2>
+
+<pre><code class="language-python"># Copy this checklist into your migration PR/ticket:
+
+MIGRATION_CHECKLIST = """
+FSDP2 Migration Checklist
+═════════════════════════
+
+Pre-migration:
+  [ ] Identified sharding units (which modules to pass to fully_shard)
+  [ ] Documented current DDP pipeline structure
+  [ ] Confirmed PyTorch >= 2.4 on cluster
+  [ ] Set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+  [ ] Existing DDP checkpoint available for weight loading
+
+Code changes:
+  [ ] Removed DDP wrapping (DistributedDataParallel)
+  [ ] Added DeviceMesh construction
+  [ ] Added MixedPrecisionPolicy
+  [ ] Added per-block fully_shard() + root fully_shard()
+  [ ] Removed model.cuda() (model stays on CPU until fully_shard)
+  [ ] Removed GradScaler + autocast
+  [ ] Removed all model.module references
+  [ ] Moved optimizer construction AFTER fully_shard()
+  [ ] Updated checkpoint save to DCP (dcp.save, all ranks)
+  [ ] Updated checkpoint load to DCP (dcp.load, all ranks)
+  [ ] Updated evaluation code (no autocast, no .module)
+  [ ] Added activation checkpointing (if needed for batch size)
+
+Optional enhancements:
+  [ ] HSDP mesh for multi-node (Lesson 009)
+  [ ] torch.compile after FSDP2 (Lesson 010)
+  [ ] Async checkpoint saving (Lesson 011)
+  [ ] Preemption handler for Slurm (Lesson 011)
+
+Verification:
+  [ ] Ran health check script (Lesson 012)
+  [ ] Verified forward output matches DDP (within fp tolerance)
+  [ ] Verified gradient norms match DDP for first 5 steps
+  [ ] Verified loss curve matches DDP over 100+ steps
+  [ ] Verified checkpoint save/load round-trip
+  [ ] Verified batch_size can be increased (memory freed by FSDP2)
+  [ ] Profiled: no unexpected graph breaks or communication stalls
+
+Performance validation:
+  [ ] Measured per-GPU throughput (should be >= DDP at same batch)
+  [ ] Measured scaling efficiency at target GPU count
+  [ ] Confirmed peak memory is lower than DDP (enables larger batch)
+"""
+</code></pre>
+
+<h2>Incremental Migration Strategy</h2>
+
+<p>For a production framework, don't migrate everything at once. Use a feature flag:</p>
+
+<pre><code class="language-python">def create_distributed_model(
+    model: nn.Module,
+    strategy: str = "ddp",  # "ddp" or "fsdp2"
+    local_rank: int = 0,
+    world_size: int = 1,
+    **kwargs,
+) -> nn.Module:
+    """
+    Factory function that supports both DDP and FSDP2.
+    Allows gradual migration and A/B comparison.
+    """
+    if strategy == "ddp":
+        model = model.cuda()
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[local_rank]
+        )
+        return model
+
+    elif strategy == "fsdp2":
+        mesh = init_device_mesh("cuda", (world_size,))
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype=torch.float16, reduce_dtype=torch.float32
+        )
+
+        if kwargs.get("activation_checkpointing", True):
+            if hasattr(model, "set_grad_checkpointing"):
+                model.set_grad_checkpointing(enable=True)
+
+        sharding_units = find_sharding_units(model)
+        for unit in sharding_units:
+            fully_shard(unit, mesh=mesh, mp_policy=mp_policy)
+        fully_shard(model, mesh=mesh, mp_policy=mp_policy)
+
+        return model
+
+    else:
+        raise ValueError(f"Unknown strategy: {strategy}")
+
+
+# In your framework config (YAML or argparse):
+# distributed:
+#   strategy: "fsdp2"  # Switch this to migrate
+#   # strategy: "ddp"  # Fall back if issues
+</code></pre>
+
+<h3>Training Loop Abstraction</h3>
+
+<pre><code class="language-python">def train_step(
+    model: nn.Module,
+    images: torch.Tensor,
+    labels: torch.Tensor,
+    optimizer: torch.optim.Optimizer,
+    strategy: str,
+    scaler=None,  # Only for DDP
+    max_grad_norm: float = 1.0,
+) -> float:
+    """
+    Strategy-agnostic training step.
+    """
+    if strategy == "ddp":
+        with torch.cuda.amp.autocast(dtype=torch.float16):
+            outputs = model(images)
+            loss = nn.functional.cross_entropy(outputs, labels)
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.module.parameters(), max_grad_norm)
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad()
+
+    elif strategy == "fsdp2":
+        outputs = model(images)
+        loss = nn.functional.cross_entropy(outputs, labels)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+        optimizer.step()
+        optimizer.zero_grad()
+
+    return loss.item()
+</code></pre>
+
+<h2>Common Migration Pitfalls</h2>
+
+<table>
+    <thead>
+    <tr><th>Pitfall</th><th>Symptom</th><th>Fix</th></tr>
+    </thead>
+    <tbody>
+    <tr>
+        <td>Calling <code>model.cuda()</code> before <code>fully_shard()</code></td>
+        <td>Works but wastes GPU memory briefly; for very large models, OOM</td>
+        <td>Remove <code>.cuda()</code> — let <code>fully_shard()</code> handle placement</td>
+    </tr>
+    <tr>
+        <td>Building optimizer before <code>fully_shard()</code></td>
+        <td>Optimizer states are full-sized → no memory savings from sharding</td>
+        <td>Always: model → shard → optimizer</td>
+    </tr>
+    <tr>
+        <td>Keeping <code>GradScaler</code> with FSDP2</td>
+        <td>Double-scaling; incorrect gradient magnitudes; training diverges</td>
+        <td>Remove GradScaler entirely; <code>reduce_dtype=fp32</code> handles underflow</td>
+    </tr>
+    <tr>
+        <td>Using <code>model.module</code> (DDP habit)</td>
+        <td><code>AttributeError: 'ViT' has no attribute 'module'</code></td>
+        <td>Remove <code>.module</code> everywhere — FSDP2 doesn't wrap</td>
+    </tr>
+    <tr>
+        <td>Saving checkpoint from rank 0 only</td>
+        <td>Other ranks hang waiting at the next collective</td>
+        <td><code>dcp.save()</code> is collective — all ranks must call</td>
+    </tr>
+    <tr>
+        <td>Loading old .pt checkpoint after <code>fully_shard()</code></td>
+        <td>Shape mismatch errors (full shapes vs sharded)</td>
+        <td>Load .pt BEFORE <code>fully_shard()</code>, or convert to DCP first</td>
+    </tr>
+    <tr>
+        <td>Custom forward hooks that call <code>.item()</code> or <code>print()</code></td>
+        <td>Graph breaks (if using torch.compile); performance loss</td>
+        <td>Guard with <code>if not torch.compiler.is_compiling():</code></td>
+    </tr>
+    <tr>
+        <td>Different random seeds across ranks for model init</td>
+        <td>Parameters differ across ranks → reduce-scatter produces garbage</td>
+        <td>Ensure all ranks use same seed for model init (or broadcast from rank 0)</td>
+    </tr>
+    </tbody>
+</table>
+
+<h2 id="quiz">Check Your Understanding</h2>
+
+<div class="quiz">
+    <h3>Q1: You're migrating a DDP pipeline that uses <code>model.no_sync()</code> for gradient accumulation (4 micro-batches). What's the FSDP2 equivalent?</h3>
+    <button onclick="checkAnswer(this, false)">Use FSDP2's set_requires_gradient_sync(False) for the first 3 micro-batches, then True for the last</button>
+    <button onclick="checkAnswer(this, true)">Just run forward+backward 4 times normally and step once — there's no equivalent optimization because all-gathers are required every forward regardless</button>
+    <button onclick="checkAnswer(this, false)">Wrap the 4 micro-batches in a torch.no_grad() context to prevent FSDP2 from synchronizing</button>
+    <button onclick="checkAnswer(this, false)">Use gradient_accumulation_steps parameter in the MixedPrecisionPolicy configuration</button>
+    <div class="explanation">
+        <strong>Correct.</strong> In DDP, <code>model.no_sync()</code> skips the gradient all-reduce on intermediate micro-batches — a valid optimization because DDP has full params on each rank. In FSDP2, you CANNOT skip the forward all-gather (params are sharded — no compute without gathering). The reduce-scatter theoretically could be deferred, but the practical benefit is minimal and the API isn't straightforward. Just accumulate normally: each micro-batch triggers full communication, and the optimizer steps once after N accumulations. The loss in communication efficiency is unavoidable with FSDP2's sharding model.
+    </div>
+</div>
+
+<div class="quiz">
+    <h3>Q2: Your existing DDP pipeline saves checkpoints with <code>torch.save(model.module.state_dict(), path)</code> on rank 0. After migrating to FSDP2, you want to load this old checkpoint for continued training. What's the correct approach?</h3>
+    <button onclick="checkAnswer(this, true)">Load the .pt file into the model on CPU BEFORE calling fully_shard(), then shard normally — fully_shard() will distribute the loaded weights</button>
+    <button onclick="checkAnswer(this, false)">Call dcp.load() pointing at the .pt file — DCP can read standard PyTorch checkpoints natively</button>
+    <button onclick="checkAnswer(this, false)">Load the .pt on all ranks simultaneously after fully_shard(), using model.load_state_dict() which handles resharding</button>
+    <button onclick="checkAnswer(this, false)">Convert the .pt file to DCP format offline, then load with dcp.load() — this is the only safe path</button>
+    <div class="explanation">
+        <strong>Correct.</strong> The simplest migration path: build model on CPU → <code>torch.load()</code> + <code>model.load_state_dict()</code> (standard PyTorch, on CPU) → then <code>fully_shard()</code>. The sharding operation distributes the already-loaded weights across ranks. This works because at the point of loading, the model is still a regular (unsharded) model with regular parameters. Answer D also works but requires an extra conversion step. Answer B is wrong — DCP cannot read standard .pt files. Answer C fails because after <code>fully_shard()</code>, parameters are sharded DTensors and won't accept full-sized tensors from <code>load_state_dict()</code>.
+    </div>
+</div>
+
+<div class="quiz">
+    <h3>Q3: After migration, you notice that FSDP2 training loss is consistently 0.01 higher than DDP for the same data after 100 steps. Is this a bug?</h3>
+    <button onclick="checkAnswer(this, false)">Yes — FSDP2 should produce bit-identical results to DDP since they compute the same math</button>
+    <button onclick="checkAnswer(this, true)">Likely not — small differences (< 0.1 relative) are expected due to different gradient reduction order (reduce-scatter vs all-reduce) and different autocast scoping, both of which change floating point accumulation</button>
+    <button onclick="checkAnswer(this, false)">Yes — this indicates the MixedPrecisionPolicy is misconfigured and using a different compute dtype than DDP's autocast</button>
+    <button onclick="checkAnswer(this, false)">Not enough information — need to compare gradient norms to determine if it's a precision or algorithmic difference</button>
+    <div class="explanation">
+        <strong>Correct.</strong> A 0.01 loss difference after 100 steps is within expected floating-point divergence. Causes: (1) DDP uses all-reduce (reduce-scatter + all-gather), FSDP2 uses reduce-scatter directly — different summation order means different fp rounding. (2) DDP's autocast scope may differ slightly from FSDP2's MixedPrecisionPolicy dtype transitions. (3) Activation checkpointing (if added) changes the recomputation graph slightly. These small differences accumulate over steps but don't affect convergence. If the difference were > 1.0 or growing exponentially, THEN investigate.
+    </div>
+</div>
+
+<div class="quiz">
+    <h3>Q4: Your framework has a hook that logs gradient statistics: <code>for p in model.module.parameters(): log(p.grad.norm())</code>. After FSDP2 migration, what changes?</h3>
+    <button onclick="checkAnswer(this, false)">Nothing — just remove .module and the code works identically since DTensor.grad.norm() returns the global norm automatically</button>
+    <button onclick="checkAnswer(this, true)">Remove .module, and be aware that p.grad is a sharded DTensor — its .norm() returns the LOCAL shard norm, not the global norm. For global norm, use torch.nn.utils.clip_grad_norm_ or manually all-reduce</button>
+    <button onclick="checkAnswer(this, false)">The hook won't work at all — FSDP2 parameters don't have .grad after backward; gradients are consumed by reduce-scatter immediately</button>
+    <button onclick="checkAnswer(this, false)">Remove .module and wrap the logging in a torch.no_grad() context to prevent DTensor from triggering communication during the norm computation</button>
+    <div class="explanation">
+        <strong>Correct.</strong> After FSDP2's reduce-scatter, <code>p.grad</code> is a sharded DTensor with local shape [P/N, ...]. Calling <code>.norm()</code> on a DTensor computes the norm correctly (DTensor handles the distributed reduction internally for norm operations). However, if you access <code>p.grad._local_tensor.norm()</code>, you get only the local shard's norm — NOT the global gradient norm. For correct global gradient norms, use <code>torch.nn.utils.clip_grad_norm_</code> (which handles DTensors) or call <code>p.grad.norm()</code> which internally triggers the correct distributed computation. The key change: remove <code>.module</code> and understand that gradients are sharded DTensors, not regular tensors.
+    </div>
+</div>
+
+<h2>Key Takeaways</h2>
+<ol>
+    <li><strong>Migration is surgical, not a rewrite.</strong> 7 discrete steps, each independently testable. Data loading, model definition, evaluation metrics — all unchanged.</li>
+    <li><strong>The core diff:</strong> Remove DDP wrap + GradScaler + autocast + .module. Add DeviceMesh + MixedPrecisionPolicy + per-block fully_shard() + root fully_shard().</li>
+    <li><strong>Order matters:</strong> build model (CPU) → load pretrained (if any) → AC → fully_shard (children → root) → optimizer → [optional: compile].</li>
+    <li><strong>Checkpoint migration:</strong> Load old .pt BEFORE sharding. Save with DCP going forward. One-time conversion for existing checkpoints.</li>
+    <li><strong>Feature flag approach:</strong> Support both DDP and FSDP2 in your framework via a config switch. This enables gradual rollout and A/B testing.</li>
+    <li><strong>Verify correctness:</strong> Compare forward outputs, gradient norms, and loss curves between DDP and FSDP2. Small fp differences (< 1e-4 relative per step) are expected and harmless.</li>
+    <li><strong>model.no_sync() has no FSDP2 equivalent</strong> for the all-gather. Gradient accumulation still works but doesn't save communication.</li>
+</ol>
+
+<h2>Primary Source</h2>
+<p>Study the <a href="https://pytorch.org/tutorials/intermediate/FSDP_tutorial.html">PyTorch FSDP Migration Tutorial</a> (note: partially FSDP1-oriented, but migration principles apply). More relevant: examine the <a href="https://github.com/pytorch/torchtitan/blob/main/torchtitan/train.py">torchtitan training loop</a> as the canonical reference for how a modern FSDP2 pipeline is structured — use it as your "target state" for the migration.</p>
+
+<script>
+    function checkAnswer(btn, correct) {
+        const quiz = btn.closest('.quiz');
+        const buttons = quiz.querySelectorAll('button');
+        const explanation = quiz.querySelector('.explanation');
+        buttons.forEach(b => { b.disabled = true; b.classList.remove('correct', 'incorrect'); });
+        if (correct) {
+            btn.classList.add('correct');
+        } else {
+            btn.classList.add('incorrect');
+            buttons.forEach(b => { if (b.getAttribute('onclick').includes('true')) b.classList.add('correct'); });
+        }
+        explanation.style.display = 'block';
+    }
+</script>

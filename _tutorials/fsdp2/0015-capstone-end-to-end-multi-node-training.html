@@ -1,0 +1,1009 @@
+---
+layout: tutorial
+tutorial: fsdp2
+type: lesson
+lesson: 15
+total: 18
+title: "Capstone: End-to-End ViT-Huge Multi-Node Training"
+tags: [Capstone, Production]
+permalink: /heap/fsdp2/0015/
+---
+
+<p><em>Everything from lessons 001–014 unified into one production-quality system. This is your reference implementation.</em></p>
+
+<h2>What This Capstone Contains</h2>
+
+<p>A single, complete training system that combines every optimization and operational feature covered in this course:</p>
+
+<ul>
+    <li><strong>FSDP2</strong> with per-block sharding (Lesson 003)</li>
+    <li><strong>DTensor-based parameters</strong> with full lifecycle understanding (Lesson 004)</li>
+    <li><strong>Topology-aware DeviceMesh</strong> — auto-detects single/multi-node (Lesson 005)</li>
+    <li><strong>Mixed precision</strong> — fp16 compute, fp32 reduce for V100 (Lesson 006)</li>
+    <li><strong>Activation checkpointing</strong> — configurable per-block (Lesson 007)</li>
+    <li><strong>Communication overlap</strong> verified by design (Lesson 008)</li>
+    <li><strong>HSDP</strong> for multi-node NVLink/IB topology (Lesson 009)</li>
+    <li><strong>torch.compile</strong> with persistent cache (Lesson 010)</li>
+    <li><strong>DCP checkpointing</strong> — async save, resume, preemption (Lesson 011)</li>
+    <li><strong>Profiling hooks</strong> and health checks (Lesson 012)</li>
+    <li><strong>Proper software engineering</strong> — config management, logging, reproducibility, graceful shutdown</li>
+</ul>
+
+<h2>Project Structure</h2>
+
+<pre><code class="language-text">fsdp2_training/
+├── train.py                 # Entry point
+├── config.py                # Dataclass-based configuration
+├── distributed.py           # Mesh, FSDP2 application, strategy
+├── data.py                  # Dataset and dataloader construction
+├── checkpoint.py            # DCP checkpoint manager
+├── profiling.py             # Profiler and debugging utilities
+├── utils.py                 # Logging, seeding, metrics
+├── configs/
+│   ├── default.yaml         # Base configuration
+│   └── finetune.yaml        # Fine-tuning override
+├── scripts/
+│   ├── launch_single_node.sh
+│   ├── launch_multi_node.sh
+│   └── healthcheck.sh
+└── README.md
+</code></pre>
+
+<h2>config.py — Configuration Management</h2>
+
+<pre><code class="language-python">"""
+config.py — Typed, validated configuration for FSDP2 training.
+Single source of truth. No magic strings in training code.
+"""
+from dataclasses import dataclass, field
+from typing import Optional
+import os
+import yaml
+
+
+@dataclass
+class ModelConfig:
+    name: str = "vit_huge_patch14_224"
+    num_classes: int = 1000
+    pretrained_path: Optional[str] = None
+    freeze_blocks: int = 0  # Number of blocks to freeze (from start)
+
+
+@dataclass
+class TrainConfig:
+    batch_size_per_gpu: int = 32
+    num_epochs: int = 100
+    lr: float = 1e-4
+    weight_decay: float = 0.05
+    max_grad_norm: float = 1.0
+    warmup_steps: int = 500
+    lr_schedule: str = "cosine"  # "cosine" or "linear"
+    label_smoothing: float = 0.1
+
+
+@dataclass
+class DistributedConfig:
+    mesh_type: str = "auto"  # "auto", "1d", "hsdp"
+    compile: bool = True
+    compile_mode: str = "default"  # "default", "max-autotune"
+    activation_checkpointing: bool = True
+    param_dtype: str = "float16"
+    reduce_dtype: str = "float32"
+
+
+@dataclass
+class CheckpointConfig:
+    dir: str = "./checkpoints"
+    save_interval_steps: int = 500
+    keep_last_n: int = 3
+    async_save: bool = True
+    export_full_on_finish: bool = True  # Export single .pt for inference
+
+
+@dataclass
+class ProfilingConfig:
+    enabled: bool = False
+    start_step: int = 5
+    num_steps: int = 3
+    output_dir: str = "./profiles"
+    memory_snapshot: bool = False  # Capture memory snapshot
+
+
+@dataclass
+class Config:
+    model: ModelConfig = field(default_factory=ModelConfig)
+    train: TrainConfig = field(default_factory=TrainConfig)
+    distributed: DistributedConfig = field(default_factory=DistributedConfig)
+    checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
+    profiling: ProfilingConfig = field(default_factory=ProfilingConfig)
+
+    # Runtime (filled at launch)
+    seed: int = 42
+    output_dir: str = "./outputs"
+    run_name: str = "fsdp2_vit_huge"
+
+    @classmethod
+    def from_yaml(cls, path: str) -> "Config":
+        """Load config from YAML, with defaults for missing fields."""
+        with open(path) as f:
+            raw = yaml.safe_load(f) or {}
+
+        cfg = cls()
+        for section_name, section_data in raw.items():
+            if hasattr(cfg, section_name) and isinstance(section_data, dict):
+                section = getattr(cfg, section_name)
+                for key, value in section_data.items():
+                    if hasattr(section, key):
+                        setattr(section, key, value)
+            elif hasattr(cfg, section_name):
+                setattr(cfg, section_name, section_data)
+
+        return cfg
+
+    @classmethod
+    def from_args(cls) -> "Config":
+        """Parse from CLI: --config path.yaml + optional overrides."""
+        import argparse
+        parser = argparse.ArgumentParser(description="FSDP2 Training")
+        parser.add_argument("--config", type=str, default=None)
+        parser.add_argument("--batch-size", type=int, default=None)
+        parser.add_argument("--compile", action="store_true", default=None)
+        parser.add_argument("--no-compile", dest="compile", action="store_false")
+        parser.add_argument("--profile", action="store_true", default=False)
+        parser.add_argument("--mesh-type", choices=["auto", "1d", "hsdp"], default=None)
+        parser.add_argument("--run-name", type=str, default=None)
+        args = parser.parse_args()
+
+        cfg = cls.from_yaml(args.config) if args.config else cls()
+
+        # CLI overrides
+        if args.batch_size is not None:
+            cfg.train.batch_size_per_gpu = args.batch_size
+        if args.compile is not None:
+            cfg.distributed.compile = args.compile
+        if args.profile:
+            cfg.profiling.enabled = True
+        if args.mesh_type is not None:
+            cfg.distributed.mesh_type = args.mesh_type
+        if args.run_name is not None:
+            cfg.run_name = args.run_name
+
+        return cfg
+</code></pre>
+
+<h2>distributed.py — FSDP2 Setup</h2>
+
+<pre><code class="language-python">"""
+distributed.py — All distributed training logic: mesh, FSDP2, compile.
+"""
+import os
+from typing import Optional
+
+import torch
+import torch.nn as nn
+import torch.distributed as dist
+from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
+from torch.distributed.device_mesh import init_device_mesh, DeviceMesh
+
+from config import Config, DistributedConfig
+import timm
+
+
+def setup_distributed() -> tuple[int, int, int, int]:
+    """Initialize distributed. Returns (local_rank, global_rank, world_size, local_world_size)."""
+    dist.init_process_group(backend="nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    global_rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", torch.cuda.device_count()))
+    torch.cuda.set_device(local_rank)
+    return local_rank, global_rank, world_size, local_world_size
+
+
+def cleanup_distributed() -> None:
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def create_device_mesh(
+    world_size: int,
+    local_world_size: int,
+    mesh_type: str = "auto",
+) -> DeviceMesh:
+    """Create topology-aware DeviceMesh."""
+    num_nodes = world_size // local_world_size
+
+    if mesh_type == "auto":
+        mesh_type = "1d" if num_nodes == 1 else "hsdp"
+
+    if mesh_type == "1d":
+        return init_device_mesh("cuda", (world_size,))
+    elif mesh_type == "hsdp":
+        return init_device_mesh(
+            "cuda",
+            (num_nodes, local_world_size),
+            mesh_dim_names=("replicate", "shard"),
+        )
+    else:
+        raise ValueError(f"Unknown mesh_type: {mesh_type}")
+
+
+def build_model(cfg: Config) -> nn.Module:
+    """Build model on CPU with optional pretrained loading and freezing."""
+    model = timm.create_model(
+        cfg.model.name,
+        pretrained=False,
+        num_classes=cfg.model.num_classes,
+    )
+
+    # Load pretrained weights (if any)
+    if cfg.model.pretrained_path:
+        state_dict = torch.load(cfg.model.pretrained_path, map_location="cpu", weights_only=True)
+        # Handle module. prefix from DDP checkpoints
+        if any(k.startswith("module.") for k in state_dict.keys()):
+            state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+        model.load_state_dict(state_dict, strict=False)
+
+    # Freeze blocks
+    if cfg.model.freeze_blocks > 0:
+        for i, block in enumerate(model.blocks):
+            if i < cfg.model.freeze_blocks:
+                for param in block.parameters():
+                    param.requires_grad = False
+        # Also freeze embeddings when freezing blocks
+        for param in model.patch_embed.parameters():
+            param.requires_grad = False
+        if hasattr(model, 'pos_embed'):
+            model.pos_embed.requires_grad = False
+        if hasattr(model, 'cls_token'):
+            model.cls_token.requires_grad = False
+
+    # Activation checkpointing
+    if cfg.distributed.activation_checkpointing:
+        model.set_grad_checkpointing(enable=True)
+
+    return model
+
+
+def apply_fsdp2(model: nn.Module, mesh: DeviceMesh, cfg: DistributedConfig) -> nn.Module:
+    """Apply FSDP2 sharding with mixed precision."""
+    dtype_map = {"float16": torch.float16, "float32": torch.float32}
+
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=dtype_map[cfg.param_dtype],
+        reduce_dtype=dtype_map[cfg.reduce_dtype],
+    )
+
+    for block in model.blocks:
+        fully_shard(block, mesh=mesh, mp_policy=mp_policy)
+    fully_shard(model, mesh=mesh, mp_policy=mp_policy)
+
+    return model
+
+
+def apply_compile(model: nn.Module, cfg: DistributedConfig) -> nn.Module:
+    """Apply torch.compile if configured."""
+    if not cfg.compile:
+        return model
+    return torch.compile(model, mode=cfg.compile_mode)
+</code></pre>
+
+<h2>checkpoint.py — Checkpoint Management</h2>
+
+<pre><code class="language-python">"""
+checkpoint.py — DCP-based sharded checkpoint manager with async save.
+"""
+import os
+import shutil
+import signal
+from pathlib import Path
+from typing import Optional
+
+import torch
+import torch.distributed as dist
+import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint.state_dict import (
+    get_model_state_dict,
+    get_optimizer_state_dict,
+    set_model_state_dict,
+    set_optimizer_state_dict,
+    StateDictOptions,
+)
+
+from config import CheckpointConfig
+
+
+class CheckpointManager:
+    """Production checkpoint manager for FSDP2 training."""
+
+    def __init__(self, cfg: CheckpointConfig):
+        self.cfg = cfg
+        self.base_dir = Path(cfg.dir)
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        self._async_future = None
+
+    def save(
+        self,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        scheduler,
+        epoch: int,
+        step: int,
+        loss: float,
+    ) -> None:
+        """Save sharded checkpoint (collective — all ranks must call)."""
+        # Wait for previous async save
+        self._wait_for_async()
+
+        save_dir = str(self.base_dir / f"step_{step:07d}")
+
+        state_dict = {
+            "model": get_model_state_dict(model),
+            "optimizer": get_optimizer_state_dict(model, optimizer),
+            "train_state": {
+                "epoch": epoch,
+                "step": step,
+                "loss": loss,
+            },
+        }
+
+        if self.cfg.async_save:
+            self._async_future = dcp.async_save(state_dict, checkpoint_id=save_dir)
+        else:
+            dcp.save(state_dict, checkpoint_id=save_dir)
+
+        if dist.get_rank() == 0:
+            print(f"[Checkpoint] {'Async s' if self.cfg.async_save else 'S'}aved step {step}")
+            self._cleanup_old()
+
+    def load_latest(
+        self,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+    ) -> Optional[dict]:
+        """Load latest checkpoint. Returns train_state or None."""
+        latest = self._find_latest()
+        if latest is None:
+            if dist.get_rank() == 0:
+                print("[Checkpoint] No checkpoint found. Starting fresh.")
+            return None
+
+        state_dict = {
+            "model": get_model_state_dict(model),
+            "optimizer": get_optimizer_state_dict(model, optimizer),
+            "train_state": {"epoch": 0, "step": 0, "loss": 0.0},
+        }
+
+        dcp.load(state_dict, checkpoint_id=str(latest))
+        set_model_state_dict(model, state_dict["model"])
+        set_optimizer_state_dict(model, optimizer, state_dict["optimizer"])
+
+        train_state = state_dict["train_state"]
+        if dist.get_rank() == 0:
+            print(f"[Checkpoint] Resumed from {latest.name} "
+                  f"(epoch={train_state['epoch']}, step={train_state['step']})")
+
+        return train_state
+
+    def export_full(self, model: torch.nn.Module, output_path: str) -> None:
+        """Export full state dict for inference (rank 0 only writes)."""
+        options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+        full_state = get_model_state_dict(model, options=options)
+
+        if dist.get_rank() == 0:
+            torch.save(full_state, output_path)
+            size_mb = os.path.getsize(output_path) / 1e6
+            print(f"[Export] Full model saved: {output_path} ({size_mb:.0f} MB)")
+
+        dist.barrier()
+
+    def finalize(self) -> None:
+        """Call at end of training to ensure all saves complete."""
+        self._wait_for_async()
+
+    def should_save(self, step: int) -> bool:
+        return step > 0 and step % self.cfg.save_interval_steps == 0
+
+    def _wait_for_async(self) -> None:
+        if self._async_future is not None:
+            self._async_future.result()
+            self._async_future = None
+
+    def _find_latest(self) -> Optional[Path]:
+        if not self.base_dir.exists():
+            return None
+        checkpoints = sorted(
+            [d for d in self.base_dir.iterdir()
+             if d.is_dir() and d.name.startswith("step_") and (d / ".metadata").exists()],
+            key=lambda p: int(p.name.split("_")[1]),
+        )
+        return checkpoints[-1] if checkpoints else None
+
+    def _cleanup_old(self) -> None:
+        if dist.get_rank() != 0:
+            return
+        checkpoints = sorted(
+            [d for d in self.base_dir.iterdir()
+             if d.is_dir() and d.name.startswith("step_")],
+            key=lambda p: int(p.name.split("_")[1]),
+        )
+        while len(checkpoints) > self.cfg.keep_last_n:
+            shutil.rmtree(checkpoints.pop(0))
+
+
+def setup_preemption_handler(
+    ckpt_manager: CheckpointManager,
+    model, optimizer, scheduler, epoch: int, step: int,
+):
+    """Register SIGTERM/SIGUSR1 handler for Slurm preemption."""
+    def handler(signum, frame):
+        if dist.get_rank() == 0:
+            print(f"[PREEMPT] Signal {signum} received — emergency save...")
+        ckpt_manager.save(model, optimizer, scheduler, epoch, step, loss=0.0)
+        ckpt_manager.finalize()
+        cleanup_distributed()
+        exit(0)
+
+    signal.signal(signal.SIGTERM, handler)
+    signal.signal(signal.SIGUSR1, handler)
+</code></pre>
+
+<h2>utils.py — Logging, Seeding, Metrics</h2>
+
+<pre><code class="language-python">"""
+utils.py — Reproducibility, logging, and training utilities.
+"""
+import os
+import time
+import random
+from typing import Optional
+
+import torch
+import torch.distributed as dist
+import numpy as np
+
+
+def set_seed(seed: int) -> None:
+    """Set all random seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # Deterministic algorithms (slight perf cost, but reproducible)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def get_lr_scheduler(optimizer, cfg, steps_per_epoch: int):
+    """Create learning rate scheduler with warmup."""
+    total_steps = cfg.train.num_epochs * steps_per_epoch
+    warmup_steps = cfg.train.warmup_steps
+
+    def lr_lambda(current_step: int) -> float:
+        if current_step < warmup_steps:
+            return current_step / max(warmup_steps, 1)
+
+        progress = (current_step - warmup_steps) / max(total_steps - warmup_steps, 1)
+
+        if cfg.train.lr_schedule == "cosine":
+            import math
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+        elif cfg.train.lr_schedule == "linear":
+            return 1.0 - progress
+        else:
+            return 1.0
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+class MetricsTracker:
+    """Track and report training metrics."""
+
+    def __init__(self, local_rank: int):
+        self.local_rank = local_rank
+        self.step_times = []
+        self.losses = []
+        self._step_start = None
+
+    def step_start(self) -> None:
+        torch.cuda.synchronize()
+        self._step_start = time.perf_counter()
+
+    def step_end(self, loss: float) -> None:
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - self._step_start
+        self.step_times.append(elapsed)
+        self.losses.append(loss)
+
+    def report(self, step: int, epoch: int, lr: float, world_size: int,
+               batch_size_per_gpu: int, log_interval: int = 10) -> None:
+        if step % log_interval != 0 or self.local_rank != 0:
+            return
+
+        recent_times = self.step_times[-log_interval:]
+        recent_losses = self.losses[-log_interval:]
+
+        avg_time = sum(recent_times) / len(recent_times)
+        avg_loss = sum(recent_losses) / len(recent_losses)
+        throughput = batch_size_per_gpu * world_size / avg_time
+
+        peak_mem = torch.cuda.max_memory_allocated(self.local_rank) / 1e9
+
+        print(f"  [E{epoch}][S{step}] loss={avg_loss:.4f} | "
+              f"{throughput:.0f} img/s | "
+              f"step={avg_time*1000:.0f}ms | "
+              f"lr={lr:.2e} | "
+              f"mem={peak_mem:.1f}GB")
+
+    def final_report(self, world_size: int, batch_size_per_gpu: int) -> None:
+        if self.local_rank != 0 or len(self.step_times) < 10:
+            return
+
+        # Skip first 5 steps (warmup/compilation)
+        steady = self.step_times[5:]
+        avg = sum(steady) / len(steady)
+        std = (sum((t-avg)**2 for t in steady) / len(steady)) ** 0.5
+        throughput = batch_size_per_gpu * world_size / avg
+
+        print(f"\n{'═'*60}")
+        print(f"  Final Report")
+        print(f"{'═'*60}")
+        print(f"  Total steps:        {len(self.step_times)}")
+        print(f"  Steady-state step:  {avg*1000:.1f} ± {std*1000:.1f} ms")
+        print(f"  Throughput:         {throughput:.0f} img/s")
+        print(f"  Peak memory:        {torch.cuda.max_memory_allocated(self.local_rank)/1e9:.2f} GB")
+        print(f"  Final loss:         {self.losses[-1]:.4f}")
+        print(f"{'═'*60}\n")
+</code></pre>
+
+<h2>data.py — Data Pipeline</h2>
+
+<pre><code class="language-python">"""
+data.py — Dataset and dataloader construction.
+Unchanged from DDP — FSDP2 does not affect data loading.
+"""
+import torch
+from torch.utils.data import DataLoader, DistributedSampler, Dataset
+
+from config import Config
+
+
+class SyntheticImageDataset(Dataset):
+    """Synthetic data for benchmarking. Replace with your real dataset."""
+
+    def __init__(self, num_samples: int = 10_000, image_size: int = 224,
+                 num_classes: int = 1000):
+        self.num_samples = num_samples
+        self.image_size = image_size
+        self.num_classes = num_classes
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, int]:
+        image = torch.randn(3, self.image_size, self.image_size)
+        label = torch.randint(0, self.num_classes, (1,)).item()
+        return image, label
+
+
+def build_dataloader(cfg: Config, world_size: int, rank: int) -> DataLoader:
+    """Build distributed dataloader."""
+    # Replace SyntheticImageDataset with your real dataset:
+    # dataset = YourDataset(cfg.data.train_dir, transform=train_transform)
+    dataset = SyntheticImageDataset(
+        num_samples=10_000,
+        num_classes=cfg.model.num_classes,
+    )
+
+    sampler = DistributedSampler(
+        dataset, num_replicas=world_size, rank=rank, shuffle=True,
+    )
+
+    return DataLoader(
+        dataset,
+        batch_size=cfg.train.batch_size_per_gpu,
+        sampler=sampler,
+        num_workers=4,
+        pin_memory=True,
+        drop_last=True,
+        persistent_workers=True,
+    )
+</code></pre>
+
+<h2>train.py — The Entry Point</h2>
+
+<pre><code class="language-python">"""
+train.py — Production FSDP2 training for ViT-Huge.
+
+Combines: FSDP2 + HSDP + Mixed Precision + Activation Checkpointing +
+          torch.compile + DCP Checkpointing + Profiling + Preemption Handling.
+
+Launch (single node, 4 GPUs):
+    torchrun --standalone --nproc_per_node=4 train.py
+
+Launch (multi-node, 2 nodes × 4 GPUs):
+    srun torchrun --nnodes=2 --nproc_per_node=4 \
+         --rdzv_id=$SLURM_JOB_ID --rdzv_backend=c10d \
+         --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
+         train.py --config configs/default.yaml
+"""
+import os
+import torch
+import torch.nn as nn
+import torch.distributed as dist
+
+from config import Config
+from distributed import (
+    setup_distributed, cleanup_distributed,
+    create_device_mesh, build_model, apply_fsdp2, apply_compile,
+)
+from data import build_dataloader
+from checkpoint import CheckpointManager, setup_preemption_handler
+from utils import set_seed, get_lr_scheduler, MetricsTracker
+
+
+def main() -> None:
+    # ─── Configuration ────────────────────────────────────────────────────────
+    cfg = Config.from_args()
+
+    # ─── Environment ──────────────────────────────────────────────────────────
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+    if cfg.distributed.compile:
+        cache_dir = os.path.join(cfg.output_dir, "torch_compile_cache")
+        os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", cache_dir)
+
+    # ─── Distributed Setup ────────────────────────────────────────────────────
+    local_rank, global_rank, world_size, local_world_size = setup_distributed()
+    set_seed(cfg.seed + global_rank)  # Slightly different seed per rank for data augmentation
+
+    if global_rank == 0:
+        print(f"\n{'═'*60}")
+        print(f"  FSDP2 Training: {cfg.model.name}")
+        print(f"{'═'*60}")
+        print(f"  World: {world_size} GPUs ({world_size // local_world_size} nodes × "
+              f"{local_world_size} GPUs/node)")
+        print(f"  Device: {torch.cuda.get_device_name(local_rank)}")
+        print(f"  PyTorch: {torch.__version__}")
+        print(f"  Batch: {cfg.train.batch_size_per_gpu}/GPU × {world_size} = "
+              f"{cfg.train.batch_size_per_gpu * world_size} effective")
+        print(f"  Compile: {cfg.distributed.compile} (mode={cfg.distributed.compile_mode})")
+        print(f"  AC: {cfg.distributed.activation_checkpointing}")
+        print(f"{'═'*60}\n")
+
+    # ─── DeviceMesh ───────────────────────────────────────────────────────────
+    mesh = create_device_mesh(world_size, local_world_size, cfg.distributed.mesh_type)
+
+    if global_rank == 0:
+        mesh_desc = "1-D flat" if mesh.ndim == 1 else f"2-D HSDP ({mesh.mesh.shape[0]}×{mesh.mesh.shape[1]})"
+        print(f"[Mesh] {mesh_desc}")
+
+    # ─── Model ────────────────────────────────────────────────────────────────
+    model = build_model(cfg)
+
+    if global_rank == 0:
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"[Model] Total: {total_params:,} | Trainable: {trainable_params:,}")
+
+        shard_factor = local_world_size if mesh.ndim == 2 else world_size
+        model_prop_gb = total_params * 16 / shard_factor / 1e9
+        print(f"[Model] Model-prop memory/GPU: {model_prop_gb:.2f} GB "
+              f"(sharded across {shard_factor})")
+
+    # ─── FSDP2 ────────────────────────────────────────────────────────────────
+    model = apply_fsdp2(model, mesh, cfg.distributed)
+
+    if global_rank == 0:
+        p = next(model.parameters())
+        print(f"[FSDP2] Param type: {type(p).__name__}, "
+              f"global={list(p.shape)}, local={list(p._local_tensor.shape)}, "
+              f"placements={p.placements}")
+
+    # ─── Compile ──────────────────────────────────────────────────────────────
+    model = apply_compile(model, cfg.distributed)
+
+    # ─── Optimizer & Scheduler ────────────────────────────────────────────────
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(
+        trainable_params,
+        lr=cfg.train.lr,
+        weight_decay=cfg.train.weight_decay,
+        fused=True,  # Fused AdamW — faster on GPU
+    )
+
+    dataloader = build_dataloader(cfg, world_size, global_rank)
+    scheduler = get_lr_scheduler(optimizer, cfg, len(dataloader))
+
+    # ─── Checkpoint ───────────────────────────────────────────────────────────
+    ckpt_manager = CheckpointManager(cfg.checkpoint)
+
+    train_state = ckpt_manager.load_latest(model, optimizer)
+    start_epoch = train_state["epoch"] if train_state else 0
+    global_step = train_state["step"] if train_state else 0
+
+    # Fast-forward scheduler to match resumed step
+    if global_step > 0:
+        for _ in range(global_step):
+            scheduler.step()
+
+    # ─── Preemption Handler ───────────────────────────────────────────────────
+    setup_preemption_handler(
+        ckpt_manager, model, optimizer, scheduler, start_epoch, global_step
+    )
+
+    # ─── Criterion ────────────────────────────────────────────────────────────
+    criterion = nn.CrossEntropyLoss(label_smoothing=cfg.train.label_smoothing)
+
+    # ─── Metrics ──────────────────────────────────────────────────────────────
+    metrics = MetricsTracker(local_rank)
+
+    # ─── Profiler (optional) ──────────────────────────────────────────────────
+    profiler_ctx = setup_profiler(cfg.profiling, local_rank) if cfg.profiling.enabled else None
+
+    # ─── Training Loop ────────────────────────────────────────────────────────
+    if global_rank == 0:
+        print(f"\n[Train] Starting epoch {start_epoch}, step {global_step}")
+
+    model.train()
+
+    for epoch in range(start_epoch, cfg.train.num_epochs):
+        dataloader.sampler.set_epoch(epoch)
+
+        for batch_idx, (images, labels) in enumerate(dataloader):
+            # Skip already-processed batches on resume
+            if train_state and epoch == start_epoch and batch_idx < (global_step % len(dataloader)):
+                continue
+
+            images = images.to(local_rank, non_blocking=True)
+            labels = labels.to(local_rank, non_blocking=True)
+
+            # ── Training step ──
+            metrics.step_start()
+
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=cfg.train.max_grad_norm)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+
+            metrics.step_end(loss.item())
+
+            global_step += 1
+
+            # ── Logging ──
+            metrics.report(
+                global_step, epoch, scheduler.get_last_lr()[0],
+                world_size, cfg.train.batch_size_per_gpu, log_interval=10
+            )
+
+            # ── Checkpoint ──
+            if ckpt_manager.should_save(global_step):
+                ckpt_manager.save(model, optimizer, scheduler, epoch, global_step, loss.item())
+
+            # ── Profiler step ──
+            if profiler_ctx:
+                profiler_ctx.step()
+
+        # Reset train_state after first resumed epoch
+        train_state = None
+
+        if global_rank == 0:
+            print(f"[Train] Epoch {epoch} complete (step {global_step})")
+
+    # ─── Finalize ─────────────────────────────────────────────────────────────
+    ckpt_manager.save(model, optimizer, scheduler, cfg.train.num_epochs, global_step, loss.item())
+    ckpt_manager.finalize()
+
+    if cfg.checkpoint.export_full_on_finish:
+        export_path = os.path.join(cfg.output_dir, f"{cfg.run_name}_final.pt")
+        ckpt_manager.export_full(model, export_path)
+
+    metrics.final_report(world_size, cfg.train.batch_size_per_gpu)
+    cleanup_distributed()
+
+
+def setup_profiler(cfg, local_rank):
+    """Setup torch.profiler if enabled."""
+    from torch.profiler import profile, schedule, tensorboard_trace_handler, ProfilerActivity
+
+    os.makedirs(cfg.output_dir, exist_ok=True)
+
+    prof = profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        schedule=schedule(
+            wait=cfg.start_step - 2,
+            warmup=2,
+            active=cfg.num_steps,
+            repeat=1,
+        ),
+        on_trace_ready=tensorboard_trace_handler(f"{cfg.output_dir}/rank{local_rank}"),
+        record_shapes=True,
+        profile_memory=cfg.memory_snapshot,
+        with_stack=True,
+    )
+    prof.start()
+    return prof
+
+
+if __name__ == "__main__":
+    main()
+</code></pre>
+
+<h2>configs/default.yaml</h2>
+
+<pre><code class="language-yaml"># Default configuration for ViT-Huge FSDP2 training on V100 cluster
+model:
+  name: vit_huge_patch14_224
+  num_classes: 1000
+  pretrained_path: null
+  freeze_blocks: 0
+
+train:
+  batch_size_per_gpu: 32
+  num_epochs: 100
+  lr: 1.0e-4
+  weight_decay: 0.05
+  max_grad_norm: 1.0
+  warmup_steps: 500
+  lr_schedule: cosine
+  label_smoothing: 0.1
+
+distributed:
+  mesh_type: auto
+  compile: true
+  compile_mode: default
+  activation_checkpointing: true
+  param_dtype: float16
+  reduce_dtype: float32
+
+checkpoint:
+  dir: ./checkpoints
+  save_interval_steps: 500
+  keep_last_n: 3
+  async_save: true
+  export_full_on_finish: true
+
+profiling:
+  enabled: false
+  start_step: 5
+  num_steps: 3
+  output_dir: ./profiles
+  memory_snapshot: false
+
+seed: 42
+output_dir: ./outputs
+run_name: vit_huge_fsdp2
+</code></pre>
+
+<h2>scripts/launch_multi_node.sh</h2>
+
+<pre><code class="language-bash">#!/bin/bash
+#SBATCH --job-name=fsdp2_vit_huge
+#SBATCH --nodes=2
+#SBATCH --ntasks-per-node=1
+#SBATCH --gpus-per-node=4
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=128G
+#SBATCH --time=24:00:00
+#SBATCH --partition=gpu
+#SBATCH --output=logs/%j_%x.log
+#SBATCH --signal=SIGUSR1@120  # Send signal 120s before time limit
+
+# ─── Environment ──────────────────────────────────────────────────────────────
+export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n1)
+export MASTER_PORT=29500
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export NCCL_DEBUG=WARN
+export OMP_NUM_THREADS=8
+
+# Compile cache on shared filesystem
+export TORCHINDUCTOR_CACHE_DIR=/lustre/$USER/torch_cache/${SLURM_JOB_NAME}
+
+# ─── Launch ───────────────────────────────────────────────────────────────────
+echo "Job $SLURM_JOB_ID: $SLURM_NNODES nodes, $(($SLURM_NNODES * 4)) GPUs"
+echo "Master: $MASTER_ADDR:$MASTER_PORT"
+echo "Nodes: $(scontrol show hostnames $SLURM_JOB_NODELIST | tr '\n' ' ')"
+
+srun torchrun \
+    --nnodes=$SLURM_NNODES \
+    --nproc_per_node=4 \
+    --rdzv_id=$SLURM_JOB_ID \
+    --rdzv_backend=c10d \
+    --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
+    train.py --config configs/default.yaml
+</code></pre>
+
+<h2>What You've Built: The Full Stack</h2>
+
+<div class="diagram">
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │                         FSDP2 Training System                            │
+    ├─────────────────────────────────────────────────────────────────────────┤
+    │                                                                          │
+    │  ┌─── Config Layer ──────────────────────────────────────────────┐      │
+    │  │  YAML + CLI → Typed dataclass → No magic strings anywhere     │      │
+    │  └───────────────────────────────────────────────────────────────┘      │
+    │                              ↓                                           │
+    │  ┌─── Distribution Layer ────────────────────────────────────────┐      │
+    │  │  DeviceMesh (auto: 1-D or HSDP) → fully_shard per-block      │      │
+    │  │  MixedPrecision (fp16/fp32) → torch.compile (cached)         │      │
+    │  │  Activation Checkpointing (timm native)                       │      │
+    │  └───────────────────────────────────────────────────────────────┘      │
+    │                              ↓                                           │
+    │  ┌─── Training Layer ────────────────────────────────────────────┐      │
+    │  │  Forward → Loss → Backward → Clip → Step → Zero              │      │
+    │  │  (Clean loop — FSDP2 is transparent)                          │      │
+    │  │  LR Schedule (warmup + cosine) → Label smoothing              │      │
+    │  └───────────────────────────────────────────────────────────────┘      │
+    │                              ↓                                           │
+    │  ┌─── Operations Layer ──────────────────────────────────────────┐      │
+    │  │  DCP Checkpoints (async, reshardable, keep-last-N)            │      │
+    │  │  Preemption handler (SIGTERM → emergency save)                │      │
+    │  │  Profiling (torch.profiler → TensorBoard, on-demand)          │      │
+    │  │  Metrics (throughput, loss, memory, LR tracking)              │      │
+    │  └───────────────────────────────────────────────────────────────┘      │
+    │                              ↓                                           │
+    │  ┌─── Deployment ───────────────────────────────────────────────┐       │
+    │  │  Export full .pt for single-GPU inference                     │       │
+    │  │  Slurm scripts (single-node + multi-node)                    │       │
+    │  │  Reproducibility (seeding, deterministic mode)                │       │
+    │  └───────────────────────────────────────────────────────────────┘      │
+    │                                                                          │
+    └─────────────────────────────────────────────────────────────────────────┘
+</div>
+    </code></pre>
+
+    <h2>Expected Performance (Your V100 Cluster)</h2>
+
+    <table>
+        <thead>
+        <tr><th>Metric</th><th>1 Node (4 GPUs)</th><th>2 Nodes HSDP (8 GPUs)</th><th>4 Nodes HSDP (16 GPUs)</th></tr>
+        </thead>
+        <tbody>
+        <tr><td>Peak memory / GPU</td><td>~12 GB</td><td>~12 GB</td><td>~12 GB</td></tr>
+        <tr><td>Effective batch size</td><td>128</td><td>256</td><td>512</td></tr>
+        <tr><td>Step time (compile)</td><td>~310 ms</td><td>~330 ms</td><td>~350 ms</td></tr>
+        <tr><td>Throughput</td><td>~410 img/s</td><td>~775 img/s</td><td>~1460 img/s</td></tr>
+        <tr><td>Scaling efficiency</td><td>—</td><td>~94%</td><td>~89%</td></tr>
+        </tbody>
+    </table>
+
+    <h2>Course Complete: What You Now Have</h2>
+
+    <p>Over 15 lessons, you've built deep understanding of:</p>
+
+    <table>
+        <thead>
+        <tr><th>Layer</th><th>Knowledge</th><th>Lessons</th></tr>
+        </thead>
+        <tbody>
+        <tr><td><strong>Why</strong></td><td>Memory model, ZeRO theory, sharding rationale</td><td>001–002</td></tr>
+        <tr><td><strong>What</strong></td><td>DTensor, DeviceMesh, placements, lifecycle</td><td>003–005</td></tr>
+        <tr><td><strong>How (memory)</strong></td><td>Mixed precision, activation checkpointing</td><td>006–007</td></tr>
+        <tr><td><strong>How (speed)</strong></td><td>Overlap, prefetch, HSDP, torch.compile</td><td>008–010</td></tr>
+        <tr><td><strong>Operations</strong></td><td>Checkpointing, profiling, debugging</td><td>011–012</td></tr>
+        <tr><td><strong>Advanced</strong></td><td>CPU offload, frozen params, per-unit policies</td><td>013</td></tr>
+        <tr><td><strong>Integration</strong></td><td>DDP migration, production patterns</td><td>014–015</td></tr>
+        </tbody>
+    </table>
+
+    <div class="callout success">
+        <strong>You can now:</strong> Train models that don't fit in DDP, configure topology-aware sharding for your specific cluster, compose all optimizations (MP + AC + compile + HSDP), save/load sharded checkpoints that reshard on different GPU counts, profile and debug production issues, and migrate existing DDP pipelines with confidence. These are senior-level distributed training skills that directly support your career goals.
+    </div>
+
+    <h2>What's Next</h2>
+
+    <p>The FSDP2 mastery mission is complete. Future directions when you're ready:</p>
+
+    <ul>
+        <li><strong>Tensor Parallelism (TP):</strong> For models where a single LAYER's parameters don't fit on one GPU (LLMs with 65B+ params). Composes with FSDP2 via 3-D mesh.</li>
+        <li><strong>Pipeline Parallelism (PP):</strong> For extreme-depth models. Splits model across stages, interleaves micro-batches.</li>
+        <li><strong>Custom CUDA kernel + FSDP2:</strong> If your future work requires custom attention or specialized operators that must interact with sharded params.</li>
+        <li><strong>Quantization-Aware Training + FSDP2:</strong> FP8 on H100, INT8 for edge deployment. Composes with MixedPrecisionPolicy.</li>
+        <li><strong>Vision-Language Models:</strong> Multi-modal architectures (CLIP, LLaVA) where encoder + decoder may use different sharding strategies.</li>
+    </ul>
+

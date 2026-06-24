@@ -1,0 +1,633 @@
+---
+layout: tutorial
+tutorial: fsdp2
+type: lesson
+lesson: 4
+total: 18
+title: "DTensor Deep Dive: Placements, Redistribution, Dispatch"
+tags: [Core, Internals]
+permalink: /heap/fsdp2/004/
+---
+
+<p><em>How PyTorch executes math on tensors that don't fully exist on any single device.</em></p>
+
+<h2>Why This Lesson Matters</h2>
+
+<p>In Lesson 003, you saw that after <code>fully_shard()</code>, parameters become DTensors. You printed their type, global shape, local shape, and placement. But you didn't ask: <strong>what happens when you multiply a Shard(0) DTensor by a local tensor?</strong> How does PyTorch know what communication is needed? What if the sharding dimension is wrong for the operation?</p>
+
+<p>This lesson answers those questions. Understanding DTensor dispatch is what separates "I can configure FSDP2" from "I can debug FSDP2 when it breaks."</p>
+
+<h2>DTensor Anatomy</h2>
+
+<p>A <code>DTensor</code> is a thin wrapper around a local tensor, carrying three pieces of metadata:</p>
+
+<pre><code class="language-python">class DTensor:
+    _local_tensor: torch.Tensor     # The actual data on this rank
+    _spec: DTensorSpec               # Metadata container
+        .mesh: DeviceMesh            # Which devices this tensor spans
+        .placements: tuple[Placement, ...]  # One placement per mesh dimension
+        .tensor_meta: TensorMeta     # Global shape, stride, dtype
+</code></pre>
+
+<div class="diagram">
+    DTensor instance on Rank 1 of 4 (1-D mesh):
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    ┌─────────────────────────────────────────┐
+    │ DTensor                                 │
+    │                                         │
+    │   _local_tensor: Tensor([256, 1024])    │  ← Only this rank's slice
+    │                                         │
+    │   _spec:                                │
+    │     .mesh: DeviceMesh([0,1,2,3])        │  ← 4 GPUs
+    │     .placements: (Shard(0),)            │  ← Sharded on dim 0
+    │     .tensor_meta:                       │
+    │         shape: [1024, 1024]             │  ← GLOBAL shape
+    │         stride: (1024, 1)               │
+    │         dtype: float32                  │
+    │                                         │
+    └─────────────────────────────────────────┘
+
+    Global view:
+    ┌──────────┬──────────┬──────────┬──────────┐
+    │ Rank 0   │ Rank 1   │ Rank 2   │ Rank 3   │  dim 0
+    │[0:256,:] │[256:512,:]│[512:768,:]│[768:1024,:]│
+    └──────────┴──────────┴──────────┴──────────┘
+    ↕ 256      ↕ 256      ↕ 256      ↕ 256
+</div>
+    </code></pre>
+
+    <p><strong>Key invariant:</strong> <code>dtensor.shape</code> always returns the <em>global</em> shape. Code that operates on DTensors is written as if the tensor were local and full-sized. The distribution is invisible to the consumer.</p>
+
+    <h2>The Three Placement Types (Revisited with Precision)</h2>
+
+    <h3>Shard(dim)</h3>
+
+    <pre><code class="language-python">from torch.distributed._tensor import Shard
+
+# Shard(0): tensor is split along dimension 0
+# Global shape [1024, 1024] on 4 GPUs → each rank holds [256, 1024]
+#
+# Shard(1): tensor is split along dimension 1
+# Global shape [1024, 1024] on 4 GPUs → each rank holds [1024, 256]
+#
+# The shard dimension MUST be evenly divisible by the mesh size.
+# If global_shape[dim] % mesh_size != 0 → padding is inserted (with perf cost).
+</code></pre>
+
+    <p><strong>FSDP2 always uses <code>Shard(0)</code></strong> for parameters at rest. This is a design choice — sharding along the first dimension is most natural for weight matrices and ensures contiguous memory for each shard.</p>
+
+    <h3>Replicate()</h3>
+
+    <pre><code class="language-python">from torch.distributed._tensor import Replicate
+
+# Replicate(): full tensor exists on every rank
+# Global shape [1024, 1024] → each rank holds [1024, 1024]
+#
+# This is the placement DURING compute in FSDP2 (after all-gather).
+# Also used for small tensors that aren't worth sharding (biases, norms).
+</code></pre>
+
+    <h3>Partial(reduce_op)</h3>
+
+    <pre><code class="language-python">from torch.distributed._tensor import Partial
+import torch.distributed as dist
+
+# Partial(dist.ReduceOp.SUM): each rank holds a partial contribution
+# that must be summed across ranks to get the true value.
+#
+# Global shape [1024, 1024] → each rank holds [1024, 1024]
+#   but rank_i's tensor is NOT the same as rank_j's!
+#   true_value = sum(rank_i_tensor for i in all_ranks)
+#
+# This arises naturally in backward: each rank computes gradients
+# from its own micro-batch → partial gradient sums.
+</code></pre>
+
+    <div class="callout">
+        <strong>Partial is the most subtle placement.</strong> A Partial tensor has the same shape on every rank (like Replicate), but the values differ across ranks and are semantically incomplete. You cannot use a Partial tensor directly — it must be <em>redistributed</em> to either Replicate (via all-reduce) or Shard (via reduce-scatter) before consumption.
+    </div>
+
+    <h2>Redistribution: The Core Mechanism</h2>
+
+    <p><strong>Redistribution</strong> is converting a DTensor from one set of placements to another. This is where communication happens. Not all redistributions require communication — some are free.</p>
+
+    <table>
+        <thead>
+        <tr><th>From</th><th>To</th><th>Communication</th><th>Cost</th><th>When in FSDP2</th></tr>
+        </thead>
+        <tbody>
+        <tr>
+            <td>Shard(0)</td>
+            <td>Replicate</td>
+            <td>all-gather</td>
+            <td>P × (N-1)/N bytes</td>
+            <td>Pre-forward, pre-backward</td>
+        </tr>
+        <tr>
+            <td>Replicate</td>
+            <td>Shard(0)</td>
+            <td>None (slice local tensor)</td>
+            <td>Free</td>
+            <td>Post-forward (free unshard)</td>
+        </tr>
+        <tr>
+            <td>Partial(sum)</td>
+            <td>Replicate</td>
+            <td>all-reduce</td>
+            <td>2P bytes (ring)</td>
+            <td>DDP-style sync (not in FSDP)</td>
+        </tr>
+        <tr>
+            <td>Partial(sum)</td>
+            <td>Shard(0)</td>
+            <td>reduce-scatter</td>
+            <td>P × (N-1)/N bytes</td>
+            <td>Post-backward (grad sharding)</td>
+        </tr>
+        <tr>
+            <td>Shard(0)</td>
+            <td>Shard(1)</td>
+            <td>all-to-all</td>
+            <td>P × (N-1)/N bytes</td>
+            <td>Rare (tensor parallelism)</td>
+        </tr>
+        <tr>
+            <td>Replicate</td>
+            <td>Partial(sum)</td>
+            <td>None (metadata change)</td>
+            <td>Free</td>
+            <td>Conceptual (grad output of replicated param)</td>
+        </tr>
+        </tbody>
+    </table>
+
+    <div class="callout warning">
+        <strong>Replicate → Shard is free?</strong> Yes — but only if you're okay discarding data. When FSDP2 transitions a parameter from Replicate back to Shard after forward, it simply drops the full buffer and retains the original shard. The "redistribution" is just <code>del unsharded_buffer</code>. This is NOT the same as a scatter operation — no communication, no new data movement. The shard was already present (it never left).
+    </div>
+
+    <h3>Explicit Redistribution API</h3>
+
+    <pre><code class="language-python">from torch.distributed._tensor import DTensor, Shard, Replicate, distribute_tensor
+
+# Create a Shard(0) DTensor
+mesh = init_device_mesh("cuda", (4,))
+global_tensor = torch.randn(1024, 1024)  # Only on rank 0 initially
+dt = distribute_tensor(global_tensor, mesh, placements=[Shard(0)])
+# Each rank now has [256, 1024]
+
+# Redistribute: Shard(0) → Replicate (triggers all-gather)
+dt_full = dt.redistribute(mesh, placements=[Replicate()])
+# Each rank now has [1024, 1024]
+
+# Redistribute: Replicate → Shard(1) (triggers local slice — no comm if from Replicate)
+dt_shard1 = dt_full.redistribute(mesh, placements=[Shard(1)])
+# Each rank now has [1024, 256]
+</code></pre>
+
+    <p>You rarely call <code>.redistribute()</code> directly — FSDP2 and DTensor's dispatch system handle it automatically. But understanding it is critical for debugging.</p>
+
+    <h2>DTensor Dispatch: How Operations Work</h2>
+
+    <p>This is the deep magic. When you call a PyTorch operation on DTensors, PyTorch's dispatch system:</p>
+
+    <ol>
+        <li>Looks up a <strong>sharding propagation rule</strong> for that operation</li>
+        <li>Determines the <strong>required input placements</strong> for the operation to be correct</li>
+        <li>If current placements don't match required → <strong>inserts redistribution</strong> automatically</li>
+        <li>Executes the operation <strong>locally</strong> on each rank's tensor</li>
+        <li>Determines the <strong>output placement</strong> based on the operation semantics</li>
+    </ol>
+
+    <h3>Example: Matrix Multiply</h3>
+
+    <p>Let's trace <code>torch.mm(input, weight)</code> where <code>input</code> is a local batch and <code>weight</code> is a Shard(0) DTensor:</p>
+
+    <pre><code class="language-python"># Shapes:
+#   input:  [batch, in_features]   = [16, 1024]  — local tensor, NOT a DTensor
+#   weight: [out_features, in_features] = [1024, 1024] — DTensor, Shard(0)
+#           local shard: [256, 1024] on each of 4 ranks
+
+# We want: output = input @ weight.T
+# Which is: torch.mm(input, weight.T)  or F.linear(input, weight)
+
+# Step 1: F.linear dispatches to the DTensor sharding rule for "linear"
+#
+# Step 2: The rule for linear(input, weight) with weight=Shard(0) says:
+#   - weight is Shard(0) meaning sharded on out_features dimension
+#   - Each rank can compute a PARTIAL result: input @ local_weight_shard.T
+#   - Result: [batch, 256] on each rank — a Shard(1) output?
+#
+#   Actually NO. For F.linear to work correctly with Shard(0) weight,
+#   it would need the full weight. So the sharding rule says:
+#   "REQUIRED: weight must be Replicate for this operation."
+#
+# Step 3: DTensor inserts redistribution: weight.redistribute(Replicate())
+#   → all-gather fires, weight becomes full [1024, 1024] on each rank
+#
+# Step 4: F.linear executes locally: input @ full_weight.T → [batch, 1024]
+#
+# Step 5: Output is a local tensor [batch, 1024] — or if input was also
+#   a DTensor, output inherits appropriate placement.
+</code></pre>
+
+    <div class="callout">
+        <strong>This is exactly what FSDP2's pre-forward hook does!</strong> When the module's forward runs and calls <code>F.linear(input, self.weight)</code>, the DTensor dispatch system requires <code>self.weight</code> to be Replicate. FSDP2's pre-forward hook proactively does this all-gather <em>before</em> the module runs, rather than letting dispatch trigger it lazily. This enables prefetching — FSDP can start the all-gather early and overlap with the previous unit's compute.
+    </div>
+
+    <h3>Operations Where Sharding "Just Works"</h3>
+
+    <p>Not all operations require full materialization. Some can operate directly on shards:</p>
+
+    <table>
+        <thead>
+        <tr><th>Operation</th><th>Input placement</th><th>What happens locally</th><th>Output placement</th></tr>
+        </thead>
+        <tbody>
+        <tr>
+            <td><code>torch.relu(x)</code></td>
+            <td>Shard(0)</td>
+            <td>relu applied to local shard</td>
+            <td>Shard(0)</td>
+        </tr>
+        <tr>
+            <td><code>x + y</code> (same shard)</td>
+            <td>Both Shard(0)</td>
+            <td>Elementwise add on shards</td>
+            <td>Shard(0)</td>
+        </tr>
+        <tr>
+            <td><code>x * scalar</code></td>
+            <td>Shard(0)</td>
+            <td>Scalar multiply on shard</td>
+            <td>Shard(0)</td>
+        </tr>
+        <tr>
+            <td><code>x.sum(dim=1)</code></td>
+            <td>Shard(0)</td>
+            <td>Reduce along dim 1 (within-shard)</td>
+            <td>Shard(0)</td>
+        </tr>
+        <tr>
+            <td><code>x.sum(dim=0)</code></td>
+            <td>Shard(0)</td>
+            <td>Reduce along shard dim — incomplete!</td>
+            <td>Partial(sum) → needs all-reduce</td>
+        </tr>
+        </tbody>
+    </table>
+
+    <div class="callout success">
+        <strong>Pointwise/elementwise operations on Shard(dim) tensors are free</strong> — no communication, just operate on the local shard. This is why normalization layers (LayerNorm, BatchNorm) and activations don't trigger any communication in FSDP2 when they operate on activation tensors (which are local, not DTensors).
+    </div>
+
+    <h2>Sharding Propagation Rules (SPR)</h2>
+
+    <p>The system that decides input/output placements for each operation is the <strong>Sharding Propagation Rule</strong> system. Each PyTorch op has a registered rule. Simplified logic for <code>torch.mm(A, B) → C</code>:</p>
+
+    <pre><code class="language-python"># Pseudocode for mm sharding rule:
+def mm_rule(A_placement, B_placement) -> (required_A, required_B, output_placement):
+    """
+    C = A @ B where A:[M, K], B:[K, N] → C:[M, N]
+    """
+    if A == Shard(0) and B == Replicate():
+        # A sharded on M (rows), B full → each rank computes its rows of C
+        return Shard(0), Replicate(), Shard(0)
+
+    elif A == Replicate() and B == Shard(1):
+        # A full, B sharded on N (cols) → each rank computes its columns of C
+        return Replicate(), Shard(1), Shard(1)
+
+    elif A == Shard(1) and B == Shard(0):
+        # A sharded on K, B sharded on K → partial result, needs reduction
+        # Each rank computes A_shard @ B_shard → partial [M, N]
+        return Shard(1), Shard(0), Partial(sum)
+
+    else:
+        # Fallback: redistribute inputs to a supported configuration
+        # Default: A=Replicate, B=Replicate → output=Replicate
+        return Replicate(), Replicate(), Replicate()
+</code></pre>
+
+    <div class="callout">
+        <strong>For FSDP2 specifically:</strong> Because FSDP2 always ensures parameters are Replicate BEFORE compute (via the pre-forward hook), the dispatch system rarely needs to trigger redistributions during the actual forward pass. The parameters are already in the correct placement. This is by design — FSDP2 proactively manages placement transitions rather than relying on lazy dispatch.
+    </div>
+
+    <h2>Multi-Dimensional Placements (2-D Mesh)</h2>
+
+    <p>When you use a 2-D DeviceMesh (for HSDP), DTensors carry <strong>one placement per mesh dimension</strong>:</p>
+
+    <pre><code class="language-python"># 2-D mesh: (2 replicas, 4 shards per replica)
+mesh_2d = init_device_mesh("cuda", (2, 4), mesh_dim_names=("replicate", "shard"))
+
+# After fully_shard with this mesh:
+# param.placements = (Replicate(), Shard(0))
+#
+# Reading left to right matches mesh dimensions:
+#   - Mesh dim 0 ("replicate"): Replicate() → full copy across replica groups
+#   - Mesh dim 1 ("shard"):     Shard(0)    → sharded within each replica group
+#
+# This means:
+#   - Within each 4-GPU node: parameter is sharded (Shard(0))
+#   - Across the 2 nodes: each node holds the SAME shards (Replicate)
+</code></pre>
+
+    <div class="diagram">
+        2-D DTensor: placements = (Replicate(), Shard(0))
+        Global shape: [1024, 1024]
+
+        Mesh dim 0 ("replicate", size 2):
+        ┌─────── Node 0 ───────┐    ┌─────── Node 1 ───────┐
+        │  SAME content         │    │  SAME content         │
+        │  (replicated)         │    │  (replicated)         │
+        └───────────────────────┘    └───────────────────────┘
+
+        Mesh dim 1 ("shard", size 4):
+        Node 0:                       Node 1 (identical):
+        ┌──────┬──────┬──────┬──────┐ ┌──────┬──────┬──────┬──────┐
+        │GPU 0 │GPU 1 │GPU 2 │GPU 3│ │GPU 4 │GPU 5 │GPU 6 │GPU 7│
+        │[0:256]│[256: │[512: │[768:│ │[0:256]│[256: │[512: │[768:│
+        │      │ 512] │ 768] │1024]│ │      │ 512] │ 768] │1024]│
+        └──────┴──────┴──────┴──────┘ └──────┴──────┴──────┴──────┘
+    </div>
+        </code></pre>
+
+        <p>This is exactly HSDP: shard within the fast NVLink domain, replicate across the slower InfiniBand domain. Gradient sync across replicas uses all-reduce over InfiniBand — the same as DDP, but only for the shard each rank owns.</p>
+
+        <h2>DTensor and Autograd</h2>
+
+        <p>DTensor integrates with PyTorch's autograd. Gradients of DTensors are themselves DTensors. The backward pass propagates placements correctly:</p>
+
+        <pre><code class="language-python"># Forward:
+#   weight: DTensor, Shard(0) → all-gathered to Replicate for compute
+#   output = F.linear(input, weight)  # input is local, weight is Replicate
+#
+# Backward:
+#   grad_output: local tensor [batch, out_features]
+#   grad_weight = grad_output.T @ input → shape [out_features, in_features]
+#
+# But wait — weight was Replicate during forward, and all ranks computed
+# the SAME forward (on different data). So:
+#   - Each rank's grad_weight is computed from its OWN micro-batch
+#   - The true gradient is the SUM across all ranks
+#   - Therefore: grad_weight has placement Partial(sum)
+#
+# FSDP2's post-backward hook then redistributes:
+#   grad_weight: Partial(sum) → Shard(0) via reduce-scatter
+#   Result: each rank holds 1/N of the summed gradient
+</code></pre>
+
+        <div class="callout">
+            <strong>This is the autograd-level explanation of why reduce-scatter appears in backward.</strong> It's not FSDP2 injecting arbitrary communication — it's the mathematically necessary consequence of: (1) replicated parameters saw different data on each rank → (2) local gradients are partial sums → (3) to get the true gradient, reduce is needed → (4) since we want sharded gradients (for the sharded optimizer), reduce-scatter is the natural choice.
+        </div>
+
+        <h2>DTensor and torch.compile</h2>
+
+        <p>The reason FSDP2 works with <code>torch.compile</code> while FSDP1 doesn't:</p>
+
+        <pre><code class="language-python"># torch.compile traces operations at the FX graph level.
+#
+# DTensor operations lower to a sequence of:
+#   1. Communication ops (all-gather, reduce-scatter) — treated as graph nodes
+#   2. Local tensor ops (the actual compute) — compiled by Inductor/Triton
+#
+# The compiler sees:
+#   %ag = call_function(all_gather, (sharded_param,))
+#   %output = call_function(torch.mm, (input, %ag.T))
+#   %free = call_function(del, (%ag,))
+#
+# This is a clean, traceable graph. No opaque Python wrappers,
+# no dynamically-shaped flat buffers.
+#
+# FSDP1's problem: FlatParamHandle operations were hidden behind
+# Python-level hook code that torch.compile could not trace through.
+# Each hook boundary was a graph break.
+</code></pre>
+
+        <p>In practice, <code>torch.compile</code> with FSDP2:</p>
+        <ul>
+            <li>Compiles the <strong>compute between communication points</strong> (each FSDP unit's forward becomes a compiled subgraph)</li>
+            <li>Communication ops (all-gather, reduce-scatter) remain as eager ops (they call into NCCL)</li>
+            <li>The compiler can fuse operations within a layer (attention + MLP), optimize memory layout, generate Triton kernels</li>
+            <li>On V100: expect 10–25% speedup from compilation (less than A100/H100 due to older architecture, but still meaningful)</li>
+        </ul>
+
+        <h2>Debugging DTensors</h2>
+
+        <p>When something goes wrong with FSDP2, inspecting DTensor state is your first tool:</p>
+
+        <pre><code class="language-python"># Useful inspection patterns:
+
+def inspect_dtensor(name: str, dt: torch.Tensor) -> None:
+    """Print DTensor state for debugging. Works even if dt is regular Tensor."""
+    from torch.distributed._tensor import DTensor
+
+    if not isinstance(dt, DTensor):
+        print(f"{name}: regular Tensor, shape={list(dt.shape)}, "
+              f"device={dt.device}, dtype={dt.dtype}")
+        return
+
+    print(f"{name}:")
+    print(f"  type:       DTensor")
+    print(f"  global:     {list(dt.shape)}")
+    print(f"  local:      {list(dt._local_tensor.shape)}")
+    print(f"  placements: {dt.placements}")
+    print(f"  mesh:       {dt.device_mesh}")
+    print(f"  dtype:      {dt.dtype}")
+    print(f"  requires_grad: {dt.requires_grad}")
+
+
+# Use in forward hook to verify state:
+def debug_hook(module, input):
+    for name, param in module.named_parameters(recurse=False):
+        inspect_dtensor(f"{module.__class__.__name__}.{name}", param)
+
+# Common issues to check:
+# 1. Parameter still Shard when it should be Replicate (hook didn't fire)
+# 2. Gradient is None (detached from graph somewhere)
+# 3. Local shape doesn't evenly divide global shape (padding issues)
+# 4. Wrong mesh — parameter on a different mesh than expected
+</code></pre>
+
+        <h2>The distribute_tensor Function</h2>
+
+        <p>This is how tensors initially become DTensors — it's what <code>fully_shard()</code> calls internally:</p>
+
+        <pre><code class="language-python">from torch.distributed._tensor import distribute_tensor, DTensor
+
+# distribute_tensor: takes a full tensor and distributes it according to placements
+# This is a COLLECTIVE operation — all ranks must call it together.
+
+# Option 1: All ranks have the full tensor (e.g., loaded from checkpoint)
+full_weight = torch.randn(1024, 1024)  # Same on all ranks (e.g., from same seed)
+dt = distribute_tensor(full_weight, mesh, placements=[Shard(0)])
+# Now each rank has [256, 1024] — it kept only its slice.
+
+# Option 2: Only rank 0 has the tensor (common for initialization)
+if dist.get_rank() == 0:
+    full_weight = torch.randn(1024, 1024)
+else:
+    full_weight = torch.empty(1024, 1024)  # Placeholder
+
+# distribute_tensor with Shard will scatter from rank 0 to all ranks
+dt = distribute_tensor(full_weight, mesh, placements=[Shard(0)])
+
+# IMPORTANT: After distribute_tensor, full_weight on each rank can be freed.
+# The DTensor owns its local shard independently.
+</code></pre>
+
+        <h2>DTensor Operations Reference</h2>
+
+        <p>Key operations you'll encounter in FSDP2 debugging:</p>
+
+        <table>
+            <thead>
+            <tr><th>Operation</th><th>What it does</th><th>When you'd call it</th></tr>
+            </thead>
+            <tbody>
+            <tr>
+                <td><code>dt.full_tensor()</code></td>
+                <td>All-gathers and returns full tensor (blocking)</td>
+                <td>Debugging, checkpointing, inference</td>
+            </tr>
+            <tr>
+                <td><code>dt.redistribute(mesh, placements)</code></td>
+                <td>Returns new DTensor with specified placements (may communicate)</td>
+                <td>Manual placement changes, debugging</td>
+            </tr>
+            <tr>
+                <td><code>dt._local_tensor</code></td>
+                <td>Access local shard (no communication)</td>
+                <td>Debugging, custom kernels, optimizer access</td>
+            </tr>
+            <tr>
+                <td><code>dt.to_local()</code></td>
+                <td>Detach from DTensor, return local shard as plain Tensor</td>
+                <td>When exiting DTensor world (use with care)</td>
+            </tr>
+            <tr>
+                <td><code>DTensor.from_local(local, mesh, placements)</code></td>
+                <td>Wrap a local tensor as DTensor (no communication)</td>
+                <td>Re-entering DTensor world after custom local ops</td>
+            </tr>
+            </tbody>
+        </table>
+
+        <div class="callout warning">
+            <strong>Calling <code>.full_tensor()</code> in a training loop defeats FSDP2.</strong> It triggers an all-gather and materializes the full tensor — useful for debugging but catastrophic for memory if called routinely. Same for <code>.redistribute(..., [Replicate()])</code> without FSDP2's managed lifecycle.
+        </div>
+
+        <h2>How FSDP2 Uses DTensor Internally</h2>
+
+        <p>Putting it all together — here's the precise internal sequence when a forward hook fires:</p>
+
+        <pre><code class="language-python"># Simplified FSDP2 pre-forward hook (pseudocode based on actual source):
+
+class FSDPState:
+    def _pre_forward(self, module, args):
+        # For each parameter in this FSDP unit:
+        for fsdp_param in self._fsdp_params:
+            # 1. The parameter DTensor is currently Shard(0)
+            assert fsdp_param.placements == (Shard(0),)
+
+            # 2. All-gather: Shard(0) → Replicate
+            # This calls into NCCL all-gather on the appropriate process group
+            # derived from the DeviceMesh
+            unsharded = fsdp_param._local_tensor  # Will be replaced
+
+            # The all-gather happens on a separate CUDA stream
+            # to enable overlap with previous unit's compute
+            all_gather_result = self._all_gather(fsdp_param)
+
+            # 3. Swap the module attribute to point to the unsharded (Replicate) param
+            # This is what module.forward() will see
+            fsdp_param._unsharded_param = all_gather_result
+            # Module attribute now reports Replicate placement and full shape
+
+        # 4. Also handle mixed precision: cast to param_dtype if needed
+        # (fp32 master → fp16 compute copy)
+
+    def _post_forward(self, module, args, output):
+        # Free unsharded parameters — reclaim memory
+        for fsdp_param in self._fsdp_params:
+            del fsdp_param._unsharded_param
+            # Parameter reverts to Shard(0) view
+            # Memory freed: (N-1)/N of each parameter's full size
+</code></pre>
+
+        <h2 id="quiz">Check Your Understanding</h2>
+
+        <div class="quiz">
+            <h3>Q1: You have a DTensor <code>x</code> with placement <code>Shard(0)</code> and global shape [1024, 512] on a 4-GPU mesh. You call <code>torch.sum(x, dim=0)</code>. What is the output placement?</h3>
+            <button onclick="checkAnswer(this, false)">Shard(0) with global shape [512] — reduction along shard dim produces a smaller shard</button>
+            <button onclick="checkAnswer(this, true)">Partial(sum) with global shape [512] — each rank has an incomplete partial sum along the sharded dimension</button>
+            <button onclick="checkAnswer(this, false)">Replicate with global shape [512] — PyTorch automatically all-reduces after reducing along the shard dim</button>
+            <button onclick="checkAnswer(this, false)">Error — reducing along the shard dimension of a Shard(0) DTensor is not a valid operation</button>
+            <div class="explanation">
+                <strong>Correct.</strong> When you sum along dimension 0 and the tensor is Shard(0), each rank sums its local shard (e.g., rows 0–255) to produce a [512] result. But the true sum needs contributions from ALL rows (0–1023), which are spread across ranks. So each rank's [512] is a partial sum. The output is Partial(sum). To get the true result, you'd need to redistribute to Replicate (via all-reduce) or consume it in a way that naturally handles Partial (e.g., feed into a reduce-scatter to get Shard output).
+            </div>
+        </div>
+
+        <div class="quiz">
+            <h3>Q2: In FSDP2 with a 2-D mesh of shape (2, 4) and dim_names ("replicate", "shard"), what are the placements of a sharded parameter at rest?</h3>
+            <button onclick="checkAnswer(this, false)">(Shard(0), Shard(0)) — sharded along both mesh dimensions simultaneously</button>
+            <button onclick="checkAnswer(this, false)">(Shard(0), Replicate()) — sharded across replicas, full within each node</button>
+            <button onclick="checkAnswer(this, true)">(Replicate(), Shard(0)) — replicated across nodes, sharded within each node</button>
+            <button onclick="checkAnswer(this, false)">(Partial(sum), Shard(0)) — partially reduced across nodes, sharded within each node</button>
+            <div class="explanation">
+                <strong>Correct.</strong> In HSDP, placements follow mesh dimension order. Mesh dim 0 is "replicate" (across nodes) → placement is Replicate(). Mesh dim 1 is "shard" (within node) → placement is Shard(0). This means each node holds the same set of shards, and within a node, the model is partitioned across GPUs. The gradient sync across replicas (the all-reduce over InfiniBand) corresponds to the Replicate dimension.
+            </div>
+        </div>
+
+        <div class="quiz">
+            <h3>Q3: Why does FSDP2 proactively all-gather in a pre-forward hook rather than letting DTensor dispatch handle it lazily when F.linear is called?</h3>
+            <button onclick="checkAnswer(this, false)">DTensor dispatch cannot handle the all-gather operation — only FSDP2's internal code knows how to invoke NCCL properly</button>
+            <button onclick="checkAnswer(this, true)">Proactive all-gather enables prefetching — starting communication for the next FSDP unit while the current unit computes, overlapping comm and compute</button>
+            <button onclick="checkAnswer(this, false)">Lazy dispatch would trigger a separate all-gather for each parameter individually, while the hook batches them into one call per FSDP unit</button>
+            <button onclick="checkAnswer(this, false)">The pre-forward hook is needed to handle mixed precision casting which DTensor dispatch does not support natively</button>
+            <div class="explanation">
+                <strong>Correct.</strong> The fundamental reason for proactive (eager) all-gather via hooks is <em>communication scheduling</em>. By explicitly controlling when the all-gather starts, FSDP2 can issue the all-gather for block N+1 while block N's compute is still running — overlapping communication latency with useful work. If dispatch triggered it lazily, it would fire at the exact moment the parameter is needed (inside F.linear), leaving no opportunity to overlap. Note: answer C is also partially true (batching params in one collective per unit), but the primary motivation is overlap/prefetch.
+            </div>
+        </div>
+
+        <div class="quiz">
+            <h3>Q4: You're writing a custom CUDA kernel via pybind11 that takes a weight matrix as input. The weight is an FSDP2 DTensor with Shard(0) placement. What do you need to do before passing it to your kernel?</h3>
+            <button onclick="checkAnswer(this, false)">Nothing — the kernel sees a contiguous tensor through DTensor's transparent dispatch mechanism and operates on the global shape</button>
+            <button onclick="checkAnswer(this, true)">Access <code>param._local_tensor</code> to get the raw shard, or ensure the kernel is called inside the FSDP unit's forward where params are already Replicate</button>
+            <button onclick="checkAnswer(this, false)">Call <code>param.full_tensor()</code> to materialize the complete weight before passing to the kernel in every forward call</button>
+            <button onclick="checkAnswer(this, false)">Register the custom kernel as a DTensor sharding rule so dispatch can handle it automatically</button>
+            <div class="explanation">
+                <strong>Correct.</strong> Custom CUDA kernels (pybind11, Triton) don't go through PyTorch's DTensor dispatch — they receive raw memory pointers. You have two options: (1) Call the kernel inside the module's <code>forward()</code>, where FSDP2's pre-forward hook has already all-gathered the parameter to Replicate — the parameter's underlying data IS the full tensor at that point. (2) Explicitly access <code>._local_tensor</code> if your kernel can operate on shards independently. Option C works but defeats memory savings. Option D is possible but requires significant effort and is rarely worth it.
+            </div>
+        </div>
+
+        <h2>Key Takeaways</h2>
+        <ol>
+            <li><strong>DTensor = local_tensor + spec (mesh, placements, global shape).</strong> It reports global shape but stores only the local shard.</li>
+            <li><strong>Three placements:</strong> Shard(dim) for partitioned data, Replicate() for full copies, Partial(op) for unreduced intermediates.</li>
+            <li><strong>Redistribution</strong> converts between placements via collectives: Shard→Replicate = all-gather, Partial→Shard = reduce-scatter, Replicate→Shard = free (just discard).</li>
+            <li><strong>Sharding Propagation Rules</strong> determine required input placements for each op and output placements. If inputs are wrong, redistribution is inserted automatically.</li>
+            <li><strong>FSDP2 bypasses lazy dispatch</strong> — it proactively manages placement transitions via hooks to enable communication overlap (prefetching).</li>
+            <li><strong>For custom CUDA kernels:</strong> call them inside forward() where params are already Replicate, or explicitly work with <code>._local_tensor</code> for shard-parallel operations.</li>
+            <li><strong>2-D placements (HSDP):</strong> one placement per mesh dimension — (Replicate(), Shard(0)) means replicated across nodes, sharded within node.</li>
+        </ol>
+
+        <h2>Primary Source</h2>
+        <p>Read the <a href="https://github.com/pytorch/pytorch/blob/main/torch/distributed/_tensor/README.md">DTensor README</a> and then skim the sharding propagation rules in <a href="https://github.com/pytorch/pytorch/tree/main/torch/distributed/_tensor/ops">torch/distributed/_tensor/ops/</a> — particularly <code>matrix_ops.py</code>. The <code>mm</code> and <code>linear</code> rules show exactly how PyTorch decides what communication to insert for matmul operations.</p>
+
+
+        <script>
+            function checkAnswer(btn, correct) {
+                const quiz = btn.closest('.quiz');
+                const buttons = quiz.querySelectorAll('button');
+                const explanation = quiz.querySelector('.explanation');
+                buttons.forEach(b => { b.disabled = true; b.classList.remove('correct', 'incorrect'); });
+                if (correct) {
+                    btn.classList.add('correct');
+                } else {
+                    btn.classList.add('incorrect');
+                    buttons.forEach(b => { if (b.getAttribute('onclick').includes('true')) b.classList.add('correct'); });
+                }
+                explanation.style.display = 'block';
+            }
+        </script>

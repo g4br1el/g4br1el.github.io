@@ -5,7 +5,7 @@ description: "PyTorch Fully Sharded Data Parallel v2 — from first principles t
 permalink: /heap/fsdp2/
 tutorial: fsdp2
 type: index
-total_lessons: 15
+total_lessons: 18
 tags:
   - PyTorch
   - Distributed Training

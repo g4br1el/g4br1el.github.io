@@ -1,0 +1,324 @@
+---
+layout: tutorial
+tutorial: fsdp2
+type: lesson
+lesson: 17
+total: 18
+title: "Vision-Language Models with FSDP2"
+tags: [Add-On, Advanced, Multi-Modal]
+permalink: /heap/fsdp2/0017/
+---
+
+
+<p><em>Sharding strategies for multi-encoder architectures (CLIP, SigLIP, LLaVA-style) where components have vastly different sizes.</em></p>
+
+<h2>The Challenge: Heterogeneous Components</h2>
+
+<p>Vision-language models combine multiple sub-models with different sizes and training dynamics:</p>
+
+<table>
+    <thead>
+    <tr><th>Architecture</th><th>Vision encoder</th><th>Text encoder/LLM</th><th>Connector</th><th>Total</th></tr>
+    </thead>
+    <tbody>
+    <tr><td>CLIP ViT-L/14 + GPT</td><td>304M</td><td>354M</td><td>—</td><td>~660M</td></tr>
+    <tr><td>SigLIP ViT-SO400M</td><td>400M</td><td>400M</td><td>—</td><td>~800M</td></tr>
+    <tr><td>LLaVA-1.5 (ViT-L + Vicuna-7B)</td><td>304M</td><td>6.7B</td><td>~20M</td><td>~7B</td></tr>
+    <tr><td>LLaVA-NeXT (ViT-L + Llama-13B)</td><td>304M</td><td>13B</td><td>~20M</td><td>~13.3B</td></tr>
+    </tbody>
+</table>
+
+<p>The key insight: <strong>the components may need different sharding strategies, different precision policies, and different freezing decisions.</strong></p>
+
+<h2>Strategy 1: Uniform Sharding (Simple, Works for CLIP-Scale)</h2>
+
+<pre><code class="language-python">"""
+CLIP-style training: vision encoder + text encoder, comparable size.
+Shard everything uniformly — same approach as ViT-Huge.
+"""
+from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
+
+
+def apply_fsdp2_clip(model, mesh, mp_policy):
+    """
+    CLIP model structure (e.g., open_clip):
+      model.visual         — ViT image encoder
+      model.transformer    — Text transformer encoder
+      model.logit_scale    — Learned temperature parameter
+    """
+    # Shard vision encoder blocks
+    for block in model.visual.transformer.resblocks:
+        fully_shard(block, mesh=mesh, mp_policy=mp_policy)
+    fully_shard(model.visual, mesh=mesh, mp_policy=mp_policy)
+
+    # Shard text encoder blocks
+    for block in model.transformer.resblocks:
+        fully_shard(block, mesh=mesh, mp_policy=mp_policy)
+    fully_shard(model.transformer, mesh=mesh, mp_policy=mp_policy)
+
+    # Shard root (logit_scale, token embeddings, positional embeddings)
+    fully_shard(model, mesh=mesh, mp_policy=mp_policy)
+
+    return model
+
+
+# Training loop for contrastive learning:
+def clip_train_step(model, images, texts, optimizer):
+    image_features = model.encode_image(images)    # Vision forward
+    text_features = model.encode_text(texts)       # Text forward
+
+    # Contrastive loss (all-gather features across ranks for full batch similarity)
+    logit_scale = model.logit_scale.exp()
+    logits_per_image = logit_scale * image_features @ text_features.t()
+
+    # NOTE: For contrastive learning, you need features from ALL ranks
+    # to compute the full similarity matrix. This requires gathering:
+    all_image_features = gather_features(image_features)  # See below
+    all_text_features = gather_features(text_features)
+
+    loss = clip_loss(logits_per_image, all_image_features, all_text_features)
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+</code></pre>
+
+<h3>Feature Gathering for Contrastive Loss</h3>
+
+<pre><code class="language-python">import torch.distributed as dist
+
+
+def gather_features(features: torch.Tensor) -> torch.Tensor:
+    """
+    Gather features from all ranks for contrastive loss computation.
+    FSDP2 doesn't affect this — features are local activations.
+    """
+    world_size = dist.get_world_size()
+
+    # All-gather features (each rank contributes its batch's features)
+    gathered = [torch.zeros_like(features) for _ in range(world_size)]
+    dist.all_gather(gathered, features)
+
+    # Concatenate: [world_size × batch_per_gpu, feature_dim]
+    # Use straight-through gradient for the local portion
+    gathered[dist.get_rank()] = features  # Keep gradients for local portion
+    return torch.cat(gathered, dim=0)
+
+
+# More efficient version using all_gather with gradients:
+class GatherWithGrad(torch.autograd.Function):
+    """All-gather that preserves gradients for the local rank's features."""
+
+    @staticmethod
+    def forward(ctx, x):
+        world_size = dist.get_world_size()
+        gathered = [torch.zeros_like(x) for _ in range(world_size)]
+        dist.all_gather(gathered, x)
+        ctx.world_size = world_size
+        ctx.rank = dist.get_rank()
+        return torch.cat(gathered, dim=0)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # Each rank only needs gradient for its portion
+        chunk_size = grad_output.shape[0] // ctx.world_size
+        return grad_output[ctx.rank * chunk_size : (ctx.rank + 1) * chunk_size]
+
+
+def gather_features_with_grad(features):
+    return GatherWithGrad.apply(features)
+</code></pre>
+
+<h2>Strategy 2: Asymmetric Sharding (LLaVA-Style, Large LLM)</h2>
+
+<p>When the LLM is 20× larger than the vision encoder, you may want different treatment:</p>
+
+<pre><code class="language-python">"""
+LLaVA-style: frozen ViT-L (304M) + trainable Llama-7B + small MLP connector.
+Vision encoder is frozen → shard for memory but no backward communication.
+LLM is trainable → full FSDP2 sharding with all optimizations.
+"""
+
+
+def apply_fsdp2_llava(model, mesh, mp_policy):
+    """
+    LLaVA structure:
+      model.vision_tower    — ViT (frozen)
+      model.mm_projector    — MLP connector (trainable, small)
+      model.model           — Llama LLM (trainable, large)
+      model.lm_head         — Language model head
+    """
+    # ─── Vision encoder: frozen, still shard for memory ───
+    for param in model.vision_tower.parameters():
+        param.requires_grad = False
+
+    # Shard vision blocks (saves memory, forward-only communication)
+    for block in model.vision_tower.vision_model.encoder.layers:
+        fully_shard(block, mesh=mesh, mp_policy=mp_policy)
+    fully_shard(model.vision_tower, mesh=mesh, mp_policy=mp_policy)
+
+    # ─── LLM: trainable, full sharding ───
+    for layer in model.model.layers:
+        fully_shard(layer, mesh=mesh, mp_policy=mp_policy)
+    fully_shard(model.model, mesh=mesh, mp_policy=mp_policy)
+
+    # ─── Root (connector, head, embeddings) ───
+    fully_shard(model, mesh=mesh, mp_policy=mp_policy)
+
+    return model
+
+
+# Memory budget (4× V100-32GB):
+# Vision (frozen, no optimizer states): 304M × 4 / 4 GPUs = 304 MB/GPU
+# LLM (trainable): 6.7B × 16 / 4 GPUs = 25.6 GB/GPU ← TIGHT on V100!
+# → Need 8 GPUs (2 nodes HSDP) or CPU offloading for 7B LLM on V100
+</code></pre>
+
+<div class="callout warning">
+    <strong>LLaVA-7B on V100-32GB requires at least 8 GPUs (2 nodes).</strong> The LLM alone needs 25.6 GB/GPU model-prop at 4-way sharding. With 8-way: 12.8 GB/GPU — feasible. Use HSDP mesh (2, 4) for NVLink-optimal communication. For LLaVA-13B: need 16+ GPUs on V100.
+</div>
+
+<h2>Strategy 3: Per-Component Precision Policies</h2>
+
+<pre><code class="language-python">def apply_fsdp2_mixed_precision_vlm(model, mesh):
+    """
+    Different precision policies for different components.
+
+    Vision encoder: fp16 (well-behaved, no overflow risk)
+    LLM: fp16 compute, fp32 reduce (standard)
+    Connector: fp32 (small, precision-sensitive for alignment)
+    """
+    mp_vision = MixedPrecisionPolicy(
+        param_dtype=torch.float16,
+        reduce_dtype=torch.float16,  # Vision grads safe in fp16 (if frozen, irrelevant)
+    )
+
+    mp_llm = MixedPrecisionPolicy(
+        param_dtype=torch.float16,
+        reduce_dtype=torch.float32,  # LLM grads need fp32 to avoid underflow
+    )
+
+    mp_connector = MixedPrecisionPolicy(
+        param_dtype=torch.float32,  # Small, precision matters for alignment
+        reduce_dtype=torch.float32,
+    )
+
+    # Apply different policies to different components
+    for block in model.vision_tower.vision_model.encoder.layers:
+        fully_shard(block, mesh=mesh, mp_policy=mp_vision)
+    fully_shard(model.vision_tower, mesh=mesh, mp_policy=mp_vision)
+
+    for layer in model.model.layers:
+        fully_shard(layer, mesh=mesh, mp_policy=mp_llm)
+    fully_shard(model.model, mesh=mesh, mp_policy=mp_llm)
+
+    # Connector is part of root — gets root's policy
+    fully_shard(model, mesh=mesh, mp_policy=mp_connector)
+</code></pre>
+
+<h2>Multi-Stage Training Patterns</h2>
+
+<pre><code class="language-python"># VLM training typically has multiple stages with different frozen components:
+
+# Stage 1: Alignment (freeze everything except connector)
+# Only the MLP connector trains to align vision → language embeddings
+def stage1_freeze(model):
+    for param in model.vision_tower.parameters():
+        param.requires_grad = False
+    for param in model.model.parameters():
+        param.requires_grad = False
+    for param in model.lm_head.parameters():
+        param.requires_grad = False
+    # Only connector trains:
+    for param in model.mm_projector.parameters():
+        param.requires_grad = True
+
+# Stage 2: Instruction tuning (unfreeze LLM, keep vision frozen)
+def stage2_freeze(model):
+    for param in model.vision_tower.parameters():
+        param.requires_grad = False
+    for param in model.model.parameters():
+        param.requires_grad = True
+    for param in model.lm_head.parameters():
+        param.requires_grad = True
+    for param in model.mm_projector.parameters():
+        param.requires_grad = True
+
+# IMPORTANT: If you change requires_grad AFTER fully_shard(),
+# the optimizer states are already allocated. Rebuild optimizer:
+def transition_stage(model, stage_fn, mesh, mp_policy, lr):
+    stage_fn(model)
+    # No need to re-shard — FSDP2 handles frozen params correctly
+    # But rebuild optimizer to only track trainable params:
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable, lr=lr)
+    return optimizer
+</code></pre>
+
+<h2>SAM (Segment Anything) with FSDP2</h2>
+
+<pre><code class="language-python">"""
+SAM architecture: image encoder (ViT-H) + prompt encoder + mask decoder.
+Image encoder is heavy (632M), decoder is light (~4M).
+"""
+
+def apply_fsdp2_sam(model, mesh, mp_policy):
+    """
+    SAM structure:
+      model.image_encoder    — ViT-H (heavy)
+      model.prompt_encoder   — Lightweight encoder for points/boxes
+      model.mask_decoder     — Lightweight transformer decoder
+    """
+    # Image encoder: per-block sharding (same as standalone ViT-H)
+    for block in model.image_encoder.blocks:
+        fully_shard(block, mesh=mesh, mp_policy=mp_policy)
+    fully_shard(model.image_encoder, mesh=mesh, mp_policy=mp_policy)
+
+    # Prompt encoder and mask decoder: small enough to be one FSDP unit each
+    fully_shard(model.prompt_encoder, mesh=mesh, mp_policy=mp_policy)
+    fully_shard(model.mask_decoder, mesh=mesh, mp_policy=mp_policy)
+
+    # Root
+    fully_shard(model, mesh=mesh, mp_policy=mp_policy)
+
+    return model
+
+# For SAM fine-tuning (freeze image encoder, train decoder):
+# Same pattern as LLaVA stage 1 — freeze + shard + optimizer only on trainable
+</code></pre>
+
+<h2>Key Architectural Decisions</h2>
+
+<table>
+    <thead>
+    <tr><th>VLM pattern</th><th>Sharding approach</th><th>Critical consideration</th></tr>
+    </thead>
+    <tbody>
+    <tr>
+        <td>Dual-encoder (CLIP/SigLIP)</td>
+        <td>Uniform per-block sharding across both encoders</td>
+        <td>Feature gathering for contrastive loss needs separate all-gather of activations</td>
+    </tr>
+    <tr>
+        <td>Encoder-decoder (LLaVA)</td>
+        <td>Per-component sharding with frozen vision encoder</td>
+        <td>LLM dominates memory; vision is cheap. Plan GPU count for LLM.</td>
+    </tr>
+    <tr>
+        <td>Prompted model (SAM)</td>
+        <td>Heavy encoder sharded; lightweight decoder as single unit</td>
+        <td>Batch dimension differs between encoder (images) and decoder (prompts per image)</td>
+    </tr>
+    <tr>
+        <td>Multi-stage training</td>
+        <td>Same sharding, different freezing per stage</td>
+        <td>Rebuild optimizer between stages; frozen params save backward communication</td>
+    </tr>
+    </tbody>
+</table>
+
+<div class="callout success">
+    <strong>The fundamental rule holds:</strong> FSDP2 doesn't care about your model's semantic structure (vision vs language). It cares about repeated module blocks you can shard individually. Find the repeated blocks in each component, shard them, shard the root. The VLM-specific challenges are about: (1) memory budgeting across unequal components, (2) per-component precision policies, and (3) feature gathering for contrastive objectives.
+</div>
+
+<h2>Primary Source</h2>
+<p><a href="https://github.com/haotian-liu/LLaVA">LLaVA repository</a> for architecture patterns. <a href="https://github.com/mlfoundations/open_clip">OpenCLIP</a> for CLIP training. For FSDP2 + LLM patterns: <a href="https://github.com/pytorch/torchtitan">torchtitan</a> (Llama sharding) and <a href="https://github.com/pytorch/torchtune">torchtune</a> (fine-tuning recipes with FSDP2).</p>

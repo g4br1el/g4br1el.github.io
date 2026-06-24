@@ -1,0 +1,634 @@
+---
+layout: tutorial
+tutorial: fsdp2
+type: lesson
+lesson: 6
+total: 18
+title: "Mixed Precision in FSDP2: fp16 on V100"
+tags: [Core, V100-Specific]
+permalink: /heap/fsdp2/006/
+---
+
+
+<p><em>The full interaction between MixedPrecisionPolicy, FSDP2's internal casting, and the precision dangers specific to V100's fp16-only world.</em></p>
+
+<h2>Why This Is More Complex Than DDP + AMP</h2>
+
+<p>In DDP, mixed precision is your problem:</p>
+<pre><code class="language-python"># DDP pattern (what you're used to):
+scaler = torch.cuda.amp.GradScaler()
+with torch.cuda.amp.autocast(dtype=torch.float16):
+    output = model(input)
+    loss = criterion(output, target)
+scaler.scale(loss).backward()
+scaler.step(optimizer)
+scaler.update()
+</code></pre>
+
+<p>In FSDP2, precision is <strong>interleaved with communication</strong>. The dtype of a parameter matters at five different points: storage, all-gather, compute, reduce-scatter, and optimizer update. <code>MixedPrecisionPolicy</code> controls this entire pipeline — and on V100, you must get it right because fp16's narrow dynamic range leaves no margin for error.</p>
+
+<h2>The Three Knobs of MixedPrecisionPolicy</h2>
+
+<pre><code class="language-python">from torch.distributed._composable.fsdp import MixedPrecisionPolicy
+
+policy = MixedPrecisionPolicy(
+    param_dtype=torch.float16,      # Dtype for compute (forward + backward)
+    reduce_dtype=torch.float32,     # Dtype for gradient reduce-scatter
+    output_dtype=None,              # Dtype to cast module outputs to (rare)
+)
+</code></pre>
+
+<table>
+    <thead>
+    <tr><th>Knob</th><th>Controls</th><th>Impact on V100</th></tr>
+    </thead>
+    <tbody>
+    <tr>
+        <td><code>param_dtype</code></td>
+        <td>The dtype of parameters AFTER all-gather, during forward/backward compute</td>
+        <td>fp16 → uses Tensor Cores (8× FLOPS vs fp32). Must be fp16 on V100 (no bf16 hardware).</td>
+    </tr>
+    <tr>
+        <td><code>reduce_dtype</code></td>
+        <td>The dtype used when gradients are reduce-scattered across ranks</td>
+        <td>fp32 recommended on V100. Prevents gradient underflow during summation. Costs 2× comm bandwidth on reduce-scatter only.</td>
+    </tr>
+    <tr>
+        <td><code>output_dtype</code></td>
+        <td>Optional cast applied to module outputs before passing to next module</td>
+        <td>Rarely needed. Use only if downstream module expects specific dtype. Default: no cast (inherit from compute).</td>
+    </tr>
+    </tbody>
+</table>
+
+<h2>Full Precision Lifecycle in FSDP2</h2>
+
+<p>Let's trace the dtype of a single parameter through one complete training step:</p>
+
+<div class="diagram">
+    Parameter precision lifecycle (V100, param_dtype=fp16, reduce_dtype=fp32):
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    [AT REST]
+    Master weight:  fp32, Shard(0), shape [P/N, ...]  ← stored permanently
+
+    [PRE-FORWARD HOOK]
+    1. all-gather master weight shards → full fp32 param    (communication in fp32)
+    2. Cast fp32 → fp16                                     (local op, no comm)
+    3. Module sees: fp16, Replicate, full shape [P, ...]    ← compute dtype
+
+    Memory at this point:
+    - fp32 shard (P/N × 4 bytes) — retained
+    - fp16 full param (P × 2 bytes) — transient
+
+    [FORWARD COMPUTE]
+    Uses fp16 parameters, produces fp16 activations
+    Tensor Core utilization: matrix multiplies run at fp16→fp32 accumulate→fp16 output
+
+    [POST-FORWARD HOOK]
+    4. Free fp16 full param buffer                          (memory reclaimed)
+    Only fp32 shard remains
+
+    [PRE-BACKWARD HOOK]
+    5. all-gather master weight shards → full fp32 param    (communication in fp32)
+    6. Cast fp32 → fp16                                     (for grad computation)
+
+    [BACKWARD COMPUTE]
+    Computes gradients in fp16 (matching forward precision)
+    grad_weight: fp16, full shape, Partial(sum) on each rank
+
+    [POST-BACKWARD HOOK]
+    7. Cast grad fp16 → fp32                                (upcast BEFORE reduction)
+    8. reduce-scatter in fp32 → sharded fp32 grad           (communication in fp32)
+    9. Free fp16 full param buffer
+
+    Result: fp32 grad shard, shape [P/N, ...]
+
+    [OPTIMIZER STEP]
+    Inputs (all fp32, all sharded):
+    - Master weight shard: [P/N, ...]
+    - Gradient shard:      [P/N, ...]
+    - Adam m shard:        [P/N, ...]
+    - Adam v shard:        [P/N, ...]
+
+    Update: entirely fp32, entirely local, no communication
+</div>
+    </code></pre>
+
+    <div class="callout">
+        <strong>Key insight:</strong> The master weights are ALWAYS fp32. FSDP2 never stores fp16 parameters permanently. The fp16 copy exists only transiently during compute. This is different from some DDP + AMP implementations where the model's <code>.parameters()</code> might be fp16 with separate fp32 copies in the optimizer — in FSDP2, the parameters ARE the fp32 masters, and fp16 is a cast applied on-the-fly.
+    </div>
+
+    <h2>Why No GradScaler Is Needed</h2>
+
+    <p>This confuses many people migrating from DDP + AMP. The reasoning:</p>
+
+    <table>
+        <thead>
+        <tr><th>Concern</th><th>DDP + AMP solution</th><th>FSDP2 solution</th></tr>
+        </thead>
+        <tbody>
+        <tr>
+            <td>fp16 gradients underflow to zero</td>
+            <td>GradScaler scales loss → amplified gradients stay in fp16 range</td>
+            <td><code>reduce_dtype=fp32</code>: gradients are upcast to fp32 BEFORE reduction. Optimizer sees fp32 grads. No underflow possible in the critical path.</td>
+        </tr>
+        <tr>
+            <td>fp16 gradient overflow (NaN/Inf)</td>
+            <td>GradScaler detects inf, skips step, reduces scale</td>
+            <td>Gradients computed in fp16 locally → upcast to fp32 immediately. The fp16 window is tiny (single backward pass on one rank). If overflow occurs here, it's a learning rate / architecture issue, not a scaling issue.</td>
+        </tr>
+        <tr>
+            <td>Accumulated fp16 round-off in optimizer</td>
+            <td>Optimizer operates on fp32 master weights (separate copy)</td>
+            <td>Identical — optimizer operates on fp32 sharded master weights natively.</td>
+        </tr>
+        </tbody>
+    </table>
+
+    <div class="callout success">
+        <strong>Bottom line:</strong> <code>reduce_dtype=fp32</code> eliminates the primary failure mode that GradScaler exists to solve (gradient underflow during accumulation/reduction). The remaining risk (local fp16 gradient overflow during backward on a single rank) is rare for well-configured training and indicates a hyperparameter problem, not a scaling problem.
+    </div>
+
+    <h3>When You MIGHT Still Want Loss Scaling</h3>
+
+    <p>There is one edge case: if you set <code>reduce_dtype=torch.float16</code> (to minimize communication) AND your model produces very small gradients, you could still underflow during the reduce-scatter. In this case, you'd need manual loss scaling. But on V100, this is not recommended — use <code>reduce_dtype=fp32</code> and avoid the complexity.</p>
+
+    <h2>V100 fp16 Dangers: The Dynamic Range Problem</h2>
+
+    <p>Understanding the numerical limits of fp16 is essential for debugging training instability:</p>
+
+    <table>
+        <thead>
+        <tr><th>Property</th><th>fp16</th><th>bf16</th><th>fp32</th></tr>
+        </thead>
+        <tbody>
+        <tr><td>Exponent bits</td><td>5</td><td>8</td><td>8</td></tr>
+        <tr><td>Mantissa bits</td><td>10</td><td>7</td><td>23</td></tr>
+        <tr><td>Max value</td><td>65,504</td><td>3.4 × 10³⁸</td><td>3.4 × 10³⁸</td></tr>
+        <tr><td>Min positive normal</td><td>6.1 × 10⁻⁵</td><td>1.2 × 10⁻³⁸</td><td>1.2 × 10⁻³⁸</td></tr>
+        <tr><td>Min subnormal</td><td>5.96 × 10⁻⁸</td><td>9.2 × 10⁻⁴¹</td><td>1.4 × 10⁻⁴⁵</td></tr>
+        <tr><td>Precision (decimal digits)</td><td>~3.3</td><td>~2.4</td><td>~7.2</td></tr>
+        </tbody>
+    </table>
+
+    <div class="callout warning">
+        <strong>The V100 disadvantage:</strong> fp16's max value of 65,504 means any intermediate result &gt; 65,504 becomes <code>inf</code>. In attention computations, <code>Q @ K.T / sqrt(d)</code> with large sequence lengths or high-magnitude embeddings can overflow. bf16 (available on A100/H100) shares fp32's exponent range and never has this issue. On V100, you must be vigilant about overflow in attention.
+    </div>
+
+    <h2>Attention Overflow: The Most Common V100 fp16 Failure</h2>
+
+    <p>The attention score computation <code>Q @ K.T</code> for ViTs with large embedding dimensions:</p>
+
+    <pre><code class="language-python"># ViT-Huge: head_dim = 1280 / 16 heads = 80
+# Attention scores: [batch, heads, seq_len, seq_len]
+#
+# If Q and K entries have magnitude ~1.0 (post-LayerNorm), then:
+#   QK entry ≈ sum of 80 products of ~1.0 magnitude values
+#   Expected magnitude: ~sqrt(80) ≈ 8.9 (Central Limit Theorem)
+#   After scaling by 1/sqrt(80): ~1.0
+#
+# But with fp16, outlier values can push individual entries to ~50-100
+# before scaling. This is fine for fp16 (max 65504).
+#
+# HOWEVER, if you forget the scaling, or if embeddings aren't well-normalized:
+#   QK entry without scaling: can reach ~80 × 5 = 400 (if values ~5)
+#   After softmax: exp(400) = inf → NaN propagates everywhere
+</code></pre>
+
+    <h3>Defenses Against fp16 Overflow in ViT</h3>
+
+    <pre><code class="language-python"># 1. Scaled dot-product attention (PyTorch 2.0+) — handles this internally
+# It computes attention in a numerically stable way, even in fp16.
+# timm's ViT uses this by default. ALWAYS use it on V100.
+output = torch.nn.functional.scaled_dot_product_attention(Q, K, V)
+
+# 2. If using a custom attention: scale BEFORE matmul, not after
+# BAD (overflow risk):
+scores = Q @ K.T / math.sqrt(head_dim)
+
+# GOOD (overflow prevented):
+Q_scaled = Q / math.sqrt(math.sqrt(head_dim))  # Scale Q by d^{-1/4}
+K_scaled = K / math.sqrt(math.sqrt(head_dim))  # Scale K by d^{-1/4}
+scores = Q_scaled @ K_scaled.T                  # Product is scaled by d^{-1/2}
+
+# 3. Clamp attention scores before softmax (last resort, loses gradient info)
+scores = scores.clamp(min=-65000, max=65000)
+</code></pre>
+
+    <div class="callout">
+        <strong>For your ViT-Huge training:</strong> If you're using <code>timm</code>'s implementation (as in Lesson 003), it uses <code>scaled_dot_product_attention</code> which is numerically stable in fp16. No additional action needed. But if you ever implement custom attention (e.g., for defect detection with cross-attention to reference images), remember the scaling-before-matmul pattern.
+    </div>
+
+    <h2>LayerNorm Precision: A Subtle Correctness Issue</h2>
+
+    <p>LayerNorm computes mean and variance across features. In fp16:</p>
+
+    <pre><code class="language-python"># LayerNorm(x) = (x - mean(x)) / sqrt(var(x) + eps) * gamma + beta
+#
+# Problem: variance computation in fp16 is numerically unstable.
+# For ViT-Huge with hidden_dim=1280:
+#   mean = sum(x_i) / 1280  — in fp16, sum of 1280 values can overflow
+#   var = sum((x_i - mean)^2) / 1280 — squared differences amplify magnitude
+#
+# PyTorch's LayerNorm handles this correctly:
+# It computes the reduction (mean, var) in fp32 internally,
+# even when input is fp16. This is NOT controlled by MixedPrecisionPolicy —
+# it's baked into the LayerNorm kernel.
+</code></pre>
+
+    <div class="callout success">
+        <strong>Good news:</strong> PyTorch's native <code>nn.LayerNorm</code> always computes reductions in fp32 internally, regardless of input dtype. The <code>gamma</code> and <code>beta</code> parameters (which ARE sharded by FSDP2) are typically fp32 at rest and cast to fp16 for the multiply/add — this is handled correctly by the precision lifecycle above. No manual intervention needed.
+    </div>
+
+    <h2>MixedPrecisionPolicy Options Matrix</h2>
+
+    <p>All valid configurations for V100:</p>
+
+    <table>
+        <thead>
+        <tr><th>Configuration</th><th>param_dtype</th><th>reduce_dtype</th><th>Compute speed</th><th>Comm cost</th><th>Stability</th><th>Verdict</th></tr>
+        </thead>
+        <tbody>
+        <tr>
+            <td>Full fp32 (no MP)</td>
+            <td>fp32</td>
+            <td>fp32</td>
+            <td>1× (baseline)</td>
+            <td>1× (baseline)</td>
+            <td>★★★★★</td>
+            <td>Slow. Only for debugging.</td>
+        </tr>
+        <tr>
+            <td><strong>Recommended</strong></td>
+            <td><strong>fp16</strong></td>
+            <td><strong>fp32</strong></td>
+            <td><strong>~2–3×</strong></td>
+            <td><strong>~1.3×</strong></td>
+            <td><strong>★★★★☆</strong></td>
+            <td><strong>Best balance for V100.</strong></td>
+        </tr>
+        <tr>
+            <td>Aggressive</td>
+            <td>fp16</td>
+            <td>fp16</td>
+            <td>~2–3×</td>
+            <td>~0.65×</td>
+            <td>★★☆☆☆</td>
+            <td>Gradient underflow risk. Needs loss scaling.</td>
+        </tr>
+        <tr>
+            <td>Compute-only fp32</td>
+            <td>fp32</td>
+            <td>fp16</td>
+            <td>1×</td>
+            <td>~0.65×</td>
+            <td>★★★☆☆</td>
+            <td>Nonsensical — slow compute but lossy comm.</td>
+        </tr>
+        </tbody>
+    </table>
+
+    <div class="callout">
+        <strong>The ~1.3× communication cost</strong> for the recommended config: all-gathers move fp32 data (4 bytes/param), reduce-scatter moves fp32 data (4 bytes/param). Compared to a hypothetical all-fp16 pipeline (2 bytes/param everywhere), you pay 2× on comm per byte. But comm volume is only a fraction of total step time, so the net overhead is ~30% on communication, which translates to ~5-10% on total step time (compute-dominated for large models).
+    </div>
+
+    <h2>What About All-Gathering in fp16?</h2>
+
+    <p>A natural question: can we store master weights in fp32 but all-gather in fp16 to save communication bandwidth?</p>
+
+    <pre><code class="language-python"># This is NOT directly configurable via MixedPrecisionPolicy in current FSDP2.
+# The all-gather operates on the stored parameter dtype (fp32 masters).
+#
+# What actually happens with param_dtype=fp16, reduce_dtype=fp32:
+#   1. Parameters at rest: fp32 (master weights)
+#   2. All-gather: transmits fp32 shards → assembles full fp32 param
+#   3. Cast: fp32 → fp16 (local operation after all-gather)
+#   4. Compute: fp16
+#   5. Grad: fp16 → cast to fp32 → reduce-scatter in fp32
+#
+# So the all-gather bandwidth cost is fp32 (4 bytes/param), not fp16.
+#
+# This is a known trade-off. The PyTorch team considered "cast-before-gather"
+# (cast to fp16, then all-gather fp16 shards), which would halve all-gather
+# bandwidth. This is planned but not yet implemented as of PyTorch 2.5.
+#
+# Workaround: store parameters in fp16 as the "master" dtype and use fp32
+# only in the optimizer via a separate mechanism. But this adds complexity
+# and is not recommended for stability.
+</code></pre>
+
+    <div class="callout warning">
+        <strong>Current limitation:</strong> FSDP2 all-gathers in the storage dtype (fp32 for masters). This means all-gather bandwidth is 2× what it could be if casting happened before communication. On your V100 NVLink (300 GB/s), this is rarely the bottleneck for ViT-Huge sized models. But at larger scale (billions of params) or with InfiniBand-heavy topologies, it matters. Keep this in mind for future optimization.
+    </div>
+
+    <h2>Comparing Memory Footprints</h2>
+
+    <p>Per-GPU memory for ViT-Huge (632M params), 4 GPUs, FSDP2:</p>
+
+    <table>
+        <thead>
+        <tr><th>Component</th><th>No MP (all fp32)</th><th>With MP (fp16 compute, fp32 reduce)</th></tr>
+        </thead>
+        <tbody>
+        <tr>
+            <td>Master weight shard</td>
+            <td>632M/4 × 4 = 632 MB</td>
+            <td>632M/4 × 4 = 632 MB (unchanged — always fp32)</td>
+        </tr>
+        <tr>
+            <td>Gradient shard</td>
+            <td>632M/4 × 4 = 632 MB</td>
+            <td>632M/4 × 4 = 632 MB (fp32 after reduction)</td>
+        </tr>
+        <tr>
+            <td>Adam m shard</td>
+            <td>632M/4 × 4 = 632 MB</td>
+            <td>632M/4 × 4 = 632 MB (unchanged)</td>
+        </tr>
+        <tr>
+            <td>Adam v shard</td>
+            <td>632M/4 × 4 = 632 MB</td>
+            <td>632M/4 × 4 = 632 MB (unchanged)</td>
+        </tr>
+        <tr>
+            <td>Transient unsharded param (1 block)</td>
+            <td>~20M × 4 = 76 MB (fp32)</td>
+            <td>~20M × 2 = <strong>38 MB (fp16!)</strong></td>
+        </tr>
+        <tr>
+            <td>Activations (batch=16, 224²)</td>
+            <td>~12 GB (fp32)</td>
+            <td><strong>~6 GB (fp16)</strong></td>
+        </tr>
+        <tr>
+            <td><strong>Total peak estimate</strong></td>
+            <td><strong>~15 GB</strong></td>
+            <td><strong>~9 GB</strong></td>
+        </tr>
+        </tbody>
+    </table>
+
+    <div class="callout success">
+        <strong>Mixed precision's biggest memory win: activations.</strong> The model-proportional memory (shards + optimizer) is fp32 regardless. But activations (saved for backward) are stored in the compute dtype — fp16. For batch_size=16 with ViT-Huge, this saves ~6 GB. That's the difference between fitting batch=16 and fitting batch=32.
+    </div>
+
+    <h2>When Training Diverges: Debugging Precision Issues</h2>
+
+    <p>Symptoms and diagnoses for fp16 training on V100:</p>
+
+    <table>
+        <thead>
+        <tr><th>Symptom</th><th>Likely cause</th><th>Diagnosis</th><th>Fix</th></tr>
+        </thead>
+        <tbody>
+        <tr>
+            <td>Loss becomes NaN suddenly (one step)</td>
+            <td>fp16 overflow in attention or large activations</td>
+            <td>Add <code>torch.autograd.detect_anomaly()</code> or check for inf in attention scores</td>
+            <td>Use <code>scaled_dot_product_attention</code>; reduce learning rate; check for exploding embeddings</td>
+        </tr>
+        <tr>
+            <td>Loss plateaus early, no learning</td>
+            <td>Gradient underflow — many grads become zero in fp16</td>
+            <td>Compare grad norms with fp32 run; check <code>(grad == 0).float().mean()</code></td>
+            <td>Verify <code>reduce_dtype=fp32</code>; increase learning rate; check for vanishing activations</td>
+        </tr>
+        <tr>
+            <td>Loss is unstable / oscillates</td>
+            <td>fp16 precision loss in accumulation or normalization</td>
+            <td>Run same config in fp32; if stable, precision is the issue</td>
+            <td>Ensure LayerNorm computes in fp32 (default); consider gradient clipping</td>
+        </tr>
+        <tr>
+            <td>Training is correct but slower than expected</td>
+            <td>Tensor Cores not engaged (wrong shapes)</td>
+            <td>Profile with <code>torch.profiler</code>; check for non-multiples-of-8 dimensions</td>
+            <td>Pad hidden dims to multiples of 8 (ViT-Huge: 1280 ✓, already good)</td>
+        </tr>
+        </tbody>
+    </table>
+
+    <h3>Debugging Utility</h3>
+
+    <pre><code class="language-python">def check_precision_health(model: nn.Module, step: int) -> None:
+    """Call periodically (every 100 steps) to detect precision issues early."""
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            grad = param.grad
+            # Access local tensor if DTensor
+            if hasattr(grad, '_local_tensor'):
+                grad = grad._local_tensor
+
+            grad_abs = grad.abs()
+            n_zero = (grad_abs == 0).sum().item()
+            n_inf = torch.isinf(grad).sum().item()
+            n_nan = torch.isnan(grad).sum().item()
+
+            total = grad.numel()
+            zero_pct = n_zero / total * 100
+
+            if n_inf > 0 or n_nan > 0:
+                print(f"[Step {step}] ⚠️  {name}: {n_inf} inf, {n_nan} nan")
+            elif zero_pct > 50:
+                print(f"[Step {step}] ⚠️  {name}: {zero_pct:.1f}% zero gradients "
+                      f"(possible underflow)")
+</code></pre>
+
+    <h2>Tensor Core Alignment on V100</h2>
+
+    <p>V100 Tensor Cores operate on fp16 matrices with specific alignment requirements:</p>
+
+    <pre><code class="language-python"># V100 Tensor Core requirements for maximum throughput:
+# - Matrix dimensions (M, N, K) should be multiples of 8
+# - Input tensors should be contiguous in memory
+#
+# ViT-Huge dimensions:
+#   hidden_dim = 1280  → 1280 / 8 = 160 ✓
+#   mlp_dim = 5120     → 5120 / 8 = 640 ✓
+#   num_heads = 16     → head_dim = 80 → 80 / 8 = 10 ✓
+#   patch_embed output = 1280 ✓
+#
+# Batch × seq_len = 16 × (224/14)² = 16 × 256 = 4096 → 4096 / 8 = 512 ✓
+#
+# All ViT-Huge dimensions are multiples of 8 → maximum Tensor Core utilization.
+# No padding needed.
+#
+# If you train with non-standard image sizes (e.g., 518×518 for DINOv2):
+#   seq_len = (518/14)² = 37² = 1369 → 1369 / 8 = 171.125 ✗
+#   This will still work but with slightly reduced Tensor Core efficiency.
+#   Padding to 1376 tokens (37.1 patches → round to 38² = 1444?) is complex.
+#   In practice, the efficiency loss for non-aligned seq_len is small (~2-5%).
+</code></pre>
+
+    <h2>The output_dtype Knob: When You Need It</h2>
+
+    <pre><code class="language-python"># output_dtype is rarely needed. The use case:
+#
+# You have two adjacent FSDP units where:
+# - Unit A computes in fp16 (param_dtype=fp16)
+# - Unit B expects fp32 input for numerical reasons
+#
+# Without output_dtype:
+#   Unit A output → fp16 tensor → passed to Unit B → Unit B's pre-forward
+#   hook doesn't cast inputs (only params are cast)
+#
+# With output_dtype=torch.float32 on Unit A:
+#   Unit A output → cast to fp32 → passed to Unit B
+#
+# In practice for ViTs: all blocks use the same policy, so this isn't needed.
+# It becomes relevant for heterogeneous architectures (e.g., mixing a
+# quantized encoder with a full-precision decoder).
+
+# Example (hypothetical):
+policy_encoder = MixedPrecisionPolicy(
+    param_dtype=torch.float16,
+    reduce_dtype=torch.float32,
+    output_dtype=torch.float32,  # Cast output to fp32 for decoder
+)
+policy_decoder = MixedPrecisionPolicy(
+    param_dtype=torch.float32,  # Decoder runs in fp32
+    reduce_dtype=torch.float32,
+)
+</code></pre>
+
+    <h2>Per-Module Precision Policies</h2>
+
+    <p>FSDP2 allows different policies for different FSDP units:</p>
+
+    <pre><code class="language-python">def apply_fsdp2_with_mixed_policies(model: nn.Module, mesh) -> nn.Module:
+    """
+    Example: fp16 for transformer blocks, fp32 for the classification head.
+
+    Rationale: The head is small (1280 × num_classes), so fp32 cost is minimal.
+    But classification logits in fp16 can lose precision for rare classes
+    with small probabilities — this avoids subtle accuracy degradation.
+    """
+    mp_fp16 = MixedPrecisionPolicy(
+        param_dtype=torch.float16,
+        reduce_dtype=torch.float32,
+    )
+    mp_fp32 = MixedPrecisionPolicy(
+        param_dtype=torch.float32,
+        reduce_dtype=torch.float32,
+    )  # No casting — everything stays fp32
+
+    # Transformer blocks: fp16 compute (Tensor Cores)
+    for block in model.blocks:
+        fully_shard(block, mesh=mesh, mp_policy=mp_fp16)
+
+    # Could also apply fp32 to specific sensitive layers:
+    # fully_shard(model.head, mesh=mesh, mp_policy=mp_fp32)
+    # But model.head is part of the root FSDP unit, so:
+
+    # Root (includes patch_embed, head, pos_embed): fp16 is fine here too
+    fully_shard(model, mesh=mesh, mp_policy=mp_fp16)
+
+    return model
+</code></pre>
+
+    <div class="callout">
+        <strong>In practice for ViT training:</strong> using a uniform fp16 policy everywhere works fine. Per-module policies are more relevant for: (1) models with mixed quantized/full-precision components, (2) architectures where specific layers are precision-sensitive (e.g., the final projection in contrastive learning), or (3) fine-tuning scenarios where only some layers are trained.
+    </div>
+
+    <h2>Gradient Clipping with FSDP2</h2>
+
+    <p>Gradient clipping is a common stability tool that interacts with FSDP2's sharded gradients:</p>
+
+    <pre><code class="language-python"># With FSDP2, gradients AFTER backward are sharded (each rank has 1/N).
+# torch.nn.utils.clip_grad_norm_ works correctly on sharded DTensor gradients
+# because it uses DTensor's all-reduce internally to compute the global norm.
+
+# Pattern:
+loss.backward()
+
+# Clip BEFORE optimizer step
+# This computes the global grad norm across all ranks (requires all-reduce)
+# then clips each rank's sharded grad in-place.
+torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+optimizer.step()
+optimizer.zero_grad()
+</code></pre>
+
+    <div class="callout warning">
+        <strong>Performance note:</strong> <code>clip_grad_norm_</code> with FSDP2 triggers an additional all-reduce to compute the global gradient norm (each rank has only a partial view of the total norm). This adds one extra collective per step. For most training, this is negligible (~1-2ms on NVLink), but be aware it exists.
+    </div>
+
+    <h2 id="quiz">Check Your Understanding</h2>
+
+    <div class="quiz">
+        <h3>Q1: With MixedPrecisionPolicy(param_dtype=fp16, reduce_dtype=fp32), what dtype is transmitted during the all-gather in the pre-forward hook?</h3>
+        <button onclick="checkAnswer(this, false)">fp16 — parameters are cast before all-gather to save bandwidth</button>
+        <button onclick="checkAnswer(this, true)">fp32 — master weights are stored in fp32 and all-gathered as-is; the cast to fp16 happens after</button>
+        <button onclick="checkAnswer(this, false)">Mixed — the first dimension in fp32, the rest in fp16 for partial precision</button>
+        <button onclick="checkAnswer(this, false)">It depends on the specific parameter size — small params stay fp32, large ones cast to fp16</button>
+        <div class="explanation">
+            <strong>Correct.</strong> FSDP2 stores master weights in fp32. The all-gather transmits fp32 shards and assembles the full fp32 parameter. Only THEN is it cast to fp16 for compute. This means all-gather bandwidth is 4 bytes/param, not 2. The "cast-before-gather" optimization (transmitting fp16 and saving bandwidth) is not yet implemented in FSDP2 as of PyTorch 2.5.
+        </div>
+    </div>
+
+    <div class="quiz">
+        <h3>Q2: Why does mixed precision save more activation memory than model-proportional memory with FSDP2?</h3>
+        <button onclick="checkAnswer(this, false)">Activations are stored redundantly across all ranks while model params are sharded</button>
+        <button onclick="checkAnswer(this, true)">Model-proportional memory (master weights, optimizer states) is always fp32 regardless of mp_policy; only activations benefit from the fp16 compute dtype</button>
+        <button onclick="checkAnswer(this, false)">FSDP2 applies additional compression to activations beyond just dtype casting</button>
+        <button onclick="checkAnswer(this, false)">Activations are larger than model parameters for typical batch sizes, so the absolute savings are greater even at the same ratio</button>
+        <div class="explanation">
+            <strong>Correct.</strong> The optimizer states (Adam m, v) and master weights are fp32 by design — MixedPrecisionPolicy doesn't change their storage dtype. Only the transient compute (forward activations saved for backward) uses fp16. So model-proportional memory is unchanged by mixed precision, while activation memory is halved. Answer D is also partially true (activations often dominate), but the root cause is that model-prop memory is fp32-locked.
+        </div>
+    </div>
+
+    <div class="quiz">
+        <h3>Q3: Your ViT-Huge FSDP2 training on V100 shows loss=NaN at step 847. Loss was decreasing normally before. What's your first diagnostic step?</h3>
+        <button onclick="checkAnswer(this, false)">Switch to reduce_dtype=fp16 to reduce communication overhead that might be causing synchronization issues</button>
+        <button onclick="checkAnswer(this, false)">Increase batch size to stabilize gradient estimates and reduce stochastic spikes</button>
+        <button onclick="checkAnswer(this, true)">Check if attention scores overflow fp16 range by logging max values in the attention computation; verify scaled_dot_product_attention is being used</button>
+        <button onclick="checkAnswer(this, false)">Add GradScaler to handle the gradient overflow that caused the NaN propagation</button>
+        <div class="explanation">
+            <strong>Correct.</strong> Sudden NaN (was fine, then explodes) on V100 fp16 is almost always attention overflow. As training progresses, embedding magnitudes can grow, pushing Q@K.T products past fp16's max (65504). First check: are you using <code>scaled_dot_product_attention</code> (which handles this internally)? If using custom attention, log <code>attn_scores.max()</code> in the steps before 847 — you'll likely see it approaching 65504. Fix: ensure SDPA usage or apply the scale-before-matmul pattern.
+        </div>
+    </div>
+
+    <div class="quiz">
+        <h3>Q4: You want to verify Tensor Cores are actually being used for your fp16 ViT-Huge matmuls on V100. How?</h3>
+        <button onclick="checkAnswer(this, false)">Check nvidia-smi for "Tensor Core Utilization" metric in the performance panel</button>
+        <button onclick="checkAnswer(this, true)">Profile with torch.profiler or nsys and look for kernels with "h884" or "hmma" in their names (Volta Tensor Core HMMA instructions)</button>
+        <button onclick="checkAnswer(this, false)">Compare fp16 vs fp32 FLOPS — if fp16 is exactly 8× faster, Tensor Cores are engaged</button>
+        <button onclick="checkAnswer(this, false)">Set CUDA_FORCE_TENSOR_CORES=1 environment variable and check for any error messages</button>
+        <div class="explanation">
+            <strong>Correct.</strong> Use <code>torch.profiler</code> or NVIDIA Nsight Systems (nsys). In the trace, look for CUDA kernel names containing "h884" (Volta's Tensor Core instruction set) or "hmma" (half-precision matrix multiply-accumulate). If you see "sgemm" (single-precision GEMM), Tensor Cores aren't engaged — likely due to non-fp16 inputs or non-aligned dimensions. Example: <code>volta_h884gemm_256x128_ldg8_nn</code> = Tensor Core kernel.
+        </div>
+    </div>
+
+    <h2>Key Takeaways</h2>
+    <ol>
+        <li><strong>MixedPrecisionPolicy controls the full precision lifecycle:</strong> storage (fp32) → all-gather (fp32) → cast → compute (fp16) → grad (fp16) → cast → reduce-scatter (fp32) → optimizer (fp32).</li>
+        <li><strong>No GradScaler needed</strong> because <code>reduce_dtype=fp32</code> eliminates the gradient underflow/overflow that GradScaler exists to solve.</li>
+        <li><strong>V100's fp16 danger zone:</strong> max value 65504. Attention scores can overflow. Use <code>scaled_dot_product_attention</code> (default in timm ViT) as defense.</li>
+        <li><strong>Activation memory is halved</strong> by mp_policy (stored in param_dtype=fp16). Model-proportional memory is unchanged (always fp32).</li>
+        <li><strong>All-gather currently transmits fp32</strong> (cast happens after gather). This is a known inefficiency — "cast-before-gather" is planned.</li>
+        <li><strong>Gradient clipping works on sharded DTensor grads</strong> but adds one all-reduce for global norm computation.</li>
+        <li><strong>Tensor Core utilization:</strong> ensure matrix dims are multiples of 8. ViT-Huge's 1280 hidden dim is naturally aligned.</li>
+    </ol>
+
+    <h2>Primary Source</h2>
+    <p>Study the <a href="https://pytorch.org/docs/stable/notes/amp_examples.html">PyTorch AMP documentation</a> for background on why mixed precision works, then read the <code>MixedPrecisionPolicy</code> source in <a href="https://github.com/pytorch/pytorch/blob/main/torch/distributed/_composable/fsdp/_fsdp_param.py">torch/distributed/_composable/fsdp/_fsdp_param.py</a> to see exactly where casts are applied in the FSDP2 lifecycle. The functions <code>_to_sharded()</code> and <code>_to_unsharded()</code> show the precision transitions.</p>
+
+
+
+    <script>
+        function checkAnswer(btn, correct) {
+            const quiz = btn.closest('.quiz');
+            const buttons = quiz.querySelectorAll('button');
+            const explanation = quiz.querySelector('.explanation');
+            buttons.forEach(b => { b.disabled = true; b.classList.remove('correct', 'incorrect'); });
+            if (correct) {
+                btn.classList.add('correct');
+            } else {
+                btn.classList.add('incorrect');
+                buttons.forEach(b => { if (b.getAttribute('onclick').includes('true')) b.classList.add('correct'); });
+            }
+            explanation.style.display = 'block';
+        }
+    </script>
