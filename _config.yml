@@ -49,7 +49,7 @@ footer-links:
 
 
 scholar:
-  style: ieee-with-url
+  style: ieee
   locale: en
   sort_by: year
   order: ascending
