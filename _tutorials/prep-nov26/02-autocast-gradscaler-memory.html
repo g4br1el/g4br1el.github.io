@@ -1,0 +1,421 @@
+---
+layout: tutorial
+tutorial: prep-nov26
+type: lesson
+lesson: 2
+total: 18
+title: "Autocast Op Policy, GradScaler Internals and Memory Accounting"
+tags:
+permalink: /heap/nov26/002/
+---
+
+
+<h1>Lesson 2 · Autocast Op Policy, GradScaler Internals &amp; Memory Accounting</h1>
+<p>Week 1 · ~60 min reading + ~45 min lab + quiz · Builds directly on Lesson 1</p>
+
+
+
+<section id="goal">
+    <h2>0. Interview skills</h2>
+    <div class="box">
+        <ol>
+            <li>Predict the output dtype of any op under <code>autocast</code> and justify the policy using Lesson 1 numbers.</li>
+            <li>Walk through one <code>GradScaler</code> iteration at the kernel/state level, including where it syncs with the host.</li>
+            <li>Read a loss-scale trajectory and diagnose what is wrong.</li>
+            <li>Do memory accounting for model states out loud: bytes per parameter, ZeRO stages, and when AMP does <i>not</i> help.</li>
+        </ol>
+    </div>
+</section>
+
+<section id="warmup">
+    <h2>1. Warm-up (recall from Lesson 1, no notes)</h2>
+    <details><summary>FP16 smallest subnormal = 2<sup>k</sup>. What is k?</summary><p>k = 1 − 15 − 10 = <b>−24</b> (≈ 5.96e−8).</p></details>
+    <details><summary>Why is FP8 E4M3 max 448 and not 240?</summary><p>It has no Inf and only <code>S.1111.111</code> is NaN, so the top exponent field is usable: 2<sup>8</sup> · 1.75 = 448.</p></details>
+    <details><summary>Does TF32 halve tensor memory?</summary><p>No. It is a Tensor Core math mode. Storage stays FP32.</p></details>
+</section>
+
+<section id="autocast">
+    <h2>2. Autocast: a per-op cast policy, not a model conversion</h2>
+    <p><code>torch.autocast</code> intercepts ops at the dispatcher level. For each op it checks a policy list and casts that op's inputs. The model's parameters are never modified. That is why native AMP keeps FP32 parameters, as covered in Lesson 1.</p>
+
+    <h3>2.1 The four categories (CUDA)</h3>
+    <table>
+        <tr><th>Category</th><th>Examples</th><th>Why (Lesson 1 link)</th></tr>
+        <tr><td><b>Cast to FP16/BF16</b></td><td><code>mm, matmul, bmm, addmm, baddbmm, linear, conv1d/2d/3d, conv_transpose*, prelu</code>, RNN cells</td><td>These are Tensor Core GEMMs. The kernel already accumulates in FP32 internally, so low-precision inputs are safe.</td></tr>
+        <tr><td><b>Cast to FP32</b></td><td><code>exp, log, pow, rsqrt, reciprocal, softmax, log_softmax, logsumexp, cumsum, layer_norm, group_norm, norm</code>, most losses (<code>mse_loss, nll_loss, l1_loss, kl_div, binary_cross_entropy_with_logits</code>, …)</td><td>Range: exp(x) overflows FP16 for x &gt; ≈11.09 (ln 65504), and x² overflows for |x| ≥ 256. Precision: long reductions get swamped.</td></tr>
+        <tr><td><b>Promote to widest input</b></td><td><code>cat, stack, addcmul, addcdiv, atan2, bilinear, cross, index_put, scatter_add, tensordot</code></td><td>Mixed-dtype inputs would otherwise error or silently lose precision.</td></tr>
+        <tr><td><b>Unlisted</b></td><td><code>relu, add, mul, dropout</code>, view ops, <code>batch_norm</code></td><td>These run in the dtype their inputs already have, using standard type promotion. FP16 + FP32 → FP32.</td></tr>
+    </table>
+    <p>Special case: <code>F.binary_cross_entropy</code> / <code>nn.BCELoss</code> <b>raise an error</b> under autocast. Use <code>BCEWithLogitsLoss</code>, which fuses sigmoid and log stably.</p>
+    <div class="box warn">These lists are version-dependent. The authoritative source is the "Autocast Op Reference" in the <code>torch.amp</code> docs for your installed version. Lab part 1 checks them empirically.</div>
+
+    <h3>2.2 Rules interviewers probe</h3>
+    <ul>
+        <li><b>Wrap only the forward pass and the loss.</b> Backward ops automatically run in the dtype of their forward op. Wrapping <code>backward()</code> is unnecessary and not recommended.</li>
+        <li><b>Cast cache:</b> inside one autocast region, each FP32 leaf tensor that requires grad (i.e. each parameter) is cast once and cached. The FP16 copy can stay alive until backward, because GEMMs save it for the weight-gradient computation.</li>
+        <li><b>In-place ops and ops with explicit <code>out=</code></b> are not autocast.</li>
+        <li><b>Gradients come back in FP32.</b> The backward of the FP32→FP16 cast produces an FP32 <code>.grad</code> on the parameter. This is what <code>GradScaler</code> relies on.</li>
+        <li><b>BF16 autocast on CUDA uses the same lists</b>, with BF16 as the low-precision type. CPU autocast has its own lists and defaults to BF16.</li>
+    </ul>
+
+    <h3>2.3 FP32 islands: manual overrides</h3>
+    <pre>with torch.autocast("cuda", dtype=torch.float16):
+    h = backbone(x)                          # FP16 GEMMs
+    with torch.autocast("cuda", enabled=False):
+        logits = head(h.float())             # explicit cast is REQUIRED:
+                                             # disabling autocast does not upcast h
+loss = criterion(logits, y)
+
+# For custom autograd Functions:
+#   @torch.amp.custom_fwd(device_type="cuda", cast_inputs=torch.float32)
+#   @torch.amp.custom_bwd(device_type="cuda")
+</pre>
+    <p>A common bug: the nested <code>enabled=False</code> region receives FP16 tensors and keeps them in FP16, so the "island" silently runs in FP16. Lesson 3 covers how to choose which ops need an island.</p>
+</section>
+
+<section id="scaler">
+    <h2>3. GradScaler internals</h2>
+
+    <h3>3.1 State</h3>
+    <ul>
+        <li><code>_scale</code>: a 1-element FP32 <b>device</b> tensor. It is kept on the device so that scaling never forces a host sync. <code>get_scale()</code> <i>does</i> sync.</li>
+        <li><code>_growth_tracker</code>: a device int tensor that counts consecutive clean steps.</li>
+        <li>Per-optimizer state: stage (READY → UNSCALED → STEPPED) and a <code>found_inf</code> flag per device.</li>
+    </ul>
+    <p>Defaults (verified, PyTorch AMP docs): <code>init_scale=2**16, growth_factor=2.0, backoff_factor=0.5, growth_interval=2000</code>.</p>
+
+    <h3>3.2 One iteration</h3>
+    <table>
+        <tr><th>Call</th><th>What happens</th><th>Interview detail</th></tr>
+        <tr><td><code>scale(loss)</code></td><td>Returns <code>loss * S</code>. The scale tensor is created lazily on first use.</td><td>Backward intermediates in FP16 are lifted away from the 2<sup>−24</sup> underflow floor.</td></tr>
+        <tr><td><code>unscale_(opt)</code></td><td>One fused foreach kernel per device/dtype multiplies every <code>.grad</code> by 1/S <i>and</i> sets <code>found_inf</code> if any value is Inf or NaN.</td><td>Must run before clipping or any norm logging. Calling it twice before <code>update()</code> raises an error. FP16 grads raise <code>ValueError</code>.</td></tr>
+        <tr><td><code>step(opt)</code></td><td>Unscales if not done already. Then calls <code>opt.step()</code> only if no <code>found_inf</code> is set; otherwise the step is <b>skipped</b>.</td><td>The default path reads <code>found_inf</code> with <code>.item()</code>, which is a <b>device→host sync</b> every step. Fused optimizers that support AMP scaling (e.g. <code>AdamW(fused=True)</code>) receive the scale and flag directly and avoid the sync (verify for your version).</td></tr>
+        <tr><td><code>update()</code></td><td>Combines the flags from all optimizers and devices, then adjusts S (see 3.3).</td><td>Call it once per iteration, after all <code>step()</code> calls.</td></tr>
+    </table>
+
+    <h3>3.3 The update rule</h3>
+    <pre># semantics of torch._amp_update_scale_
+if found_inf:
+    scale *= backoff_factor          # 0.5
+    growth_tracker = 0
+else:
+    growth_tracker += 1
+    if growth_tracker == growth_interval:   # 2000
+        scale *= growth_factor       # 2.0
+        growth_tracker = 0
+</pre>
+    <p>The result is a <b>sawtooth</b>: S rises until it hits the overflow boundary, halves, and rises again. S tracks the largest safe power of two, within about 2×. With default settings, S often starts too high, so the first few steps are skipped. This is also why you see the warning "<code>lr_scheduler.step()</code> called before <code>optimizer.step()</code>".</p>
+
+    <h3>3.4 Diagnosing from the scale trajectory</h3>
+    <table>
+        <tr><th>Pattern</th><th>Likely meaning</th><th>Action</th></tr>
+        <tr><td>Sawtooth around a stable level, rare skips</td><td>Healthy</td><td>None</td></tr>
+        <tr><td>A few skips at the start, then stable</td><td><code>init_scale</code> too high (normal)</td><td>Ignore, or lower <code>init_scale</code></td></tr>
+        <tr><td>Skips <b>every</b> step, S falls toward 0</td><td>The non-finite value does <b>not depend on S</b>: forward activation &gt; 65504, log(0), division by zero, bad data, or diverged weights</td><td>Loss scaling cannot fix this. Do NaN forensics (Lesson 3): hooks, <code>detect_anomaly</code>, data checks</td></tr>
+        <tr><td>Frequent skips mid-training</td><td>Gradient spikes or instability</td><td>Check LR/warmup and clipping; consider BF16</td></tr>
+    </table>
+    <div class="box">Key insight: loss scaling only solves the <b>gradient range</b> problem in backward. It cannot fix forward overflow, because the forward pass runs before any scaling is applied.</div>
+
+    <h3>3.5 Production recipes</h3>
+    <pre># Gradient accumulation: S must stay constant within one effective batch
+for i, (x, y) in enumerate(loader):
+    with torch.autocast("cuda", dtype=torch.float16):
+        loss = loss_fn(model(x), y) / accum
+    scaler.scale(loss).backward()          # with DDP: wrap non-boundary steps in model.no_sync()
+    if (i + 1) % accum == 0:
+        scaler.unscale_(opt)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(opt)
+        scaler.update()                    # exactly once per effective batch
+        opt.zero_grad(set_to_none=True)
+
+# Checkpointing: the scale is part of training state
+ckpt = {"model": model.state_dict(), "opt": opt.state_dict(), "scaler": scaler.state_dict()}
+</pre>
+    <ul>
+        <li><b>Multiple optimizers or losses:</b> use one scaler. Call <code>step()</code> for each optimizer, then <code>update()</code> once.</li>
+        <li><b>DDP:</b> the all-reduce spreads Inf/NaN to every rank, so all ranks skip the same steps.</li>
+        <li><b>FSDP:</b> each rank sees only its own gradient shard. Use <code>ShardedGradScaler</code>, which all-reduces <code>found_inf</code> across ranks (verify).</li>
+        <li><b>BF16:</b> no scaler needed, because BF16 has FP32's exponent range (Lesson 1).</li>
+    </ul>
+</section>
+
+<section id="memory">
+    <h2>4. Memory accounting</h2>
+    <h3>4.1 Model states (persistent, bytes per parameter)</h3>
+    <table>
+        <tr><th>Setup</th><th>Breakdown</th><th class="n">B/param</th></tr>
+        <tr><td>FP32 + Adam</td><td>w 4 + g 4 + m 4 + v 4</td><td class="n">16</td></tr>
+        <tr><td>Native AMP + Adam</td><td>w 4 (FP32) + g 4 (FP32) + m 4 + v 4</td><td class="n">16</td></tr>
+        <tr><td>Classic MP / ZeRO accounting</td><td>w 2 + g 2 + master 4 + m 4 + v 4</td><td class="n">16</td></tr>
+    </table>
+    <p>On top of this, native AMP adds <b>up to about 2 B/param transiently</b> for cached FP16 weight casts. These partly overlap with gradient allocation, because backward frees casts while it creates grads. Optimizer kernels also allocate temporary buffers. Measure them in Lab part 4.</p>
+
+    <h3>4.2 Activations: where AMP actually saves memory</h3>
+    <ul>
+        <li>Tensors saved by FP16 ops (GEMM inputs) take half the memory.</li>
+        <li>Tensors saved by FP32-list ops (softmax output, layer_norm, losses) stay FP32. So "AMP halves activations" is an approximation.</li>
+        <li>If the model is parameter-dominated (small batch), AMP barely reduces peak memory. If it is activation-dominated (large batch or long sequences), AMP helps a lot.</li>
+    </ul>
+    <details><summary>Stretch: transformer activation formula (verify)</summary>
+        <p>Korthikanti et al. (2022) estimate activation memory per layer, without recomputation and with 16-bit activations, as <code>s·b·h·(34 + 5·a·s/h)</code> bytes (s = sequence length, b = batch, h = hidden size, a = heads). The <code>a·s²</code> term comes from attention scores and is what fused attention removes.</p></details>
+
+    <h3>4.3 ZeRO: sharding the 16 bytes (Ψ = params, N<sub>d</sub> = data-parallel GPUs)</h3>
+    <table>
+        <tr><th>Stage</th><th>Shards</th><th>Per-GPU model states</th></tr>
+        <tr><td>Baseline DP</td><td>none</td><td>16Ψ</td></tr>
+        <tr><td>ZeRO-1</td><td>optimizer states (12 B)</td><td>4Ψ + 12Ψ/N<sub>d</sub></td></tr>
+        <tr><td>ZeRO-2</td><td>+ gradients</td><td>2Ψ + 14Ψ/N<sub>d</sub></td></tr>
+        <tr><td>ZeRO-3 / FSDP full shard</td><td>+ parameters</td><td>16Ψ/N<sub>d</sub></td></tr>
+    </table>
+    <p>Paper sanity check (verify): Ψ = 7.5B, N<sub>d</sub> = 64 gives 120 → 31.4 → 16.6 → 1.9 GB. PyTorch FSDP's mixed-precision accounting differs in detail; that comes in a later lesson.</p>
+
+    <div class="calc">
+        <b>Calculator</b> (model states only, GB = 10<sup>9</sup> bytes; excludes activations, workspaces, communication buffers and fragmentation)<br>
+        <label>Params (billions) <input id="cp" type="text" value="7"></label>
+        <label>N<sub>d</sub> <input id="cn" type="text" value="8"></label>
+        <button id="cbtn">Compute</button>
+        <div id="cout"></div>
+    </div>
+</section>
+
+<section id="answer">
+    <h2>5. Interview answers (30 s each, say them out loud)</h2>
+    <div class="box"><b>"Walk me through GradScaler."</b><br>"scale() multiplies the loss by S, 2<sup>16</sup> by default, so FP16 backward intermediates don't underflow. unscale_ runs one fused kernel that multiplies the FP32 grads by 1/S and sets a found-inf flag. It must happen before clipping. step() reads that flag, which is a host sync unless the optimizer is fused and AMP-aware, and skips the update on Inf/NaN. update() halves S on overflow, or doubles it after 2000 clean steps. So S follows a sawtooth just below the overflow boundary. If it decays every step, the problem is a non-finite value in the forward pass, which scaling can't fix."</div>
+    <div class="box"><b>"Where does memory go for a 7B model with AdamW?"</b><br>"Model states are 16 bytes per parameter whether or not you use AMP: FP32 weights, FP32 grads, two FP32 Adam moments. That's 112 GB, more than one 80 GB GPU even before activations. AMP saves activations and bandwidth, not optimizer state. So you shard: on 8 GPUs, ZeRO-1, 2 and 3 need 38.5, 26.25 and 14 GB per GPU. Activations then decide batch size, recomputation and sequence length."</div>
+</section>
+
+<section id="lab">
+    <h2>6. Lab (~45 min, CUDA required)</h2>
+    <p>Write down your prediction for every printed line <i>before</i> running it, then compare it with the hidden answers.</p>
+
+    <h3>Part 1: Autocast dtype map</h3>
+    <pre>import torch, torch.nn.functional as F
+assert torch.cuda.is_available()
+a = torch.randn(64, 64, device="cuda")
+with torch.autocast("cuda", dtype=torch.float16):
+    h = a @ a
+    print("mm            ", h.dtype)
+    print("softmax(fp32) ", torch.softmax(a, -1).dtype)
+    print("softmax(fp16) ", torch.softmax(h, -1).dtype)
+    print("a + a         ", (a + a).dtype)
+    print("h + a         ", (h + a).dtype)
+    print("relu(h)       ", torch.relu(h).dtype)
+    print("layer_norm(h) ", F.layer_norm(h, (64,)).dtype)
+    print("cat([h, a])   ", torch.cat([h, a]).dtype)
+    with torch.autocast("cuda", enabled=False):
+        print("island mm     ", (h.float() @ a).dtype)
+    try:
+        F.binary_cross_entropy(torch.sigmoid(h), torch.rand_like(a))
+    except RuntimeError as e:
+        print("BCE error:", str(e)[:70])
+</pre>
+    <details><summary>Expected</summary>
+        <p>mm → float16 · softmax (both) → float32 · a + a → float32 (unlisted op, inputs are FP32) · h + a → float32 (type promotion) · relu(h) → float16 · layer_norm → float32 · cat → float32 (widest input) · island → float32 · BCE → RuntimeError (unsafe to autocast).</p></details>
+
+    <h3>Part 2: Scale trajectory and skipped steps</h3>
+    <pre>import torch
+torch.manual_seed(0)
+model = torch.nn.Linear(16, 1).cuda()
+opt = torch.optim.SGD(model.parameters(), lr=1e-3)
+scaler = torch.amp.GradScaler("cuda", init_scale=1024.0, growth_interval=3)
+
+for step in range(10):
+    x = torch.randn(8, 16, device="cuda")
+    if step == 5:
+        x[0, 0] = float("inf")                       # inject an overflow
+    w_before = model.weight.detach().clone()
+    s_before = scaler.get_scale()
+    with torch.autocast("cuda", dtype=torch.float16):
+        loss = model(x).float().pow(2).mean()
+    opt.zero_grad(set_to_none=True)
+    scaler.scale(loss).backward()
+    scaler.step(opt)
+    scaler.update()
+    s_after = scaler.get_scale()
+    unchanged = torch.equal(w_before, model.weight)
+    print(step, s_before, s_after, "SKIPPED" if s_after &lt; s_before else "", "w unchanged" if unchanged else "")
+</pre>
+    <details><summary>Expected</summary>
+        <table>
+            <tr><th>Step</th><th class="n">S before</th><th class="n">S after</th><th>Note</th></tr>
+            <tr><td>0, 1</td><td class="n">1024</td><td class="n">1024</td><td>tracker 1, 2</td></tr>
+            <tr><td>2</td><td class="n">1024</td><td class="n">2048</td><td>3 clean steps → grow</td></tr>
+            <tr><td>3, 4</td><td class="n">2048</td><td class="n">2048</td><td>tracker 1, 2</td></tr>
+            <tr><td>5</td><td class="n">2048</td><td class="n">1024</td><td>SKIPPED, weights unchanged, tracker reset</td></tr>
+            <tr><td>6, 7</td><td class="n">1024</td><td class="n">1024</td><td>tracker 1, 2</td></tr>
+            <tr><td>8</td><td class="n">1024</td><td class="n">2048</td><td>grow</td></tr>
+            <tr><td>9</td><td class="n">2048</td><td class="n">2048</td><td></td></tr>
+        </table>
+        <p>Note: each <code>get_scale()</code> call is a host sync. Don't log it every step in production.</p></details>
+
+    <h3>Part 3: The <code>model.half()</code> trap</h3>
+    <pre>m = torch.nn.Linear(16, 1).cuda().half()
+opt = torch.optim.SGD(m.parameters(), lr=1e-3)
+sc = torch.amp.GradScaler("cuda")
+loss = m(torch.randn(8, 16, device="cuda", dtype=torch.float16)).float().mean()
+sc.scale(loss).backward()
+try:
+    sc.step(opt)
+except ValueError as e:
+    print("ValueError:", e)
+</pre>
+    <details><summary>Expected and why</summary>
+        <p><code>ValueError: Attempting to unscale FP16 gradients.</code> GradScaler assumes FP32 parameters (native AMP). Unscaling FP16 grads in place would bring back exactly the underflow that scaling was meant to prevent.</p></details>
+
+    <h3>Part 4: Measure bytes per parameter</h3>
+    <pre>import torch, torch.nn as nn
+
+def run(amp, batch=256, layers=8, d=4096):
+    torch.cuda.empty_cache()
+    model = nn.Sequential(*[nn.Linear(d, d) for _ in range(layers)]).cuda()
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    x = torch.randn(batch, d, device="cuda")
+    def step():   # no scaler: we only measure memory here
+        with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
+            loss = model(x).float().pow(2).mean()
+        loss.backward()
+        opt.step()
+        opt.zero_grad(set_to_none=True)
+    step()                                   # creates Adam state lazily
+    torch.cuda.reset_peak_memory_stats()
+    steady = torch.cuda.memory_allocated()
+    step()
+    peak = torch.cuda.max_memory_allocated()
+    n = sum(p.numel() for p in model.parameters())
+    print(f"amp={amp!s:5} batch={batch:5}: steady={steady/n:5.2f} B/param  peak={peak/n:5.2f} B/param")
+    del model, opt, x
+
+for b in (256, 16384):          # 4b (16384) needs ~8 GB
+    for amp in (False, True):
+        run(amp, batch=b)
+</pre>
+    <details><summary>What to expect (then explain your actual numbers)</summary>
+        <ul>
+            <li><b>Steady state ≈ 12 B/param in both modes</b>: FP32 w + m + v. The grads were freed by <code>set_to_none=True</code>.</li>
+            <li><b>Batch 256:</b> the peak is dominated by model states and optimizer temporaries, so AMP and FP32 peaks are similar. AMP does not help here.</li>
+            <li><b>Batch 16384:</b> saved activations are about 2.1 GB in FP32 (≈16 B/param) and about half that in FP16, so the AMP peak is clearly lower.</li>
+            <li>Exact numbers depend on the foreach vs. fused Adam implementation and the caching allocator. Explain every difference greater than 1 B/param.</li>
+        </ul></details>
+</section>
+
+<section id="quiz">
+    <h2>7. Quiz</h2>
+    <p>For numeric questions, enter digits only (decimals allowed).</p>
+    <div id="quizRoot"></div>
+    <p id="score"></p>
+    <button id="reset">Reset quiz</button>
+</section>
+
+<section id="sources">
+    <h2>8. Sources</h2>
+    <h3>Verified this session</h3>
+    <ul>
+        <li>PyTorch, <a href="https://docs.pytorch.org/docs/stable/notes/amp_examples.html">Automatic Mixed Precision examples</a>: GradScaler defaults, the standard loop, <code>unscale_</code> before clipping, skipped steps on Inf/NaN.</li>
+    </ul>
+    <h3>Verified in a previous session</h3>
+    <ul>
+        <li>PyTorch, <a href="https://docs.pytorch.org/docs/stable/amp.html">torch.amp</a> (contains the Autocast Op Reference; the op lists were <i>not</i> re-checked this session).</li>
+        <li>Micikevicius et al., <a href="https://arxiv.org/abs/1710.03740">Mixed Precision Training</a>; NVIDIA Mixed Precision User Guide.</li>
+    </ul>
+    <h3>From memory, verify before relying on them</h3>
+    <ul>
+        <li>GradScaler source (<code>torch/amp/grad_scaler.py</code>): <code>.item()</code> sync in <code>step()</code>, FP16-grad <code>ValueError</code>, fused-optimizer path.</li>
+        <li><code>torch.distributed.fsdp.sharded_grad_scaler.ShardedGradScaler</code>.</li>
+        <li>Rajbhandari et al., <a href="https://arxiv.org/abs/1910.02054">ZeRO</a>: stage formulas and the 7.5B example.</li>
+        <li>Korthikanti et al., <a href="https://arxiv.org/abs/2205.05198">Reducing Activation Recomputation in Large Transformer Models</a>: activation formula.</li>
+    </ul>
+</section>
+
+<footer>Next (planned): Lesson 3 covers TF32, choosing FP32 islands and NaN forensics. Send your L1 and L2 quiz scores, your Lab part 4 numbers, and any predictions you got wrong.</footer>
+
+<script>
+    // Calculator
+    function gb(x) { return (x / 1e9).toFixed(2) + " GB"; }
+    document.getElementById("cbtn").addEventListener("click", () => {
+        const P = parseFloat(document.getElementById("cp").value) * 1e9;
+        const N = parseInt(document.getElementById("cn").value, 10);
+        const out = document.getElementById("cout");
+        if (!(P > 0) || !(N >= 1)) { out.textContent = "Enter positive numbers."; return; }
+        const rows = [["Baseline DP (FP32 / native AMP / classic MP)", 16*P],
+            ["ZeRO-1", 4*P + 12*P/N], ["ZeRO-2", 2*P + 14*P/N], ["ZeRO-3", 16*P/N]];
+        out.innerHTML = "<table><tr><th>Setup</th><th>Per-GPU model states</th></tr>" +
+            rows.map(r => `<tr><td>${r[0]}</td><td class="n">${gb(r[1])}</td></tr>`).join("") + "</table>";
+    });
+    document.getElementById("cbtn").click();
+
+    // Quiz
+    const Q = [
+        {q:"a, b are FP32 CUDA tensors. Inside autocast(dtype=float16), what is the dtype of torch.mm(a, b)?", type:"mc",
+            opts:["float32","float16","bfloat16","Depends on the shapes"], a:1,
+            why:"mm is on the lower-precision list: inputs are cast to FP16 and the Tensor Core kernel accumulates in FP32 internally."},
+        {q:"Inside FP16 autocast: h is FP16, a is FP32 (same shape). Dtype of h + a?", type:"mc",
+            opts:["float16","float32","Error","bfloat16"], a:1,
+            why:"add is unlisted, so standard type promotion applies: FP16 + FP32 gives FP32."},
+        {q:"Inside FP16 autocast, F.layer_norm is applied to an FP16 tensor. Output dtype?", type:"mc",
+            opts:["float16","float32"], a:1,
+            why:"layer_norm is on the FP32 list (mean/variance reduction, rsqrt). The output is FP32, which is why the next GEMM casts back to FP16."},
+        {q:"Largest integer x such that x*x is finite in FP16?", type:"num", a:255,
+            why:"255^2 = 65025 rounds to 65024, which is finite. 256^2 = 65536 is above the overflow threshold (65520), so it becomes Inf. This is why pow and norms run in FP32."},
+        {q:"Under autocast, what does nn.BCELoss do?", type:"mc",
+            opts:["Runs in FP16","Runs in FP32","Raises an error; use BCEWithLogitsLoss","Promotes to the widest input"], a:2,
+            why:"BCE after a separate sigmoid is numerically unsafe, so autocast refuses it. BCEWithLogitsLoss fuses log-sigmoid and is on the FP32 list."},
+        {q:"Default GradScaler growth_interval?", type:"num", a:2000,
+            why:"S doubles after 2000 consecutive steps without Inf/NaN (verified in the docs)."},
+        {q:"S = 65536 with default settings. Three consecutive overflow steps. New S?", type:"num", a:8192,
+            why:"65536 * 0.5^3 = 8192. All three optimizer steps are skipped."},
+        {q:"S = 65536 with default settings, then 6000 clean steps in a row. New S?", type:"num", a:524288,
+            why:"6000 / 2000 = 3 growths: 65536 * 2^3 = 524288."},
+        {q:"Every step is skipped and S keeps halving toward ~1e-30. Most likely cause?", type:"mc",
+            opts:["init_scale is too high","growth_interval is too small",
+                "A non-finite value is produced regardless of S (e.g. forward activation overflow, log(0), bad data)",
+                "Gradients are underflowing"], a:2,
+            why:"If smaller S never helps, the Inf/NaN does not come from scaled gradients. Loss scaling cannot fix forward-pass problems."},
+        {q:"Gradient accumulation over 4 micro-batches: how many scaler.update() calls per optimizer step?", type:"num", a:1,
+            why:"S must stay constant across the accumulated grads, so call update() once per effective batch, after step()."},
+        {q:"model.half() plus GradScaler: what happens at scaler.step(opt)?", type:"mc",
+            opts:["Works, just slower","ValueError: Attempting to unscale FP16 gradients","Silently skips every step","Grads are upcast automatically"], a:1,
+            why:"GradScaler expects FP32 params and grads (native AMP). Unscaling FP16 grads would underflow again."},
+        {q:"Why does the default scaler.step(optimizer) path cause a device-to-host sync?", type:"mc",
+            opts:["It copies the gradients to the CPU","It reads found_inf with .item() to decide whether to call optimizer.step()",
+                "It recomputes the loss on the CPU","update() allocates a new scale tensor"], a:1,
+            why:"A Python-side branch needs the flag value on the host. Fused AMP-aware optimizers take grad_scale/found_inf on the device and avoid this sync."},
+        {q:"ZeRO-2, 7B params, 8 GPUs: per-GPU model-state memory in GB (1 GB = 1e9 B)?", type:"num", a:26.25, tol:0.01,
+            why:"2 * 7 + 14 * 7 / 8 = 14 + 12.25 = 26.25 GB. FP16 params are replicated; grads and optimizer states are sharded."}
+    ];
+
+    const root = document.getElementById("quizRoot"), scoreEl = document.getElementById("score");
+    let done = {};
+    function render() {
+        root.innerHTML = ""; done = {}; scoreEl.textContent = "";
+        Q.forEach((it, i) => {
+            const s = document.createElement("div"); s.className = "q";
+            let h = `<p><b>Q${i+1}.</b> ${it.q}</p>`;
+            h += it.type === "num"
+                ? `<input id="in${i}" type="text" inputmode="decimal">`
+                : it.opts.map((o, j) => `<label><input type="radio" name="q${i}" value="${j}"> ${o}</label>`).join("");
+            h += `<br><button data-i="${i}">Check</button><p class="fb" id="fb${i}"></p>`;
+            s.innerHTML = h; root.appendChild(s);
+        });
+    }
+    root.addEventListener("click", e => {
+        if (e.target.tagName !== "BUTTON") return;
+        const i = +e.target.dataset.i, it = Q[i];
+        let ok;
+        if (it.type === "num") {
+            const v = parseFloat(document.getElementById("in" + i).value.replace(/[\s,]/g, ""));
+            ok = !isNaN(v) && Math.abs(v - it.a) <= (it.tol || 1e-9);
+        } else {
+            const c = document.querySelector(`input[name=q${i}]:checked`);
+            ok = !!c && +c.value === it.a;
+        }
+        const fb = document.getElementById("fb" + i);
+        fb.className = "fb " + (ok ? "ok" : "bad");
+        fb.textContent = (ok ? "Correct. " : "Not quite. ") + it.why;
+        done[i] = ok;
+        const n = Object.keys(done).length, c = Object.values(done).filter(Boolean).length;
+        scoreEl.textContent = `Score: ${c}/${Q.length} (answered ${n}/${Q.length})`;
+    });
+    document.getElementById("reset").addEventListener("click", render);
+    render();
+</script>

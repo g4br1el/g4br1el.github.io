@@ -1,0 +1,518 @@
+---
+layout: tutorial
+tutorial: prep-nov26
+type: lesson
+lesson: 4
+total: 18
+title: "Stable Reductions: Kahan, Log-Sum-Exp, Online Softmax and FlashAttention"
+tags:
+permalink: /heap/nov26/004/
+---
+
+<h1>Lesson 4 · Stable Reductions: Kahan, Log-Sum-Exp, Online Softmax and FlashAttention</h1>
+<p>Week 2 · ~70 min reading + ~55 min lab + quiz · Builds on Lessons 1–3</p>
+
+
+
+<section id="goal">
+    <h2>0. Interview skills</h2>
+    <div class="box">
+        <ol>
+            <li>State the error growth of naive, pairwise and Kahan summation, and explain stagnation using ulp arithmetic.</li>
+            <li>Derive stable log-sum-exp, log_softmax, cross-entropy and BCE-with-logits from first principles.</li>
+            <li>Write the online-softmax merge rule and the FlashAttention inner loop. Explain why it is <b>exact</b>, what it stores for backward, and where precision is lost.</li>
+            <li>Compute variance stably (Welford/Chan) and explain why results change with GPU count, batch size or kernel choice.</li>
+            <li>Connect these to systems choices: FP32 accumulators, FP32 gradient-accumulation buffers, Kahan buffers for pure-BF16 weights, and deterministic modes.</li>
+        </ol>
+    </div>
+</section>
+
+<section id="warmup">
+    <h2>1. Warm-up (recall from Lesson 3, no notes)</h2>
+    <details><summary>By what factor is TF32's unit roundoff larger than FP32's?</summary><p>2<sup>−11</sup>/2<sup>−24</sup> = 2<sup>13</sup> = 8192.</p></details>
+    <details><summary>What is the gradient of <code>torch.where(x &gt; 0, torch.log(x), 0)</code> at x = 0, and how do you fix it?</summary><p>NaN, because 0 · (1/0). Fix it with a double <code>where</code> that sanitizes x before <code>log</code>.</p></details>
+    <details><summary>Your FP32 island disables autocast on an Ampere GPU with TF32 enabled. What do its matmuls use?</summary><p>TF32. Set <code>fp32_precision = "ieee"</code> if you need IEEE GEMMs.</p></details>
+</section>
+
+<section id="sum">
+    <h2>2. Summation error</h2>
+    <h3>2.1 Bounds (first order, u = unit roundoff)</h3>
+    <table>
+        <tr><th>Method</th><th>Worst-case |error|</th><th>Typical (random rounding)</th><th>Cost</th></tr>
+        <tr><td>Recursive (naive loop, <code>cumsum</code>)</td><td>≈ (n−1)·u·Σ|x<sub>i</sub>|</td><td>~ √n·u·Σ|x<sub>i</sub>|</td><td>n adds, sequential</td></tr>
+        <tr><td>Pairwise / tree (GPU reductions, NumPy <code>sum</code>)</td><td>≈ ⌈log<sub>2</sub>n⌉·u·Σ|x<sub>i</sub>|</td><td>~ √(log n)·u·Σ|x<sub>i</sub>|</td><td>n adds, parallel</td></tr>
+        <tr><td>Kahan (compensated)</td><td>≈ 2u·Σ|x<sub>i</sub>| + O(n·u²)</td><td>~ independent of n</td><td>4 flops per element, plus a compensation variable</td></tr>
+        <tr><td>Wider accumulator (FP32 for BF16 inputs)</td><td>Bound uses u of the <i>accumulator</i></td><td></td><td>Free in registers; costs memory if stored</td></tr>
+    </table>
+    <p>The relative error is the bound divided by |Σx<sub>i</sub>|, so it scales with the <b>condition number</b> κ = Σ|x<sub>i</sub>| / |Σx<sub>i</sub>|. Kahan fixes accumulated rounding error, but not cancellation in ill-conditioned sums.</p>
+
+    <h3>2.2 Stagnation</h3>
+    <p>Adding a to a running sum S does nothing once a &lt; ulp(S)/2. At exactly half an ulp, the tie rounds to even. Summing 1.0 repeatedly therefore stops at 2<sup>p</sup>, where p is the number of significand bits:</p>
+    <table>
+        <tr><th>Format</th><th>p</th><th>Σ 1.0 stops at</th></tr>
+        <tr><td>BF16</td><td class="n">8</td><td class="n">256</td></tr>
+        <tr><td>FP16</td><td class="n">11</td><td class="n">2048</td></tr>
+        <tr><td>FP32</td><td class="n">24</td><td class="n">16,777,216</td></tr>
+    </table>
+    <p>Before it stops completely, the error is often <b>biased</b>, not random. Inside one binade, every addition of 0.1 rounds in the same direction. Lab part 1 shows a 1% systematic drift.</p>
+
+    <h3>2.3 Kahan summation</h3>
+    <pre>s = 0; c = 0              # c holds the low-order bits lost so far
+for x in xs:
+    y = x - c             # corrected addend
+    t = s + y             # big + small: low bits of y are lost
+    c = (t - s) - y       # (what was actually added) - (what we wanted) = -lost bits
+    s = t
+</pre>
+    <div class="box warn">Compilers with fast-math, or <code>torch.compile</code> algebraic rewrites, can simplify <code>(t − s) − y</code> to 0. Check the generated code if you rely on it.</div>
+
+    <h3>2.4 Where reductions hide in a training step</h3>
+    <table>
+        <tr><th>Reduction</th><th>Risk</th><th>Standard practice</th></tr>
+        <tr><td>GEMM K-dimension</td><td>Long dot products</td><td>FP32 accumulators in Tensor Cores for FP16/BF16. For FP8 on Hopper, DeepSeek-V3 reports limited accumulation precision and promotes partial sums to FP32 on CUDA cores every 128 elements (verify). cuBLAS split-K may reduce in lower precision (see <code>allow_fp16_reduced_precision_reduction</code> / <code>allow_bf16_reduced_precision_reduction</code>, verify the defaults).</td></tr>
+        <tr><td>Softmax / LSE</td><td>Overflow, masked rows</td><td>Max-subtraction; fused online softmax</td></tr>
+        <tr><td>Norm statistics</td><td>Cancellation</td><td>FP32 Welford or two-pass (§5)</td></tr>
+        <tr><td>Loss mean over tokens/ranks</td><td>Swamping; unequal token counts</td><td>FP32. Divide by the <i>global</i> token count, not the per-rank mean of means.</td></tr>
+        <tr><td>Gradient accumulation over micro-batches</td><td>Swamping when BF16 <code>.grad</code> is added k times</td><td>FP32 accumulation buffers (e.g. Megatron "accumulate grads in FP32", verify the flag name)</td></tr>
+        <tr><td>Grad norm (Σg²)</td><td>FP16 overflow; swamping</td><td>FP32, e.g. <code>torch.nn.utils.clip_grad_norm_</code> / foreach norms</td></tr>
+        <tr><td>Weight update w + Δ</td><td>Swamping (Lesson 3: BF16 1 + 1e−3 = 1)</td><td>FP32 master weights, <b>or</b> BF16 + Kahan buffer, <b>or</b> stochastic rounding</td></tr>
+        <tr><td>All-reduce</td><td>Comm dtype; order depends on topology</td><td>Lesson 10</td></tr>
+    </table>
+    <div class="box"><b>Memory trade-off for pure-BF16 weights:</b> a BF16 weight plus an FP32 master copy costs 2 + 4 = <b>6 B/param</b>. A BF16 weight plus a BF16 Kahan compensation buffer costs 2 + 2 = <b>4 B/param</b>. Stochastic rounding costs 2 B/param but needs random bits and adds noise. Some optimizer libraries offer Kahan-compensated BF16 updates (Zamirai et al., "Revisiting BFloat16 Training", verify).</div>
+</section>
+
+<section id="lse">
+    <h2>3. Log-sum-exp and stable losses</h2>
+    <div class="formula">LSE(x) = m + log Σ exp(x_i − m),   m = max_i x_i
+        log_softmax(x)_i = x_i − LSE(x)
+        CE(x, y) = LSE(x) − x_y           ∂CE/∂x = softmax(x) − onehot(y)</div>
+    <ul>
+        <li>With m subtracted, every exponent is ≤ 0, so nothing overflows. The largest term is exp(0) = 1, so the sum is ≥ 1 and log never sees 0.</li>
+        <li>Overflow thresholds for exp(x): FP16 x &gt; ≈11.09, FP32/BF16 x &gt; ≈88.72, FP64 x &gt; ≈709.8.</li>
+        <li>Never write <code>log(softmax(x))</code>. A softmax output that underflows to 0 gives −Inf.</li>
+    </ul>
+    <div class="formula">BCE-with-logits(z, y) = max(z, 0) − z·y + log1p(exp(−|z|))</div>
+    <p>Use <code>binary_cross_entropy_with_logits</code>, <code>log1p</code>, <code>expm1</code>, <code>softplus</code> and <code>xlogy</code> for the same reason: they avoid forming a value that rounds to 0 or 1 before you take its log.</p>
+</section>
+
+<section id="online">
+    <h2>4. Online softmax and FlashAttention</h2>
+    <h3>4.1 Online normalizer (Milakov &amp; Gimelshein, 2018)</h3>
+    <p>The state is (m, d), where m is the running max and d = Σ exp(x<sub>i</sub> − m).</p>
+    <div class="formula">update with block b:   m' = max(m, max(b));   d' = d·exp(m − m') + Σ exp(b_i − m')
+        merge (m1,d1),(m2,d2): m  = max(m1, m2);    d  = d1·exp(m1 − m) + d2·exp(m2 − m)</div>
+    <p>The merge is associative and commutative up to rounding. That allows a single pass, tiling and parallel splits such as split-KV / Flash-Decoding. The initial state is (−Inf, 0). Watch out: if a block is entirely −Inf, then m − m' = −Inf − (−Inf) = NaN, the same trap as Lesson 3. Real kernels guard against this.</p>
+
+    <h3>4.2 FlashAttention forward (one query block)</h3>
+    <pre>m = -inf; l = 0; O = 0                       # all FP32, kept on-chip
+for each key/value block j:
+    S = (Q_i @ K_j^T) * scale                # FP32 accumulate
+    m_new = max(m, rowmax(S))
+    P = exp(S - m_new)
+    alpha = exp(m - m_new)                   # rescale old contributions
+    l = alpha * l + rowsum(P)
+    O = alpha * O + P @ V_j                  # P cast to fp16/bf16 for the Tensor Core GEMM (verify per version)
+    m = m_new
+O = O / l;  LSE = m + log(l)                 # store LSE (one float per row) for backward
+</pre>
+    <table>
+        <tr><th>Property</th><th>Why</th></tr>
+        <tr><td><b>Exact</b>, not an approximation</td><td>The rescaling identity is algebraically exact. Differences from a naive softmax come only from rounding order.</td></tr>
+        <tr><td>Numerically safe</td><td>Max-subtraction in every block; FP32 m, l and O accumulators; scores never round-trip through HBM in FP16.</td></tr>
+        <tr><td>Memory O(N) instead of O(N²)</td><td>The N×N score/probability matrix is never materialized. Backward recomputes S and P from Q, K and the saved LSE: P = exp(S − LSE).</td></tr>
+        <tr><td>Where precision is lost</td><td>Input rounding of Q, K and V; P rounded to BF16/FP16 before P·V; FP8 variants (FA3) add more (verify).</td></tr>
+        <tr><td>FA2 refinement</td><td>Keeps O unnormalized and divides by l once at the end, which saves non-matmul FLOPs.</td></tr>
+    </table>
+
+    <h3>Interactive: online-softmax stepper (float64)</h3>
+    <div class="calc">
+        <label>Scores <input id="ox" type="text" style="width:26rem" value="3, 1000, -2, 999, 1001, 0.5, 998, 4"></label>
+        <label>Block <input id="ob" type="text" style="width:4rem" value="3"></label>
+        <button id="obtn">Run</button>
+        <span class="presets">
+      <button class="op" data-x="3, 1000, -2, 999, 1001, 0.5, 998, 4" data-b="3">Large logits</button>
+      <button class="op" data-x="1, 2, 3, 4, 5, 6" data-b="2">Small</button>
+      <button class="op" data-x="-Infinity, -Infinity, -Infinity" data-b="1">Fully masked</button>
+    </span>
+        <div id="oout"></div>
+        <p class="small">A naive exp(x)/Σexp(x) overflows in float64 above ≈709.8, which gives Inf/Inf = NaN.</p>
+    </div>
+</section>
+
+<section id="var">
+    <h2>5. Variance: Welford and Chan</h2>
+    <p>E[x²] − E[x]² subtracts two numbers of size ≈ mean². In FP32 with mean ≈ 10⁴, both terms are ≈ 10⁸, where the ulp is 8. The result is a multiple of 8, so the true variance of 1 is lost.</p>
+    <div class="formula">Welford (streaming):  n += 1;  δ = x − mean;  mean += δ/n;  M2 += δ·(x − mean);   var = M2/n
+        Chan merge (parallel): δ = mean_b − mean_a;  n = n_a + n_b
+        mean = mean_a + δ·n_b/n;   M2 = M2_a + M2_b + δ²·n_a·n_b/n</div>
+    <p>The Chan merge is what makes block-parallel LayerNorm/BatchNorm kernels and cross-GPU SyncBatchNorm stable. A cheap alternative is to shift by any sample (x − x<sub>0</sub>) before using the naive formula.</p>
+</section>
+
+<section id="repro">
+    <h2>6. Reproducibility: reduction order is part of the result</h2>
+    <ul>
+        <li>Floating-point addition is <b>not associative</b>. A different reduction tree gives different low-order bits.</li>
+        <li>The tree changes with: the number of GPUs or the all-reduce algorithm; the kernel chosen for a shape (split-K, tile sizes); atomics, e.g. FlashAttention's backward dQ and some <code>index_add</code>/<code>scatter_add</code>; batch size and padding.</li>
+        <li><b>Batch invariance:</b> row 0 of A·B may differ bitwise depending on how many other rows are in the batch, because a different kernel runs. This matters for LLM inference reproducibility (Thinking Machines, "Defeating Nondeterminism in LLM Inference", 2025, verify).</li>
+        <li>PyTorch: <code>torch.use_deterministic_algorithms(True)</code> plus <code>CUBLAS_WORKSPACE_CONFIG=:4096:8</code> gives run-to-run determinism on the <i>same</i> setup. It doesn't give invariance across GPU counts or batch sizes. Expect a slowdown, and errors for ops without deterministic implementations.</li>
+        <li>Rule of thumb: differences in the last digits (about 1e−6 relative in FP32, 1e−2 to 1e−3 in BF16) that stay bounded are normal. Differences that <b>grow</b> over steps mean either chaotic training dynamics (normal for long runs) or a bug. Compare loss curves statistically, not bitwise.</li>
+    </ul>
+</section>
+
+<section id="answer">
+    <h2>7. Interview answers (30 s each, say them out loud)</h2>
+    <div class="box"><b>"Why is FlashAttention numerically safe, and is it approximate?"</b><br>"It's exact. It uses the online-softmax identity: keep a running max m and normalizer l per query row, and when a new key block raises the max, rescale the old l and the output accumulator by exp(m_old − m_new). All of that stays in FP32 on-chip, and every exponent is ≤ 0. It never materializes the N×N matrix, so memory is O(N). For backward it stores one LSE per row and recomputes P. Precision is lost only from input rounding and from casting P to BF16 for the PV GEMM."</div>
+    <div class="box"><b>"Same seed, 8 vs. 16 GPUs, the loss differs in the 6th digit. Bug?"</b><br>"Probably not. FP addition isn't associative, and changing the world size changes the all-reduce tree and the per-rank batch shapes, which changes kernel choices. I'd check that the difference starts at the rounding level and that the curves agree statistically. Deterministic mode gives me run-to-run reproducibility on a fixed setup, but not invariance across GPU counts. One thing I'd verify is that the loss is normalized by the global token count, because that's a real bug that looks similar."</div>
+    <div class="box"><b>"Can we drop the FP32 master weights?"</b><br>"Only if we handle swamping. A BF16 update smaller than half an ulp is lost: at w = 1, that's anything below about 0.004. The options are a BF16 Kahan compensation buffer, which brings us to 4 instead of 6 bytes per param and recovers the lost bits, or stochastic rounding, which is unbiased in expectation. I'd validate it against an FP32-master baseline on the loss curve, especially late in training when updates are smallest."</div>
+</section>
+
+<section id="lab">
+    <h2>8. Lab (~55 min)</h2>
+    <p>Write down a prediction for every printed line before you run it.</p>
+
+    <h3>Part 0: Summation simulator (in this page, emulated rounding)</h3>
+    <div class="calc">
+        <label>Format <select id="sf"><option>FP32</option><option>FP16</option><option>BF16</option></select></label>
+        <label>Start <input id="ss" type="text" value="0"></label>
+        <label>Addend <input id="sa" type="text" value="0.1"></label>
+        <label>n <input id="sn" type="text" value="1000000"></label>
+        <button id="sbtn">Simulate</button><br>
+        <span class="presets">
+      <button class="sp" data-f="FP32" data-s="0" data-a="0.1" data-n="1000000">FP32 · 0.1 × 1e6</button>
+      <button class="sp" data-f="FP16" data-s="0" data-a="1" data-n="5000">FP16 · 1 × 5000</button>
+      <button class="sp" data-f="BF16" data-s="1" data-a="0.001" data-n="1000">BF16 · 1 + 1000 × 1e-3</button>
+      <button class="sp" data-f="BF16" data-s="0" data-a="1" data-n="1000">BF16 · 1 × 1000</button>
+    </span>
+        <div id="sout"></div>
+        <p class="small">Every operation is rounded to the chosen format (round-to-nearest-even). Pairwise sums the addends with a tree (leaves of 8) and then adds the start value. n is capped at 5e6.</p>
+    </div>
+
+    <h3>Part 1: Naive vs. pairwise vs. Kahan (CPU, NumPy)</h3>
+    <pre>import math, time, numpy as np
+n = 10**6
+x = np.full(n, 0.1, dtype=np.float32)
+exact = math.fsum(x.astype(np.float64))         # exact sum of the float32 values
+
+def kahan(v):
+    s = np.float32(0); c = np.float32(0)
+    for xi in v:                                # xi is np.float32: all math stays in float32
+        y = xi - c; t = s + y; c = (t - s) - y; s = t
+    return s
+
+t0 = time.time(); k = kahan(x); dt = time.time() - t0
+results = [("naive (cumsum)", np.cumsum(x)[-1]),    # sequential float32 accumulator
+           ("pairwise (sum)", x.sum()),             # NumPy uses pairwise summation
+           ("kahan", k),
+           ("float64 acc", x.sum(dtype=np.float64))]
+print(f"exact          {exact:.4f}")
+for name, val in results:
+    print(f"{name:14} {float(val):.4f}  rel err {abs(float(val) - exact) / exact:.1e}")
+print(f"kahan python loop took {dt:.1f}s")
+</pre>
+    <details><summary>Expected and why</summary>
+        <ul>
+            <li>exact = 100000.0015, because float32(0.1) is slightly more than 0.1.</li>
+            <li>naive ≈ <b>1.01e5, about 1% high</b>. The drift is systematic. In [65536, 131072) the ulp is 2<sup>−7</sup>, and 0.1 = 12.8 ulps rounds up to 13 ulps every time.</li>
+            <li>pairwise has a relative error of about 1e−7 or smaller. kahan gives 100000.0, the nearest float32 (rel ≈ 1.5e−8). float64 accumulation is essentially exact.</li>
+            <li>Kahan in a Python loop takes seconds. In a kernel it is almost free, because summation is memory-bound.</li>
+        </ul></details>
+
+    <h3>Part 2: LSE and stable losses (CPU, torch)</h3>
+    <pre>import torch, torch.nn.functional as F
+for x in (torch.tensor([1000., 1000.]), torch.tensor([-1000., -1000.])):
+    print("naive", torch.log(torch.exp(x).sum()).item(), "| logsumexp", torch.logsumexp(x, 0).item())
+
+h = torch.tensor([12., 12.], dtype=torch.float16)
+print("fp16 exp(12):", torch.exp(h)[0].item(), "| lse via fp32:", torch.logsumexp(h.float(), 0).half().item())
+
+z = torch.tensor([-200., 0., 200.]); y = torch.tensor([1., 1., 0.])
+s = torch.sigmoid(z)
+naive = -(y * torch.log(s) + (1 - y) * torch.log(1 - s))
+print("bce naive      ", naive)
+print("bce with logits", F.binary_cross_entropy_with_logits(z, y, reduction="none"))
+</pre>
+    <details><summary>Expected and why</summary>
+        <ul>
+            <li><code>inf</code> vs. 1000.6931 (= 1000 + ln 2). <code>-inf</code> vs. −999.3069.</li>
+            <li>FP16 exp(12) = <code>inf</code>, because 162755 &gt; 65504. The LSE is 12.6953125 (12.693 rounded to the FP16 grid).</li>
+            <li>naive BCE: <code>[inf, 0.6931, inf]</code>. With logits: <code>[200, 0.6931, 200]</code>. The sigmoid rounds to exactly 0 or 1 before the log.</li>
+        </ul></details>
+
+    <h3>Part 3: Online softmax and a mini FlashAttention (CPU, torch)</h3>
+    <pre>import torch, math
+torch.manual_seed(0)
+
+def online_stats(x, block):
+    m, d = torch.tensor(float("-inf")), torch.tensor(0.0)
+    for i in range(0, x.numel(), block):
+        b = x[i:i + block]
+        m_new = torch.maximum(m, b.max())
+        d = d * torch.exp(m - m_new) + torch.exp(b - m_new).sum()
+        m = m_new
+    return m, d
+
+x = torch.randn(10_000) * 30
+m, d = online_stats(x, 128)
+print("max |online - softmax|:", (torch.exp(x - m) / d - torch.softmax(x, 0)).abs().max().item())
+print("LSE:", (m + d.log()).item(), "vs", torch.logsumexp(x, 0).item())
+
+def flash_attn(q, k, v, Br=64, Bc=64, p_dtype=torch.float32):
+    N, D = q.shape; scale = 1 / math.sqrt(D)
+    O, L = torch.zeros(N, D), torch.empty(N)
+    for i in range(0, N, Br):
+        qi = q[i:i + Br].float() * scale
+        m = torch.full((qi.shape[0],), float("-inf")); l = torch.zeros(qi.shape[0]); acc = torch.zeros(qi.shape[0], D)
+        for j in range(0, N, Bc):
+            s = qi @ k[j:j + Bc].float().T
+            m_new = torch.maximum(m, s.max(-1).values)
+            p = torch.exp(s - m_new[:, None])
+            alpha = torch.exp(m - m_new)
+            l = alpha * l + p.sum(-1)
+            acc = alpha[:, None] * acc + (p.to(p_dtype) @ v[j:j + Bc].to(p_dtype)).float()
+            m = m_new
+        O[i:i + Br] = acc / l[:, None]; L[i:i + Br] = m + l.log()
+    return O, L
+
+N, D = 512, 64
+q, k, v = (torch.randn(N, D) for _ in range(3))
+ref = torch.softmax(q.double() @ k.double().T / math.sqrt(D), -1) @ v.double()
+for p_dtype in (torch.float32, torch.bfloat16):
+    O, L = flash_attn(q, k, v, p_dtype=p_dtype)
+    print(f"P in {str(p_dtype):15} max |O - ref64| = {(O.double() - ref).abs().max().item():.1e}")
+lse_ref = torch.logsumexp(q.double() @ k.double().T / math.sqrt(D), -1)
+print("LSE max diff:", (L.double() - lse_ref).abs().max().item())
+</pre>
+    <details><summary>Expected</summary>
+        <p>Online vs. softmax: about 1e−8 or smaller, and the LSEs agree to FP32 precision. Flash with FP32 P: about 1e−6, because it is exact up to rounding. With BF16 P (and V): about 1e−3, which is the cost of the Tensor Core cast. Change <code>Bc</code>: the results move only in the last bits.</p></details>
+
+    <h3>Part 4: Order, cancellation, batch invariance</h3>
+    <pre>import torch
+torch.manual_seed(0)
+x = torch.randn(1_000_000)
+a, b = x.sum(), x[torch.randperm(x.numel())].sum()
+print(f"sum {a.item():.6f} | permuted {b.item():.6f} | bitwise equal: {torch.equal(a, b)} | fp64 {x.double().sum().item():.6f}")
+print(f"8 chunks ('8 GPUs'): {sum(c.sum() for c in x.chunk(8)).item():.6f}")
+
+y = 10_000 + torch.randn(1_000_000)
+naive = (y * y).mean() - y.mean() ** 2
+y0 = y - y[0]
+print("naive var:", naive.item(), "| torch.var:", y.var(correction=0).item(),
+      "| shifted:", ((y0 * y0).mean() - y0.mean() ** 2).item())
+
+if torch.cuda.is_available():                     # 4c: batch invariance (optional)
+    torch.backends.cuda.matmul.fp32_precision = "ieee"
+    A = torch.randn(2048, 4096, device="cuda"); B = torch.randn(4096, 4096, device="cuda")
+    full, single = (A @ B)[:1], A[:1] @ B
+    print("row 0 bitwise equal:", torch.equal(full, single), "| max diff:", (full - single).abs().max().item())
+</pre>
+    <details><summary>Expected</summary>
+        <ul>
+            <li>The three sums usually differ in the last digits, so bitwise equal is usually False, and all of them are close to the FP64 value. That is non-associativity.</li>
+            <li>naive var is a <b>multiple of 8</b> (0, 8, −8, 16, …) because both terms are ≈ 1e8, where the FP32 ulp is 8. torch.var and the shifted version give ≈ 1.0.</li>
+            <li>4c: often <code>False</code> with a difference around 1e−5. M = 1 and M = 2048 select different kernels and reduction orders. This depends on hardware and library version.</li>
+        </ul></details>
+</section>
+
+<section id="quiz">
+    <h2>9. Quiz</h2>
+    <p>For numeric questions, enter digits only (decimals allowed).</p>
+    <div id="quizRoot"></div>
+    <p id="score"></p>
+    <button id="reset">Reset quiz</button>
+</section>
+
+<section id="sources">
+    <h2>10. Sources (from memory: no lookups were made for this lesson, verify before citing)</h2>
+    <ul>
+        <li>Higham, "The accuracy of floating point summation", SIAM J. Sci. Comput. 14(4), 1993; and <i>Accuracy and Stability of Numerical Algorithms</i>, 2nd ed., ch. 4.</li>
+        <li>Kahan, "Further remarks on reducing truncation errors", CACM 8(1), 1965.</li>
+        <li>Welford, Technometrics 4(3), 1962; Chan, Golub &amp; LeVeque, "Algorithms for computing the sample variance", 1983.</li>
+        <li>Milakov &amp; Gimelshein, "Online normalizer calculation for softmax", <a href="https://arxiv.org/abs/1805.02867">arXiv:1805.02867</a>.</li>
+        <li>Dao et al., "FlashAttention", <a href="https://arxiv.org/abs/2205.14135">arXiv:2205.14135</a>; Dao, "FlashAttention-2", <a href="https://arxiv.org/abs/2307.08691">arXiv:2307.08691</a>; Shah et al., "FlashAttention-3" (FP8).</li>
+        <li>DeepSeek-AI, "DeepSeek-V3 Technical Report", <a href="https://arxiv.org/abs/2412.19437">arXiv:2412.19437</a> (FP8 accumulation promotion interval).</li>
+        <li>Zamirai et al., "Revisiting BFloat16 Training" (Kahan summation and stochastic rounding for BF16 weights).</li>
+        <li>Thinking Machines Lab, "Defeating Nondeterminism in LLM Inference" (batch invariance), 2025.</li>
+        <li>PyTorch docs: <a href="https://docs.pytorch.org/docs/stable/notes/randomness.html">Reproducibility</a>, <a href="https://docs.pytorch.org/docs/main/notes/numerical_accuracy.html">Numerical accuracy</a>, <code>torch.backends.cuda.matmul.allow_*_reduced_precision_reduction</code>.</li>
+        <li>NumPy docs: <code>numpy.sum</code> notes (pairwise summation); <code>np.add.accumulate</code> is sequential.</li>
+    </ul>
+</section>
+
+<footer>Next (planned): Lesson 5 covers FP8 and MX formats: E4M3 vs. E5M2 roles, per-tensor, delayed and block scaling, MXFP8/MXFP4 shared exponents, and Transformer Engine recipes.</footer>
+
+<script>
+    // Format emulation
+    const F = {
+        FP32: {p:24, emin:-126, max:(2 - 2**-23) * 2**127},
+        FP16: {p:11, emin:-14,  max:65504},
+        BF16: {p:8,  emin:-126, max:(2 - 2**-7) * 2**127}
+    };
+    function rne(v) { const f = Math.floor(v), d = v - f; if (d > 0.5) return f + 1; if (d < 0.5) return f; return (f % 2 === 0) ? f : f + 1; }
+    function rnd(x, Fm) {
+        if (!isFinite(x) || x === 0) return x;
+        const a = Math.abs(x);
+        let e = Math.floor(Math.log2(a));
+        if (2**e > a) e--; if (2**(e + 1) <= a) e++;
+        e = Math.max(e, Fm.emin);
+        const ulp = 2**(e - Fm.p + 1);
+        let r = rne(a / ulp) * ulp;
+        if (r > Fm.max) r = Infinity;
+        return Math.sign(x) * r;
+    }
+    function fmt(x) {
+        if (!isFinite(x)) return String(x);
+        if (x !== 0 && (Math.abs(x) >= 1e6 || Math.abs(x) < 1e-3)) return x.toExponential(4);
+        return x.toPrecision(10).replace(/\.?0+$/, "");
+    }
+
+    // Summation simulator
+    function simulate() {
+        const out = document.getElementById("sout");
+        const Fm = F[document.getElementById("sf").value];
+        const s0 = rnd(parseFloat(document.getElementById("ss").value), Fm);
+        const a = rnd(parseFloat(document.getElementById("sa").value), Fm);
+        let n = Math.floor(parseFloat(document.getElementById("sn").value));
+        if (isNaN(s0) || isNaN(a) || !(n > 0)) { out.textContent = "Enter valid numbers (n > 0)."; return; }
+        let note = "";
+        if (n > 5e6) { n = 5e6; note = " (n capped at 5e6)"; }
+
+        let s = s0;
+        for (let i = 0; i < n; i++) s = rnd(s + a, Fm);
+
+        const memo = new Map();
+        function pw(k) {
+            if (memo.has(k)) return memo.get(k);
+            let r;
+            if (k <= 8) { r = 0; for (let i = 0; i < k; i++) r = rnd(r + a, Fm); }
+            else { const h = Math.floor(k / 2); r = rnd(pw(h) + pw(k - h), Fm); }
+            memo.set(k, r); return r;
+        }
+        const p = rnd(s0 + pw(n), Fm);
+
+        let ks = s0, c = 0;
+        for (let i = 0; i < n; i++) { const y = rnd(a - c, Fm); const t = rnd(ks + y, Fm); c = rnd(rnd(t - ks, Fm) - y, Fm); ks = t; }
+
+        const exact = s0 + n * a;
+        const row = (name, v) => {
+            const rel = (isFinite(v) && exact !== 0) ? (Math.abs(v - exact) / Math.abs(exact)).toExponential(2) : "–";
+            return `<tr><td>${name}</td><td class="n">${fmt(v)}</td><td class="n">${rel}</td></tr>`;
+        };
+        out.innerHTML = `<p class="small">Addend as stored: ${fmt(a)} · start as stored: ${fmt(s0)}${note}</p>
+    <table><tr><th>Method</th><th>Result</th><th>Rel. error</th></tr>
+    ${row("Exact (float64, stored inputs)", exact)}${row("Naive", s)}${row("Pairwise", p)}${row("Kahan", ks)}</table>`;
+    }
+    document.getElementById("sbtn").addEventListener("click", simulate);
+    document.querySelectorAll(".sp").forEach(b => b.addEventListener("click", () => {
+        document.getElementById("sf").value = b.dataset.f;
+        document.getElementById("ss").value = b.dataset.s;
+        document.getElementById("sa").value = b.dataset.a;
+        document.getElementById("sn").value = b.dataset.n;
+        simulate();
+    }));
+
+    // Online-softmax stepper
+    function stepper() {
+        const out = document.getElementById("oout");
+        const xs = document.getElementById("ox").value.split(/[\s,;]+/).filter(Boolean).map(Number);
+        const B = Math.max(1, parseInt(document.getElementById("ob").value) || 1);
+        if (!xs.length || xs.some(isNaN)) { out.textContent = "Enter numbers separated by commas."; return; }
+        let m = -Infinity, d = 0, rows = "";
+        for (let i = 0; i < xs.length; i += B) {
+            const b = xs.slice(i, i + B), mn = Math.max(m, ...b), alpha = Math.exp(m - mn);
+            d = d * alpha + b.reduce((s, x) => s + Math.exp(x - mn), 0);
+            rows += `<tr><td>${i / B + 1}</td><td>[${b.join(", ")}]</td><td class="n">${fmt(m)}</td><td class="n">${fmt(mn)}</td><td class="n">${fmt(alpha)}</td><td class="n">${fmt(d)}</td></tr>`;
+            m = mn;
+        }
+        const mx = Math.max(...xs), e = xs.map(x => Math.exp(x - mx)), Z = e.reduce((s, v) => s + v, 0);
+        const pRef = e.map(v => v / Z), pOn = xs.map(x => Math.exp(x - m) / d);
+        const nZ = xs.reduce((s, x) => s + Math.exp(x), 0), pNaive = xs.map(x => Math.exp(x) / nZ);
+        const diff = Math.max(...pOn.map((v, i) => Math.abs(v - pRef[i])));
+        out.innerHTML = `<table><tr><th>Block</th><th>Values</th><th>m old</th><th>m new</th><th>exp(m old − m new)</th><th>d</th></tr>${rows}</table>
+    <table><tr><th></th>${xs.map((x, i) => `<th>x${i}</th>`).join("")}</tr>
+    <tr><td>Online</td>${pOn.map(v => `<td class="n">${fmt(v)}</td>`).join("")}</tr>
+    <tr><td>Two-pass (max-subtracted)</td>${pRef.map(v => `<td class="n">${fmt(v)}</td>`).join("")}</tr>
+    <tr><td>Naive exp/Σexp</td>${pNaive.map(v => `<td class="n">${fmt(v)}</td>`).join("")}</tr></table>
+    <p>LSE = m + ln d = <b>${fmt(m + Math.log(d))}</b> · max |online − two-pass| = ${fmt(diff)}</p>`;
+    }
+    document.getElementById("obtn").addEventListener("click", stepper);
+    document.querySelectorAll(".op").forEach(b => b.addEventListener("click", () => {
+        document.getElementById("ox").value = b.dataset.x;
+        document.getElementById("ob").value = b.dataset.b;
+        stepper();
+    }));
+    stepper();
+
+    // Quiz
+    const Q = [
+        {q:"In FP32, you repeatedly add 1.0 to a sum starting at 0. At what value does it stop growing?", type:"num", a:16777216,
+            why:"2^24. There the ulp is 2, so adding 1 is a tie, and the tie rounds to even, keeping the value."},
+        {q:"Same question in BF16?", type:"num", a:256,
+            why:"BF16 has 8 significand bits, so the sum stops at 2^8 = 256."},
+        {q:"How do the worst-case error bounds of naive, pairwise and Kahan summation grow with n?", type:"mc",
+            opts:["All grow like n","n / log n / roughly constant","log n / n / constant","√n / √n / √n"], a:1,
+            why:"Recursive ≈ (n−1)u·Σ|x|, pairwise ≈ log2(n)·u·Σ|x|, Kahan ≈ 2u·Σ|x| + O(n u²)."},
+        {q:"Kahan's relative error bound is ≈ 2u times what?", type:"mc",
+            opts:["n","log n","The condition number Σ|x_i| / |Σx_i|","The largest |x_i|"], a:2,
+            why:"Kahan removes accumulated rounding error, but an ill-conditioned (cancelling) sum still loses relative accuracy."},
+        {q:"logsumexp([1000, 1000]) = ? (3 decimals)", type:"num", a:1000.693, tol:0.001,
+            why:"1000 + ln 2. The naive form overflows to Inf in FP32 and FP64."},
+        {q:"Merge online-softmax states (m1=2, d1=3) and (m2=5, d2=1). What is the merged d? (3 decimals)", type:"num", a:1.149, tol:0.002,
+            why:"m = 5; d = 3·e^(2−5) + 1·e^0 = 3·0.0498 + 1 ≈ 1.149."},
+        {q:"In FlashAttention, why are l and O multiplied by exp(m_old − m_new)?", type:"mc",
+            opts:["To add dropout","To re-express earlier contributions relative to the new running max","To convert to FP16","To approximate the softmax"], a:1,
+            why:"Earlier terms were exp(s − m_old). Multiplying by exp(m_old − m_new) turns them into exp(s − m_new). The identity is exact."},
+        {q:"Is FlashAttention an approximation of attention?", type:"mc",
+            opts:["Yes, it drops small probabilities","Yes, it uses low-rank projections","No, it is exact; differences come only from rounding and summation order","Only in backward"], a:2,
+            why:"Unlike sparse or linear attention, it computes the same function with a different evaluation order."},
+        {q:"What does the FlashAttention forward pass save per query row so backward can recompute P?", type:"mc",
+            opts:["The full P matrix","The log-sum-exp (m + log l)","Only the max m","Nothing; backward reruns the forward pass"], a:1,
+            why:"With the LSE, P = exp(S − LSE) can be rebuilt block by block, so memory stays O(N)."},
+        {q:"FP32 data with mean ≈ 1e4 and variance ≈ 1. The naive E[x²] − E[x]² result is always a multiple of what number?", type:"num", a:8,
+            why:"Both terms are ≈ 1e8, in [2^26, 2^27), where the FP32 ulp is 2^(26−23) = 8. Their difference is a multiple of 8."},
+        {q:"In Chan's parallel variance merge, which term is added to M2_a + M2_b?", type:"mc",
+            opts:["δ²·n_a·n_b / n","δ·n_b / n","(mean_a² + mean_b²)/2","δ²"], a:0,
+            why:"M2 = M2_a + M2_b + δ²·n_a·n_b/(n_a + n_b), with δ = mean_b − mean_a."},
+        {q:"Same seed and code; the loss differs in the 6th digit between 8 and 16 GPUs. What is the most likely cause?", type:"mc",
+            opts:["A race condition bug","Non-associative FP addition: the reduction trees and kernel choices changed","The RNG is broken","TF32 being disabled"], a:1,
+            why:"World size changes the all-reduce order and the per-rank shapes. Deterministic mode doesn't make results invariant across GPU counts."},
+        {q:"Which is the stable BCE-with-logits formula?", type:"mc",
+            opts:["−y·log σ(z) − (1−y)·log(1−σ(z))","max(z,0) − z·y + log1p(exp(−|z|))","log(1 + exp(z)) − z·y","softmax(z) − y"], a:1,
+            why:"The exponent is never positive, and σ(z) is never rounded to exactly 0 or 1 before a log."},
+        {q:"Pure-BF16 weights with a BF16 Kahan compensation buffer: bytes per parameter for weight + buffer?", type:"num", a:4,
+            why:"2 + 2 = 4 B, vs. 2 + 4 = 6 B for a BF16 weight plus an FP32 master copy. The optimizer states are extra in both cases."}
+    ];
+
+    const root = document.getElementById("quizRoot"), scoreEl = document.getElementById("score");
+    let done = {};
+    function render() {
+        root.innerHTML = ""; done = {}; scoreEl.textContent = "";
+        Q.forEach((it, i) => {
+            const s = document.createElement("div"); s.className = "q";
+            let h = `<p><b>Q${i+1}.</b> ${it.q}</p>`;
+            h += it.type === "num"
+                ? `<input id="in${i}" type="text" inputmode="decimal">`
+                : it.opts.map((o, j) => `<label><input type="radio" name="q${i}" value="${j}"> ${o}</label>`).join("");
+            h += `<br><button data-i="${i}">Check</button><p class="fb" id="fb${i}"></p>`;
+            s.innerHTML = h; root.appendChild(s);
+        });
+    }
+    root.addEventListener("click", e => {
+        if (e.target.tagName !== "BUTTON") return;
+        const i = +e.target.dataset.i, it = Q[i];
+        let ok;
+        if (it.type === "num") {
+            const v = parseFloat(document.getElementById("in" + i).value.replace(/[\s,]/g, ""));
+            ok = !isNaN(v) && Math.abs(v - it.a) <= (it.tol || 1e-9);
+        } else {
+            const c = document.querySelector(`input[name=q${i}]:checked`);
+            ok = !!c && +c.value === it.a;
+        }
+        const fb = document.getElementById("fb" + i);
+        fb.className = "fb " + (ok ? "ok" : "bad");
+        fb.textContent = (ok ? "Correct. " : "Not quite. ") + it.why;
+        done[i] = ok;
+        const n = Object.keys(done).length, c = Object.values(done).filter(Boolean).length;
+        scoreEl.textContent = `Score: ${c}/${Q.length} (answered ${n}/${Q.length})`;
+    });
+    document.getElementById("reset").addEventListener("click", render);
+    render();
+</script>

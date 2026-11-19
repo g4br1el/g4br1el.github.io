@@ -1,0 +1,237 @@
+---
+layout: tutorial
+tutorial: prep-nov26
+type: lesson
+lesson: 1
+total: 18
+title: "Float Bit Layouts and Why FP16 Training Needs Master Weights and Loss Scaling"
+tags:
+permalink: /heap/nov26/001/
+---
+
+
+<h1>Lesson 1 · Float Bit Layouts &amp; Why FP16 Training Needs Master Weights and Loss Scaling</h1>
+<p>Week 1 · ~45 min reading + ~30 min lab + quiz · Target: Research / Senior DL Engineering interviews</p>
+
+<section id="goal">
+    <h2>0. Interview skill</h2>
+    <div class="box">Given exponent bits <b>E</b> and mantissa bits <b>M</b>, derive every key number of a float format on a whiteboard in under 5 minutes. Then explain each part of the Micikevicius mixed-precision recipe from those numbers.</div>
+</section>
+
+<section id="formulas">
+    <h2>1. One formula set for all formats</h2>
+    <p>Bias <code>b = 2<sup>E−1</sup> − 1</code>. The exponent field with all ones is reserved for Inf/NaN (IEEE-style), so the largest usable exponent is <code>2<sup>E</sup> − 2 − b</code>.</p>
+    <table>
+        <tr><th>Quantity</th><th>Formula</th></tr>
+        <tr><td>Normal value</td><td>(−1)<sup>s</sup> · 2<sup>e−b</sup> · (1 + f/2<sup>M</sup>)</td></tr>
+        <tr><td>Max finite</td><td>(2 − 2<sup>−M</sup>) · 2<sup>2<sup>E</sup> − 2 − b</sup></td></tr>
+        <tr><td>Min normal</td><td>2<sup>1−b</sup></td></tr>
+        <tr><td>Min subnormal</td><td>2<sup>1−b−M</sup></td></tr>
+        <tr><td>Machine epsilon (ulp at 1.0)</td><td>2<sup>−M</sup></td></tr>
+        <tr><td>Unit roundoff</td><td>2<sup>−(M+1)</sup></td></tr>
+        <tr><td>Decimal digits</td><td>≈ (M+1) · log<sub>10</sub>2</td></tr>
+    </table>
+</section>
+
+<section id="table">
+    <h2>2. Derived values</h2>
+    <table>
+        <tr><th>Format</th><th>E</th><th>M</th><th>Bias</th><th>Max</th><th>Min normal</th><th>Min subnormal</th><th>eps</th></tr>
+        <tr><td>FP32</td><td class="n">8</td><td class="n">23</td><td class="n">127</td><td class="n">3.40e38</td><td class="n">2<sup>−126</sup> ≈ 1.18e−38</td><td class="n">2<sup>−149</sup> ≈ 1.4e−45</td><td class="n">2<sup>−23</sup> ≈ 1.19e−7</td></tr>
+        <tr><td>TF32*</td><td class="n">8</td><td class="n">10</td><td class="n">127</td><td class="n">≈3.40e38</td><td class="n">2<sup>−126</sup></td><td class="n">n/a</td><td class="n">2<sup>−10</sup> ≈ 9.8e−4</td></tr>
+        <tr><td>FP16</td><td class="n">5</td><td class="n">10</td><td class="n">15</td><td class="n"><b>65504</b></td><td class="n">2<sup>−14</sup> ≈ 6.10e−5</td><td class="n">2<sup>−24</sup> ≈ 5.96e−8</td><td class="n">2<sup>−10</sup> ≈ 9.8e−4</td></tr>
+        <tr><td>BF16</td><td class="n">8</td><td class="n">7</td><td class="n">127</td><td class="n">≈3.39e38</td><td class="n">2<sup>−126</sup></td><td class="n">2<sup>−133</sup> ≈ 9.2e−41</td><td class="n">2<sup>−7</sup> ≈ 7.8e−3</td></tr>
+        <tr><td>FP8 E5M2</td><td class="n">5</td><td class="n">2</td><td class="n">15</td><td class="n">57344</td><td class="n">2<sup>−14</sup></td><td class="n">2<sup>−16</sup> ≈ 1.5e−5</td><td class="n">0.25</td></tr>
+        <tr><td>FP8 E4M3**</td><td class="n">4</td><td class="n">3</td><td class="n">7</td><td class="n"><b>448</b></td><td class="n">2<sup>−6</sup></td><td class="n">2<sup>−9</sup> ≈ 1.95e−3</td><td class="n">0.125</td></tr>
+    </table>
+    <p>* TF32 is a Tensor Core math mode, not a storage format. Tensors stay FP32 in memory.<br>
+        ** E4M3 breaks the IEEE rule. It has no Inf, and only <code>S.1111.111</code> is NaN, so the top exponent is usable: 2<sup>8</sup> · 1.75 = 448. The IEEE formula would give 240, which is a classic interview trap.</p>
+    <div class="box warn">Check every row yourself with <code>torch.finfo(dtype)</code> (see the Lab). The E4M3 source (arXiv:2209.05433) has not been verified in this session yet.</div>
+</section>
+
+<section id="drills">
+    <h2>3. Whiteboard drills</h2>
+    <p>Try each drill yourself before you expand the solution.</p>
+    <details><summary>Drill 1: Decode FP16 <code>0x7BFF</code></summary>
+        <p><code>0 11110 1111111111</code> → 2<sup>30−15</sup> · (1 + 1023/1024) = 2<sup>15</sup> · (2 − 2<sup>−10</sup>) = <b>65504</b>.</p></details>
+    <details><summary>Drill 2: Convert FP32 1.0 to BF16</summary>
+        <p>Keep the top 16 bits (in hardware, with round-to-nearest-even): <code>0x3F800000</code> → <code>0x3F80</code>. The conversion is cheap and keeps FP32's full range.</p></details>
+    <details><summary>Drill 3: "Is BF16 more precise than FP16?"</summary>
+        <p>No. FP16 has 3 more mantissa bits, so its resolution is finer. It has 3 fewer exponent bits, so its normal range is only about 2<sup>−14</sup> to 2<sup>16</sup>. BF16 has FP32's range but is 8× coarser near 1.0.</p></details>
+    <details><summary>Drill 4: Derive E5M2 max finite with the IEEE formula</summary>
+        <p>b = 15, top usable exponent = 2<sup>5</sup> − 2 − 15 = 15, mantissa factor = 2 − 2<sup>−2</sup> = 1.75 → 1.75 · 2<sup>15</sup> = <b>57344</b>.</p></details>
+</section>
+
+<section id="failures">
+    <h2>4. From bit layout to failure modes</h2>
+    <p>The three techniques in Micikevicius et al. each fix one failure mode.</p>
+    <table>
+        <tr><th>Failure mode</th><th>Cause</th><th>Fix</th></tr>
+        <tr><td><b>Lost updates</b></td><td>If |Δw| &lt; ½ ulp(w), then w + Δw rounds back to w. Near w ≈ 1, ulp = 2<sup>−10</sup>, so updates more than about 2<sup>11</sup> times smaller than the weight disappear.</td><td><b>FP32 master weights.</b> The optimizer step runs in FP32, then the result is cast to FP16.</td></tr>
+        <tr><td><b>Gradient underflow</b></td><td>Many activation gradients fall below 2<sup>−24</sup> and become 0. For example, 1e−8 flushes to zero.</td><td><b>Loss scaling.</b> L′ = S·L, so all gradients are multiplied by S. Unscale before the optimizer step.</td></tr>
+        <tr><td><b>Accumulation swamping</b></td><td>Long FP16 sums stall. For example, 2048 + 1 = 2048 (ulp = 2, and the tie rounds to even).</td><td><b>FP32 accumulation</b> in dot products and reductions. Softmax and norms also stay in FP32.</td></tr>
+    </table>
+    <p>The paper used fixed scale factors. The <b>dynamic</b> procedure from NVIDIA's guide works like this:</p>
+    <ol>
+        <li>Check the gradients for Inf/NaN.</li>
+        <li>If found, skip the step and halve S.</li>
+        <li>After N clean steps, double S.</li>
+    </ol>
+</section>
+
+<section id="nuances">
+    <h2>5. Two nuances that set strong candidates apart</h2>
+    <h3>5.1 PyTorch native AMP has no separate FP16 weight copy</h3>
+    <ul>
+        <li>Parameters stay FP32, and <code>autocast</code> casts them per operation.</li>
+        <li>So the "master weights" are simply the parameters themselves.</li>
+        <li>The FP16-model-plus-FP32-master design is the Apex O2 / paper style.</li>
+    </ul>
+    <h3>5.2 Mixed precision does not save optimizer memory</h3>
+    <table>
+        <tr><th>Setup</th><th>Bytes per parameter</th></tr>
+        <tr><td>Classic MP + Adam</td><td>2 (FP16 w) + 2 (FP16 g) + 4 (master) + 4 (m) + 4 (v) = <b>16</b></td></tr>
+        <tr><td>Pure FP32 + Adam</td><td>4 + 4 + 4 + 4 = <b>16</b></td></tr>
+    </table>
+    <p>The real savings are activation memory, memory bandwidth and Tensor Core throughput. This 16-byte accounting is also where ZeRO starts (verify the reference).</p>
+</section>
+
+<section id="answer">
+    <h2>6. Interview answer (aim for 30 seconds)</h2>
+    <div class="box">"FP16 has a 5-bit exponent, so the smallest subnormal is 2<sup>−24</sup>. Many activation gradients are smaller and flush to zero, which is why we scale the loss and unscale before the step. Dynamic scaling backs off and skips the step on Inf/NaN. Separately, with 10 mantissa bits an update more than about 2<sup>11</sup> times smaller than the weight is rounded away. So the optimizer works on FP32 master weights, and reductions accumulate in FP32. BF16 removes the range problem but is 8× coarser, so accumulation and master weights still matter."</div>
+    <p>Practice: say it out loud with a timer, then write the FP16 row of the table from memory.</p>
+</section>
+
+<section id="lab">
+    <h2>7. Lab (~30 min)</h2>
+    <p>Before running each part, write down what you expect it to print.</p>
+    <pre>import torch
+
+# 1) Verify the format table
+for dt in [torch.float32, torch.float16, torch.bfloat16,
+           torch.float8_e4m3fn, torch.float8_e5m2]:
+    fi = torch.finfo(dt)
+    print(f"{str(dt):22s} max={fi.max:.4g} tiny={fi.tiny:.4g} eps={fi.eps:.4g}")
+
+# 2) Lost update: FP16 vs FP32
+w16, w32 = torch.tensor(1.0, dtype=torch.float16), torch.tensor(1.0)
+print("fp16:", (w16 + 1e-4).item(), "fp32:", (w32 + 1e-4).item())
+
+# 3) Underflow and loss scaling
+g = torch.tensor(1e-8)
+print("unscaled ->", g.half().item())                                # 0.0
+print("scaled S=1024 ->", (g * 1024).half().float().item() / 1024)   # ~1e-8
+
+# 4) Accumulation swamping
+acc16 = torch.tensor(0.0, dtype=torch.float16)
+for _ in range(4096):
+    acc16 += 1
+print("fp16 running sum of 4096 ones:", acc16.item())                 # 2048.0
+</pre>
+    <details><summary>Stretch: repeat part 4 with <code>torch.bfloat16</code>. Predict the stall value first.</summary>
+        <p>BF16 has M = 7, so the ulp becomes 2 at 2<sup>8</sup> = <b>256</b>. Then 256 + 1 is a tie that rounds to even, so the sum stalls at 256. This is why BF16 still needs FP32 accumulation.</p></details>
+</section>
+
+<section id="quiz">
+    <h2>8. Quiz</h2>
+    <p>Answer, press Check, then read the explanation. For numeric questions, enter digits only (negative numbers allowed).</p>
+    <div id="quizRoot"></div>
+    <p id="score"></p>
+    <button id="reset">Reset quiz</button>
+</section>
+
+<section id="sources">
+    <h2>9. Sources</h2>
+    <h3>Verified in a previous session</h3>
+    <ul>
+        <li>Micikevicius et al., "Mixed Precision Training", ICLR 2018. <a href="https://arxiv.org/abs/1710.03740">arXiv:1710.03740</a></li>
+        <li>NVIDIA, <a href="https://docs.nvidia.com/deeplearning/performance/pdf/Training-Mixed-Precision-User-Guide.pdf">Train With Mixed Precision (User Guide)</a></li>
+        <li>PyTorch, <a href="https://docs.pytorch.org/docs/2.14/amp.html">torch.amp</a> and <a href="https://docs.pytorch.org/docs/2.15/notes/amp_examples.html">AMP examples</a></li>
+    </ul>
+    <h3>To verify before relying on them (from memory)</h3>
+    <ul>
+        <li>Micikevicius et al., "FP8 Formats for Deep Learning". <a href="https://arxiv.org/abs/2209.05433">arXiv:2209.05433</a></li>
+        <li>Rajbhandari et al., "ZeRO". <a href="https://arxiv.org/abs/1910.02054">arXiv:1910.02054</a></li>
+        <li>Goldberg, "What Every Computer Scientist Should Know About Floating-Point Arithmetic" (1991)</li>
+    </ul>
+</section>
+
+<footer>Next: Lesson 2 covers <code>autocast</code> op lists, <code>GradScaler</code> internals and memory accounting. Send your quiz score and anything that surprised you.</footer>
+
+<script>
+    const Q = [
+        {q:"Largest finite FP16 value?", type:"num", a:65504,
+            why:"Top usable exponent field 11110 gives 2^15; all-ones mantissa gives (2 - 2^-10). Product = 65504."},
+        {q:"BF16: the smallest positive subnormal is 2^k. Enter k.", type:"num", a:-133,
+            why:"Min normal 2^(1-127) = 2^-126; subnormal step = 2^-126 * 2^-7 = 2^-133."},
+        {q:"Largest finite FP8 E4M3 (OCP/NVIDIA 'fn' variant)?", type:"num", a:448,
+            why:"No Inf encoding; only S.1111.111 is NaN, so exponent 1111 is usable: 2^(15-7) * 1.75 = 448. The IEEE-style formula would give 240."},
+        {q:"In FP16, 2048 + 1 = ?", type:"mc", opts:["2049","2048","2050","Inf"], a:1,
+            why:"ulp at 2048 is 2. 2049 is an exact tie; round-to-nearest-even keeps 2048. An FP16 running sum of ones stalls here."},
+        {q:"A BF16 running sum of ones stalls at which value?", type:"num", a:256,
+            why:"M = 7, so ulp = 2 at 2^8 = 256. 256 + 1 is a tie and rounds to even (256)."},
+        {q:"Which statement is correct?", type:"mc",
+            opts:["BF16 is more precise than FP16 near 1.0",
+                "FP16 has finer resolution near 1.0 than BF16, but a much smaller range",
+                "FP16 and BF16 have the same range",
+                "TF32 tensors occupy 19 bits in memory"], a:1,
+            why:"FP16 eps = 2^-10, BF16 eps = 2^-7 (8x coarser). BF16 matches FP32 range. TF32 is a math mode; storage stays FP32."},
+        {q:"Why must clip_grad_norm_ run after scaler.unscale_(optimizer)?", type:"mc",
+            opts:["Otherwise the threshold is compared against gradients that are S times too large",
+                "unscale_ casts gradients to FP16 for faster clipping",
+                "clip_grad_norm_ does not support FP32 gradients",
+                "It reduces memory usage"], a:0,
+            why:"Before unscale_, every gradient is multiplied by S, so the norm is S times too large and clipping would be far too aggressive."},
+        {q:"Classic mixed precision + Adam: persistent bytes per parameter (FP16 w, FP16 g, FP32 master, m, v)?", type:"num", a:16,
+            why:"2 + 2 + 4 + 4 + 4 = 16, the same as pure FP32 (4+4+4+4). Savings come from activations, bandwidth and Tensor Core throughput."},
+        {q:"A gradient of 1e-8 is cast to FP16 with no loss scaling. Result?", type:"mc",
+            opts:["1e-8 exactly","A subnormal close to 1e-8","0","NaN"], a:2,
+            why:"Smallest FP16 subnormal is 2^-24 ~ 5.96e-8; 1e-8 is below half of that, so it rounds to 0. Scaling by 1024 moves it to ~1.02e-5, which is representable."},
+        {q:"In PyTorch native AMP (autocast + GradScaler), where do the FP32 master weights live?", type:"mc",
+            opts:["In a separate FP32 copy held by GradScaler",
+                "They are the model parameters themselves; autocast casts per op",
+                "In the optimizer state as m and v",
+                "There are none; weights are stored in FP16"], a:1,
+            why:"Native AMP keeps parameters in FP32 and casts to FP16/BF16 inside autocast-enabled ops. A separate master copy is the Apex O2 / paper design."}
+    ];
+
+    const root = document.getElementById("quizRoot"), scoreEl = document.getElementById("score");
+    let done = {};
+
+    function render() {
+        root.innerHTML = ""; done = {}; scoreEl.textContent = "";
+        Q.forEach((it, i) => {
+            const s = document.createElement("div");
+            s.className = "q";
+            let h = `<p><b>Q${i+1}.</b> ${it.q}</p>`;
+            h += it.type === "num"
+                ? `<input id="in${i}" type="text" inputmode="numeric">`
+                : it.opts.map((o, j) => `<label><input type="radio" name="q${i}" value="${j}"> ${o}</label>`).join("");
+            h += `<br><button data-i="${i}">Check</button><p class="fb" id="fb${i}"></p>`;
+            s.innerHTML = h;
+            root.appendChild(s);
+        });
+    }
+
+    root.addEventListener("click", e => {
+        if (e.target.tagName !== "BUTTON") return;
+        const i = +e.target.dataset.i, it = Q[i];
+        let ok;
+        if (it.type === "num") {
+            const v = parseFloat(document.getElementById("in" + i).value.replace(/[\s,]/g, ""));
+            ok = !isNaN(v) && Math.abs(v - it.a) < 1e-9;
+        } else {
+            const c = document.querySelector(`input[name=q${i}]:checked`);
+            ok = !!c && +c.value === it.a;
+        }
+        const fb = document.getElementById("fb" + i);
+        fb.className = "fb " + (ok ? "ok" : "bad");
+        fb.textContent = (ok ? "Correct. " : "Not quite. ") + it.why;
+        done[i] = ok;
+        const n = Object.keys(done).length, c = Object.values(done).filter(Boolean).length;
+        scoreEl.textContent = `Score: ${c}/${Q.length} (answered ${n}/${Q.length})`;
+    });
+
+    document.getElementById("reset").addEventListener("click", render);
+    render();
+</script>
