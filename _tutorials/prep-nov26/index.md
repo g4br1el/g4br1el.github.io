@@ -1,7 +1,7 @@
 ---
 layout: page
-title: "FSDP2 Mastery"
-description: "[Nov 26] FP32 / TF32 / FP16 / BF16 / FP8 — exponent vs mantissa bits, dynamic range vs precision"
+title: "[Nov 26] Float formats"
+description: "FP32 / TF32 / FP16 / BF16 / FP8 — exponent vs mantissa bits, dynamic range vs precision"
 permalink: /heap/nov26
 tutorial: prep-nov26
 type: index
