@@ -1,0 +1,396 @@
+---
+layout: tutorial
+tutorial: prep-nov26
+type: lesson
+lesson: 7
+total: 12
+title: "Lesson 7: Xavier/He - Deriving Var(W) from Signal Propagation"
+tags: []
+permalink: /heap/nov26/007/
+---
+
+
+    <div class="box">
+        <strong>One lemma does all the work:</strong> Var(Σ w<sub>i</sub>x<sub>i</sub>) = n · Var(w) · E[x²].
+        Xavier, He, the 1/√d<sub>k</sub> in attention and the classic sharded-initialization bug are all applications of it.
+    </div>
+    <p><span class="verify">[verify]</span> marks claims from memory that were not retrieved in this session.</p>
+
+
+<!-- ============================================================ -->
+<h2 id="s1">1. Why scale compounds</h2>
+<p>For a plain MLP, h<sub>l</sub> = f(W<sub>l</sub>h<sub>l−1</sub>). If each layer multiplies the signal's mean square by a factor c, then after L layers the factor is c<sup>L</sup>:</p>
+<div class="f">0.9<sup>100</sup> ≈ 2.66 × 10<sup>−5</sup> &nbsp;&nbsp;|&nbsp;&nbsp; 1.1<sup>100</sup> ≈ 1.38 × 10<sup>4</sup></div>
+<p>The same applies backward to gradients. Initialization aims for c ≈ 1 in <em>both</em> directions at step 0.</p>
+<div class="box warn"><strong>Symmetry:</strong> all-zero (or all-equal) weights give identical rows, identical outputs and identical gradients, so the neurons never differentiate. Weights need random, zero-mean initialization. Biases at zero are fine. Deliberately zero-initializing a <em>final</em> projection in a residual branch is a different, intentional trick (Section 7, Lesson 8).</div>
+
+<!-- ============================================================ -->
+<h2 id="s2">2. The variance lemma</h2>
+<p>Let z = Σ<sub>i=1</sub><sup>n</sup> w<sub>i</sub>x<sub>i</sub>. The w<sub>i</sub> are i.i.d. with E[w] = 0 and independent of x. The x<sub>i</sub> may have any mean.</p>
+<div class="f">
+    E[z] = Σ E[w<sub>i</sub>] E[x<sub>i</sub>] = 0<br>
+    Var(z) = E[z²] = Σ<sub>i</sub>Σ<sub>j</sub> E[w<sub>i</sub>w<sub>j</sub>] E[x<sub>i</sub>x<sub>j</sub>] = Σ<sub>i</sub> E[w<sub>i</sub>²] E[x<sub>i</sub>²]<br>
+    <strong>Var(z) = n · Var(w) · E[x²]</strong>
+</div>
+<p>The cross terms vanish because E[w<sub>i</sub>w<sub>j</sub>] = E[w<sub>i</sub>]E[w<sub>j</sub>] = 0 for i ≠ j.</p>
+<div class="box ok">
+    <strong>Two nuances that impress interviewers:</strong>
+    <ol>
+        <li><strong>E[x²], not Var(x).</strong> They coincide only if E[x] = 0, which holds for tanh and linear layers but not for ReLU or sigmoid outputs. Writing Var(x) is the most common whiteboard mistake.</li>
+        <li><strong>Correlated inputs do not break the lemma at init.</strong> The independence of the <em>weights</em> kills the cross terms. For a fixed input, Var<sub>W</sub>(z) = Var(w)·‖x‖², so the quantity being propagated is the mean square ‖x‖²/n.</li>
+    </ol>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s3">3. Forward and backward conditions</h2>
+<p>Notation: y<sub>l</sub> = W<sub>l</sub>x<sub>l−1</sub>, x<sub>l</sub> = f(y<sub>l</sub>). W<sub>l</sub> has shape (n<sub>out</sub>, n<sub>in</sub>), like <code>nn.Linear.weight</code>.</p>
+
+<h3>3.1 Forward (linear regime, e.g. tanh near 0, where f(y) ≈ y and f′(0) = 1)</h3>
+<div class="f">Var(y<sub>l</sub>) = n<sub>in</sub> · Var(W<sub>l</sub>) · Var(y<sub>l−1</sub>) &nbsp;⇒&nbsp; <strong>n<sub>in</sub> · Var(W) = 1</strong></div>
+
+<h3>3.2 Backward</h3>
+<div class="f">
+    ∂L/∂x<sub>l−1</sub> = W<sub>l</sub><sup>T</sup> (∂L/∂y<sub>l</sub>), &nbsp;&nbsp; ∂L/∂y<sub>l</sub> = (∂L/∂x<sub>l</sub>) ⊙ f′(y<sub>l</sub>)<br>
+    Each component of W<sup>T</sup>g sums over n<sub>out</sub> terms ⇒ Var(∂L/∂x<sub>l−1</sub>) = n<sub>out</sub> · Var(W) · E[(∂L/∂y<sub>l</sub>)²]<br>
+    With f′ ≈ 1: &nbsp;<strong>n<sub>out</sub> · Var(W) = 1</strong>
+</div>
+
+<h3>3.3 Weight gradients</h3>
+<div class="f">∂L/∂W<sub>l</sub> = (∂L/∂y<sub>l</sub>) x<sub>l−1</sub><sup>T</sup> &nbsp;⇒&nbsp; Var ≈ E[x<sub>l−1</sub>²] · E[(∂L/∂y<sub>l</sub>)²]</div>
+<p>If both conditions held, activations and back-propagated gradients would have equal scale in every layer. Weight gradients would then also be comparable across layers, so a single learning rate fits all of them.</p>
+
+<!-- ============================================================ -->
+<h2 id="s4">4. Glorot/Xavier: the compromise</h2>
+<p>Both conditions can only hold together if n<sub>in</sub> = n<sub>out</sub>. Glorot and Bengio take the harmonic mean of the two ideal variances 1/n<sub>in</sub> and 1/n<sub>out</sub>:</p>
+<div class="f"><strong>Var(W) = 2 / (n<sub>in</sub> + n<sub>out</sub>)</strong></div>
+<p>The paper's <em>normalized initialization</em> is the uniform form. Since Var(U[−a, a]) = a²/3:</p>
+<div class="f">W ~ U[−a, a], &nbsp; a = √(6 / (n<sub>in</sub> + n<sub>out</sub>))</div>
+<p>"Xavier normal", N(0, 2/(n<sub>in</sub>+n<sub>out</sub>)), is a library variant with the same variance, not the paper's formula.</p>
+
+<h3>4.1 The baseline it replaced</h3>
+<p>The paper's "standard" heuristic was U[−1/√n, 1/√n]. That gives Var(W) = 1/(3n), so the forward factor per layer in the linear regime is n · 1/(3n) = <strong>1/3</strong>. After 10 layers the variance has shrunk by 3<sup>−10</sup> ≈ 1.7 × 10<sup>−5</sup>.</p>
+
+<h3>4.2 Worked example: 512 → 256</h3>
+<div class="f">Var(W) = 2/768 ≈ 2.604 × 10<sup>−3</sup>, &nbsp; std ≈ 0.0510, &nbsp; uniform bound a = √(6/768) ≈ 0.0884</div>
+
+<h3>4.3 What the paper found empirically</h3>
+<p>From the PMLR abstract:</p>
+<ul>
+    <li>The logistic sigmoid is unsuited to deep nets with random init, because its <strong>non-zero mean</strong> can drive especially the <strong>top hidden layer into saturation</strong>.</li>
+    <li>Saturated units can move out of saturation by themselves, but slowly. This explains training plateaus.</li>
+    <li>A non-linearity that saturates less (softsign) can be beneficial.</li>
+    <li>Training is harder when the singular values of each layer's Jacobian are far from 1. This motivates the normalized initialization, which gave substantially faster convergence.</li>
+</ul>
+<p>The paper also compares cross-entropy with quadratic cost and reports fewer plateaus with cross-entropy. <span class="verify">[verify]</span></p>
+
+<!-- ============================================================ -->
+<h2 id="s5">5. He/Kaiming: the ReLU correction</h2>
+<p>The pre-activation y = Wx is symmetric with zero mean, because W is, even though x = ReLU(·) is not zero-mean. Therefore:</p>
+<div class="f">E[ReLU(y)²] = ∫<sub>0</sub><sup>∞</sup> y² p(y) dy = ½ E[y²] = ½ Var(y)</div>
+<p>Plug this into the lemma (with E[x²], not Var(x)):</p>
+<div class="f">
+    Forward: Var(y<sub>l</sub>) = ½ · n<sub>in</sub> · Var(W) · Var(y<sub>l−1</sub>) ⇒ <strong>Var(W) = 2 / n<sub>in</sub></strong>, &nbsp;std = √(2/n<sub>in</sub>)<br>
+    Backward: f′(y) = 1[y &gt; 0], E[f′²] = ½ ⇒ Var(W) = 2 / n<sub>out</sub>
+</div>
+
+<h3>5.1 Why choosing one fan mode is enough</h3>
+<p>Use fan_in mode (forward exact). The backward factor per layer is then ½ · n<sub>l</sub> · 2/n<sub>l−1</sub> = n<sub>l</sub>/n<sub>l−1</sub>, which telescopes:</p>
+<div class="f">∏<sub>l=1</sub><sup>L</sup> n<sub>l</sub>/n<sub>l−1</sub> = n<sub>L</sub>/n<sub>0</sub></div>
+<p>The mismatch is bounded by the ratio of the first and last widths and does <strong>not</strong> compound with depth. Fan_out mode gives the mirror result: forward ratio n<sub>0</sub>/n<sub>L</sub>.</p>
+
+<h3>5.2 Leaky ReLU / PReLU with slope a</h3>
+<div class="f">E[x²] = ½(1 + a²) Var(y) ⇒ Var(W) = 2 / ((1 + a²) · n<sub>in</sub>), &nbsp; gain = √(2/(1 + a²))</div>
+<p>For GELU/SiLU there is no equally clean closed form. In practice people use He- or Xavier-style scales, or a fixed small std combined with normalization (Lesson 8).</p>
+
+<!-- ============================================================ -->
+<h2 id="s6">6. Gains and framework conventions</h2>
+<p>In general: Xavier std = gain · √(2/(fan_in + fan_out)), and Kaiming std = gain / √fan_mode.</p>
+<table>
+    <thead><tr><th>Scheme</th><th>Distribution</th><th>PyTorch</th><th>Note</th></tr></thead>
+    <tbody>
+    <tr><td>Xavier uniform</td><td>U(± gain·√(6/(fi+fo)))</td><td><code>xavier_uniform_</code></td><td>Paper's form. Keras Dense default is <code>glorot_uniform</code> <span class="verify">[verify]</span></td></tr>
+    <tr><td>Xavier normal</td><td>N(0, gain²·2/(fi+fo))</td><td><code>xavier_normal_</code></td><td>Default gain = 1. Pass <code>calculate_gain("tanh")</code> for tanh</td></tr>
+    <tr><td>He normal</td><td>N(0, gain²/fan_mode)</td><td><code>kaiming_normal_</code></td><td>Default nonlinearity <code>leaky_relu</code> with a = 0, so gain = √2 (same as ReLU)</td></tr>
+    <tr><td>He uniform</td><td>U(± gain·√(3/fan_mode))</td><td><code>kaiming_uniform_</code></td><td>Same variance as He normal</td></tr>
+    <tr><td><code>nn.Linear</code>/<code>nn.Conv*</code> default</td><td>U(±1/√fan_in), Var = 1/(3·fan_in)</td><td><code>kaiming_uniform_(a=√5)</code></td><td>Equals Glorot's "standard" baseline. Bias also U(±1/√fan_in) <span class="verify">[verify in your version]</span></td></tr>
+    </tbody>
+</table>
+<p><strong>Gains</strong> (<code>nn.init.calculate_gain</code>): linear/conv/sigmoid = 1, tanh = 5/3 (heuristic), relu = √2, leaky_relu = √(2/(1+a²)), selu = 3/4. <span class="verify">[verify selu]</span></p>
+<p><strong>Why the Linear default is ~1/(3·fan_in):</strong> gain(leaky_relu, a=√5) = √(2/6) = 1/√3, and the bound is (1/√3)·√(3/fan_in) = 1/√fan_in.</p>
+<p><strong>Fan computation:</strong> PyTorch uses fan_in = <code>size(1)</code> × receptive field and fan_out = <code>size(0)</code> × receptive field.</p>
+<ul>
+    <li>Linear weight (out, in): fan_in = in.</li>
+    <li>Conv weight (C<sub>out</sub>, C<sub>in</sub>/groups, k<sub>h</sub>, k<sub>w</sub>): fan_in = (C<sub>in</sub>/groups)·k<sub>h</sub>·k<sub>w</sub>.</li>
+    <li>Hand-rolled code that transposes the weight silently swaps fan_in and fan_out.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="s7">7. Where the derivation breaks (bridge to Lesson 8)</h2>
+
+<h3>7.1 Residual streams</h3>
+<p>Consider x<sub>l+1</sub> = x<sub>l</sub> + F(x<sub>l</sub>). Suppose F preserves variance and its output is uncorrelated with x<sub>l</sub>:</p>
+<div class="f">Var(x<sub>l+1</sub>) = 2 · Var(x<sub>l</sub>) ⇒ <strong>2<sup>L</sup> growth</strong> without normalization</div>
+<p>With pre-LN, F sees a normalized input, so its output variance is roughly a constant c. Then Var(x<sub>L</sub>) ≈ Var(x<sub>0</sub>) + L·c, which is linear growth. Common fixes:</p>
+<ul>
+    <li>Scale the branch outputs, e.g. GPT-2's 1/√N on residual projections <span class="verify">[verify]</span>.</li>
+    <li>Zero-initialize the last BN γ or projection in each branch <span class="verify">[verify: Goyal et al. 2017]</span>.</li>
+    <li>Fixup <span class="verify">[verify]</span>.</li>
+</ul>
+
+<h3>7.2 Attention logits</h3>
+<p>The logit q·k = Σ<sub>i=1</sub><sup>d<sub>k</sub></sup> q<sub>i</sub>k<sub>i</sub> is the same lemma. With independent unit-variance components, Var(q·k) = d<sub>k</sub>. Dividing by √d<sub>k</sub> keeps logits O(1). Otherwise softmax saturates and its gradients vanish, which is the same story as the saturated sigmoid.</p>
+
+<h3>7.3 Embeddings</h3>
+<p>An embedding is a lookup, not a sum, so the fan argument does not apply. A fixed small std (e.g. 0.02) is a common convention <span class="verify">[verify]</span>. With tied embeddings, this choice also sets the scale of the output logits.</p>
+
+<h3>7.4 Limits</h3>
+<p>Initialization fixes the scale at step 0 only. It does not make learning rates transfer across widths; that is a separate topic (μP <span class="verify">[verify]</span>, out of scope).</p>
+
+<!-- ============================================================ -->
+<h2 id="s8">8. Systems angle (Nvidia/Helsing relevance)</h2>
+
+<h3>8.1 The sharded-initialization trap</h3>
+<p>In tensor parallelism with degree p, a weight W of shape (out, in) is split across devices:</p>
+<ul>
+    <li><strong>Column-parallel</strong> splits <em>out</em>: the shard is (out/p, in). fan_in is still correct, but fan_out is wrong, which breaks Xavier.</li>
+    <li><strong>Row-parallel</strong> splits <em>in</em>: the shard is (out, in/p). Calling <code>kaiming_normal_</code> on the local shard computes fan_in = in/p, so the <strong>std is too large by √p</strong>.</li>
+</ul>
+<p>Fixes:</p>
+<ul>
+    <li>Compute the std from the <em>global</em> shape and call <code>normal_(0, std)</code> on the shard.</li>
+    <li>Or initialize the full tensor and scatter it, at the cost of extra memory.</li>
+</ul>
+<p>RNG streams also need care:</p>
+<ul>
+    <li>Tensor-parallel shards need <em>distinct</em> streams.</li>
+    <li>Data-parallel replicas need <em>identical</em> streams.</li>
+</ul>
+<p>Megatron-LM handles this with a model-parallel RNG tracker <span class="verify">[verify]</span>.</p>
+
+<h3>8.2 Meta-device / deferred init</h3>
+<p>Large models are often built on the meta device and materialized per shard. Make sure <code>reset_parameters</code> or your init function sees global shapes or uses an explicit std. Check the exact behavior of your FSDP version. <span class="verify">[verify]</span></p>
+
+<h3>8.3 Low precision (link to Lessons 1 and 5)</h3>
+<ul>
+    <li><strong>Sampling:</strong> sample in FP32, then cast.</li>
+    <li><strong>BF16:</strong> rounds each weight with relative error ≤ 2<sup>−8</sup>. The distribution survives and the range is no issue.</li>
+    <li><strong>FP16:</strong> a typical std of ~0.02 is far above the minimum normal of 6.1×10<sup>−5</sup>, so it is fine.</li>
+    <li><strong>FP8 E4M3:</strong> the minimum normal is 2<sup>−6</sup> ≈ 0.0156. With He init at fan_in 4096 (std ≈ 0.0221), about <strong>52%</strong> of weights fall below it, and ~3.5% flush to zero. This is why FP8 needs per-tensor or block scaling.</li>
+</ul>
+
+<h3>8.4 Step-0 health check</h3>
+<ul>
+    <li>Log the per-layer activation RMS and the ratio RMS<sub>l</sub>/RMS<sub>l−1</sub>.</li>
+    <li>Log the per-layer gradient RMS.</li>
+    <li>Healthy: O(1) values and flat across depth.</li>
+    <li>A geometric trend means an init, fan, gain or residual-scaling bug. Find it before touching the optimizer.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="s9">9. Lab (~40 min)</h2>
+<p>Write down a prediction for each printed row <em>before</em> running. Requires PyTorch ≥ 2.1 for Part 5.</p>
+<pre><code class="language-python">import math
+import torch
+import torch.nn as nn
+
+torch.manual_seed(0)
+
+INITS = {
+    "N(0,1)":        lambda W: nn.init.normal_(W, 0.0, 1.0),
+    "N(0,0.01)":     lambda W: nn.init.normal_(W, 0.0, 0.01),
+    "xavier":        lambda W: nn.init.xavier_normal_(W),
+    "xavier+tanh":   lambda W: nn.init.xavier_normal_(W, gain=nn.init.calculate_gain("tanh")),
+    "he":            lambda W: nn.init.kaiming_normal_(W, nonlinearity="relu"),
+    "torch_default": lambda W: nn.init.kaiming_uniform_(W, a=math.sqrt(5)),
+}
+
+def probe(act, init_fn, depth=50, width=512, batch=256):
+    """Plain MLP at init: per-layer activation RMS and input-gradient RMS."""
+    x = torch.randn(batch, width, requires_grad=True)
+    h, rms = x, []
+    for _ in range(depth):
+        W = init_fn(torch.empty(width, width))      # (out, in), like nn.Linear
+        h = act(h @ W.T)
+        rms.append(h.pow(2).mean().sqrt().item())
+    h.backward(torch.randn_like(h))                 # unit-variance upstream gradient
+    return rms, x.grad.pow(2).mean().sqrt().item()
+
+# Part 1: depth sweep
+for act_name, act in [("tanh", torch.tanh), ("relu", torch.relu)]:
+    print(f"\n== {act_name} ==")
+    for name, fn in INITS.items():
+        rms, g = probe(act, fn)
+        print(f"{name:14s} RMS L1={rms[0]:9.3e} L10={rms[9]:9.3e} "
+              f"L50={rms[-1]:9.3e} | input-grad RMS={g:9.3e}")
+
+# Part 2: nn.Linear default equals Glorot's "standard" baseline
+lin = nn.Linear(1024, 1024)
+print("\nnn.Linear Var(W):", lin.weight.var().item(), " 1/(3*fan_in):", 1 / (3 * 1024))
+
+# Part 3: sharded-init trap (row-parallel, tp=4)
+out_f, in_f, tp = 4096, 4096, 4
+std_full = nn.init.kaiming_normal_(torch.empty(out_f, in_f), nonlinearity="relu").std().item()
+std_naive = nn.init.kaiming_normal_(torch.empty(out_f, in_f // tp), nonlinearity="relu").std().item()
+std_fixed = torch.empty(out_f, in_f // tp).normal_(0, math.sqrt(2 / in_f)).std().item()
+print(f"full={std_full:.4f}  naive shard={std_naive:.4f} (x{std_naive / std_full:.2f})  "
+      f"fixed shard={std_fixed:.4f}")
+
+# Part 4: attention scaling is the same lemma
+d = 128
+q, k = torch.randn(100_000, d), torch.randn(100_000, d)
+s = (q * k).sum(-1)
+print(f"Var(q.k)={s.var().item():.1f} (d={d})  after /sqrt(d): {(s / math.sqrt(d)).var().item():.3f}")
+
+# Part 5 (stretch): He-init weights cast to FP8 E4M3
+W = nn.init.kaiming_normal_(torch.empty(4096, 4096), nonlinearity="relu")
+W8 = W.to(torch.float8_e4m3fn).float()
+print(f"std={W.std().item():.4f}  below E4M3 min normal: "
+      f"{(W.abs() &lt; 2**-6).float().mean().item():.1%}  flushed to 0: "
+      f"{(W8 == 0).float().mean().item():.1%}")
+</code></pre>
+
+<details><summary>Expected behavior (open after running)</summary>
+    <p><strong>Part 1, ReLU:</strong></p>
+    <ul>
+        <li><code>he</code> stays flat.</li>
+        <li><code>xavier</code> loses a factor ½ in variance per layer (RMS × 0.707, so ~3×10<sup>−8</sup> at L50).</li>
+        <li><code>torch_default</code> loses a factor 1/6 per layer.</li>
+        <li><code>N(0,0.01)</code> vanishes: variance factor ½·512·10<sup>−4</sup> ≈ 0.026 per layer.</li>
+        <li><code>N(0,1)</code> grows ~16× in RMS per layer and overflows to inf/NaN around layer 32.</li>
+    </ul>
+    <p><strong>Part 1, tanh:</strong></p>
+    <ul>
+        <li><code>N(0,1)</code> saturates (RMS near 1) and its gradients are unreliable.</li>
+        <li><code>N(0,0.01)</code> and <code>torch_default</code> vanish.</li>
+        <li><code>xavier</code> decays slowly because tanh contracts.</li>
+        <li><code>xavier+tanh</code> (gain 5/3) holds much steadier.</li>
+    </ul>
+    <p><strong>Part 2:</strong> both values ≈ 3.26×10<sup>−4</sup>.</p>
+    <p><strong>Part 3:</strong> the naive shard ratio is ≈ 2.00 = √4.</p>
+    <p><strong>Part 4:</strong> ≈ 128, then ≈ 1.</p>
+    <p><strong>Part 5:</strong> ~52% below min normal, ~3.5% zero.</p>
+</details>
+<p><strong>Stretch task:</strong> add a residual MLP block, x ← x + F(x), with and without a pre-LayerNorm. Plot RMS versus depth and confirm 2<sup>L</sup> growth versus linear growth.</p>
+
+<!-- ============================================================ -->
+<h2 id="s10">10. Interview drills (~15 min)</h2>
+<h3>10.1 Thirty-second answer</h3>
+<blockquote>"For y = Σ w<sub>i</sub>x<sub>i</sub> with zero-mean independent weights, Var(y) = n·Var(w)·E[x²]. Preserving the forward signal needs n<sub>in</sub>·Var(W) = 1. The backward pass goes through Wᵀ, so it needs n<sub>out</sub>·Var(W) = 1. Glorot and Bengio compromise with 2/(n<sub>in</sub>+n<sub>out</sub>), uniform bound √(6/(n<sub>in</sub>+n<sub>out</sub>)), derived in tanh's linear regime. ReLU zeros half of a symmetric pre-activation, so E[x²] = ½Var(y), and He uses 2/n<sub>in</sub>. In practice I check fans on sharded weights, the gain for the nonlinearity and residual-branch scaling, and I verify by logging per-layer activation RMS at step 0."</blockquote>
+
+<h3>10.2 Whiteboard prompts</h3>
+<details><summary>Derive He initialization. Where exactly does the ½ come from?</summary>
+    <p>y = Wx is symmetric with zero mean over W, so E[ReLU(y)²] = ½E[y²]. The lemma uses E[x²], giving Var(y<sub>l</sub>) = ½·n<sub>in</sub>·Var(W)·Var(y<sub>l−1</sub>) and therefore Var(W) = 2/n<sub>in</sub>. Using Var(x) instead of E[x²] gives the wrong answer.</p></details>
+<details><summary>Leaky ReLU with slope 0.2: what is Var(W)?</summary>
+    <p>2/((1 + 0.04)·n<sub>in</sub>) = 1.923/n<sub>in</sub>.</p></details>
+<details><summary>Why is the PyTorch Linear default "too small" for a deep ReLU MLP without normalization?</summary>
+    <p>Var = 1/(3·fan_in). With ReLU, the per-layer variance factor is ½·1/3 = 1/6, so the signal vanishes geometrically. It works in practice because modern nets use normalization and residuals.</p></details>
+<details><summary>At step 0, the residual-stream RMS of your 48-block transformer grows ~1.4× per block. What do you check?</summary>
+    <p>1.4² ≈ 2, which is the 2<sup>L</sup> signature of an unnormalized residual stream with variance-preserving branches. Check in this order:</p>
+    <ol>
+        <li>Is the norm placement what you think (pre- versus post-LN)?</li>
+        <li>Are the branch output projections scaled down or zero-initialized?</li>
+        <li>Are fans computed from global shapes on sharded weights?</li>
+        <li>Are the correct gains used?</li>
+    </ol></details>
+<details><summary>A row-parallel layer was initialized with kaiming_normal_ on each shard (tp = 8). What is the effect and the fix?</summary>
+    <p>fan_in is computed as in/8, so the std is √8 ≈ 2.83× too large. Fix: use std = √(2/in<sub>global</sub>), or initialize the full tensor and scatter it. Also check the RNG stream policy: distinct across TP shards, identical across DP replicas.</p></details>
+
+<!-- ============================================================ -->
+<h2 id="s11">11. Quiz</h2>
+<p>For numeric answers, enter a decimal number (e.g. <code>0.0541</code>). Answers within ±2% are accepted.</p>
+<div class="quiz" id="quiz"></div>
+<p id="score"></p>
+
+<!-- ============================================================ -->
+<h2 id="s12">12. Sources</h2>
+<p><strong>Retrieved in this session</strong></p>
+<ol>
+    <li>X. Glorot, Y. Bengio, "Understanding the difficulty of training deep feedforward neural networks", AISTATS 2010, PMLR 9:249–256. <a href="https://proceedings.mlr.press/v9/glorot10a.html">proceedings.mlr.press/v9/glorot10a.html</a></li>
+    <li>Yoshua Bengio publication page for the same paper. <a href="https://yoshuabengio.org/en/publication/understanding-difficulty-training-deep-feedforward-neural-networks">yoshuabengio.org</a></li>
+</ol>
+<p><strong>To verify (from memory)</strong></p>
+<ul>
+    <li>He et al., "Delving Deep into Rectifiers", arXiv:1502.01852</li>
+    <li>Saxe et al., "Exact solutions to the nonlinear dynamics of learning in deep linear neural networks" (orthogonal init), arXiv:1312.6120</li>
+    <li>Vaswani et al., "Attention Is All You Need", arXiv:1706.03762</li>
+    <li>Goyal et al., "Accurate, Large Minibatch SGD" (zero-γ), arXiv:1706.02677</li>
+    <li>Zhang et al., "Fixup Initialization", arXiv:1901.09321</li>
+    <li>Shoeybi et al., "Megatron-LM", arXiv:1909.08053</li>
+    <li>PyTorch <code>torch.nn.init</code> documentation (gains, fan computation, Linear default)</li>
+</ul>
+
+<script>
+    const Q = [
+        {q:"z = Σ w<sub>i</sub>x<sub>i</sub> with n = 256, Var(w) = 1/512, and inputs from a ReLU with E[x²] = 2. What is Var(z)?", type:"num", a:1,
+            why:"Var(z) = n·Var(w)·E[x²] = 256 · (1/512) · 2 = 1."},
+        {q:"Glorot uniform bound a for a 1024 → 1024 layer?", type:"num", a:0.05413,
+            why:"a = √(6/(1024+1024)) = √(6/2048) ≈ 0.0541."},
+        {q:"He-normal std for a ReLU layer with fan_in = 2048?", type:"num", a:0.03125,
+            why:"std = √(2/2048) = √(1/1024) = 1/32 = 0.03125."},
+        {q:"Glorot's 'standard' baseline U[−1/√n, 1/√n]: per-layer forward variance factor in the linear regime?", type:"num", a:1/3,
+            why:"Var(U[−a,a]) = a²/3 = 1/(3n), so the factor is n·1/(3n) = 1/3. Signals shrink geometrically."},
+        {q:"Why does the He derivation use E[x²] rather than Var(x)?", type:"mc",
+            opts:["ReLU outputs have a non-zero mean, and the lemma needs the second moment of x",
+                "Var(x) is always larger than E[x²]",
+                "Because the weights are uniformly distributed",
+                "It does not matter: they are equal for any activation"], a:0,
+            why:"Var(z) = n·Var(w)·E[x²]. E[x²] = Var(x) + E[x]², which differs from Var(x) whenever E[x] ≠ 0, as for ReLU outputs. (Var(x) ≤ E[x²], never larger.)"},
+        {q:"Row-parallel layer, tp = 4, kaiming_normal_ called on each local shard. By what factor is the std too large?", type:"num", a:2,
+            why:"The shard has in/4 columns, so fan_in is 4× too small, variance is 4× too large, and the std is √4 = 2× too large."},
+        {q:"No normalization; each residual branch F preserves variance and is uncorrelated with its input. After L blocks, Var(x<sub>L</sub>) ≈ ?", type:"mc",
+            opts:["(L+1)·Var(x₀), linear growth","2<sup>L</sup>·Var(x₀), exponential growth","Var(x₀), constant","It shrinks"], a:1,
+            why:"Var(x + F(x)) = Var(x) + Var(F(x)) = 2·Var(x) per block. Pre-LN turns this into linear growth, because F sees normalized inputs."},
+        {q:"What is PyTorch's default initialization for nn.Linear weights?", type:"mc",
+            opts:["xavier_uniform_","U(±1/√fan_in), i.e. Var = 1/(3·fan_in)","He normal with fan_in","N(0, 0.02²)"], a:1,
+            why:"kaiming_uniform_(a=√5): gain = 1/√3, bound = (1/√3)·√(3/fan_in) = 1/√fan_in. This is Glorot's 'standard' baseline."},
+        {q:"He init in fan_out mode, layer widths n₀ … n_L. Ratio of output to input activation variance at init?", type:"mc",
+            opts:["Exactly 1","n₀ / n_L","2<sup>L</sup>","(n₀ / n_L)<sup>L</sup>"], a:1,
+            why:"The per-layer forward factor is ½·n_{l−1}·2/n_l = n_{l−1}/n_l. The product telescopes to n₀/n_L: bounded, no compounding with depth."},
+        {q:"Why are attention logits divided by √d<sub>k</sub>?", type:"mc",
+            opts:["Var(q·k) = d_k·Var(q)·Var(k) for independent zero-mean components; scaling keeps logits O(1) so softmax does not saturate",
+                "To make the softmax sum to one",
+                "To reduce memory traffic",
+                "Because d_k is the fan_out of W_o"], a:0,
+            why:"It is the same variance lemma. Saturated softmax produces vanishing gradients, analogous to a saturated sigmoid."},
+        {q:"According to Glorot & Bengio, why is the logistic sigmoid problematic with random init in deep nets?", type:"mc",
+            opts:["Its non-zero mean can drive the top hidden layer into saturation",
+                "Its derivative is unbounded",
+                "It is not differentiable at 0",
+                "It causes exploding activations"], a:0,
+            why:"Stated in the paper's abstract. Saturated units recover only slowly, which explains plateaus."},
+        {q:"Leaky ReLU with slope 0.2, fan_in = 1000. He variance Var(W)?", type:"num", a:2/(1.04*1000),
+            why:"Var(W) = 2/((1 + a²)·n) = 2/(1.04 · 1000) ≈ 0.001923."}
+    ];
+
+    const root = document.getElementById("quiz"), done = {};
+    Q.forEach((it, i) => {
+        const s = document.createElement("section");
+        let h = `<p><b>Q${i + 1}.</b> ${it.q}</p>`;
+        h += it.type === "num"
+            ? `<input id="in${i}" type="text" inputmode="decimal">`
+            : it.opts.map((o, j) => `<label><input type="radio" name="q${i}" value="${j}"> ${o}</label><br>`).join("");
+        h += `<br><button data-i="${i}">Check</button><p class="fb" id="fb${i}"></p>`;
+        s.innerHTML = h;
+        root.appendChild(s);
+    });
+
+    root.addEventListener("click", e => {
+        if (e.target.tagName !== "BUTTON") return;
+        const i = +e.target.dataset.i, it = Q[i];
+        let ok;
+        if (it.type === "num") {
+            const v = parseFloat(document.getElementById("in" + i).value.replace(",", "."));
+            const tol = Number.isInteger(it.a) ? 1e-9 : 0.02 * Math.abs(it.a);
+            ok = Number.isFinite(v) && Math.abs(v - it.a) <= tol;
+        } else {
+            const c = document.querySelector(`input[name=q${i}]:checked`);
+            ok = !!c && +c.value === it.a;
+        }
+        const fb = document.getElementById("fb" + i);
+        fb.className = "fb " + (ok ? "ok" : "bad");
+        fb.innerHTML = (ok ? "Correct. " : "Not quite. ") + it.why;
+        done[i] = ok;
+        document.getElementById("score").textContent =
+            `Score: ${Object.values(done).filter(Boolean).length}/${Q.length}`;
+    });
+</script>

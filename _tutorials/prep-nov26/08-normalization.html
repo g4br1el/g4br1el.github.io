@@ -1,0 +1,531 @@
+---
+layout: tutorial
+tutorial: prep-nov26
+type: lesson
+lesson: 8
+total: 12
+title: "Lesson 8: Normalization - BN, LN, RMSNorm, Pre- vs Post-LN"
+tags: []
+permalink: /heap/nov26/008/
+---
+
+
+    <div class="box">
+        <strong>Three ideas that do most of the work:</strong>
+        <ol>
+            <li><strong>Scale invariance.</strong> LN(αx) = LN(x). So gradients are orthogonal to the incoming weights, they scale like 1/‖W‖, and the effective learning rate becomes η/‖W‖².</li>
+            <li><strong>The backward pass is a projection scaled by 1/σ.</strong> The input gradient sums to zero and is orthogonal to x − μ.</li>
+            <li><strong>Computing the statistics is a numerics problem.</strong> The naive formula E[x²] − E[x]² cancels catastrophically, and squaring in FP16 overflows above 256.</li>
+        </ol>
+    </div>
+    <p><span class="verify">[verify]</span> marks claims from memory. No external sources were retrieved for this lesson.</p>
+
+<!-- ============================================================ -->
+<h2 id="s1">1. What normalization buys (and what it does not)</h2>
+<ul>
+    <li><strong>The forward scale no longer depends on the init.</strong> A layer feeding a norm can have any weight scale. This removes the compounding problem from Lesson 7 for that layer, but not for the residual sum, the embeddings or the output head.</li>
+    <li><strong>Scale invariance changes the optimization geometry</strong> (Section 4.3). Weight norm becomes a hidden learning-rate knob, and weight decay controls it.</li>
+    <li><strong>Why BN works is still debated.</strong> The original "internal covariate shift" explanation is disputed. Santurkar et al. argue that the main effect is a smoother loss landscape <span class="verify">[verify]</span>. In an interview, say "the mechanism is debated" rather than repeating the ICS story as fact.</li>
+</ul>
+<div class="box warn">Normalization fixes the <em>scale</em> of activations, not their <em>direction</em> or <em>rank</em>. Dead ReLUs, collapsed representations and the growth of the residual stream all survive it.</div>
+
+<!-- ============================================================ -->
+<h2 id="s2">2. The zoo: which axes are reduced?</h2>
+<table>
+    <thead><tr><th>Norm</th><th>Statistics over</th><th>Depends on batch?</th><th>Centers?</th><th>Typical use</th></tr></thead>
+    <tbody>
+    <tr><td>BatchNorm</td><td>(N, H, W), separately for each channel C</td><td><strong>Yes.</strong> Train and eval behave differently.</td><td>Yes</td><td>CNNs, vision backbones</td></tr>
+    <tr><td>LayerNorm</td><td>Feature dimension(s), separately for each token or sample</td><td>No</td><td>Yes</td><td>Transformers</td></tr>
+    <tr><td>RMSNorm</td><td>Feature dimension, separately for each token</td><td>No</td><td><strong>No</strong> (no mean, usually no bias)</td><td>LLaMA-family LLMs, T5-style models <span class="verify">[verify]</span></td></tr>
+    <tr><td>GroupNorm</td><td>Groups of channels × (H, W), separately for each sample</td><td>No</td><td>Yes</td><td>Detection and segmentation with small batches, diffusion U-Nets</td></tr>
+    <tr><td>InstanceNorm</td><td>(H, W), separately for each (N, C)</td><td>No</td><td>Yes</td><td>Style transfer</td></tr>
+    </tbody>
+</table>
+<p>GroupNorm with one group is a LayerNorm over (C, H, W). GroupNorm with C groups is InstanceNorm.</p>
+
+<!-- ============================================================ -->
+<h2 id="s3">3. Forward definitions</h2>
+<div class="f">
+    <strong>LN:</strong> μ = (1/n)Σx<sub>i</sub>, &nbsp; σ² = (1/n)Σ(x<sub>i</sub> − μ)², &nbsp; ŷ = (x − μ)/√(σ² + ε), &nbsp; y = γ ⊙ ŷ + β<br>
+    <strong>RMSNorm:</strong> r = √((1/n)Σx<sub>i</sub>² + ε), &nbsp; ŷ = x / r, &nbsp; y = g ⊙ ŷ<br>
+    <strong>BN (train):</strong> the same as LN, but μ and σ² are taken over (N, H, W) for each channel. <strong>BN (eval):</strong> the running μ and σ² are used instead.
+</div>
+<ul>
+    <li><strong>Biased variance.</strong> The normalization uses the biased (1/n) variance. BN's running variance is updated with the <em>unbiased</em> batch variance <span class="verify">[verify in your PyTorch version]</span>.</li>
+    <li><strong>Where ε goes.</strong> Placing ε inside the square root, as above, is the common convention. Some implementations use 1/(σ + ε). The two are not identical when σ is near 0, and this matters when porting checkpoints.</li>
+    <li><strong>Typical ε values:</strong>
+        <ul>
+            <li>1e-5 is the default for <code>nn.LayerNorm</code> and BN.</li>
+            <li>1e-5 or 1e-6 is common in LLM RMSNorm configs <span class="verify">[verify]</span>.</li>
+            <li><code>torch.nn.RMSNorm</code> defaults to <code>eps=None</code>, which means <code>torch.finfo(x.dtype).eps</code>. That is 2<sup>−7</sup> ≈ 0.0078 for BF16 input, which is not negligible <span class="verify">[verify]</span>.</li>
+        </ul>
+    </li>
+    <li><strong>What RMSNorm gives up.</strong> It drops re-centering. You lose invariance to a common shift of the inputs and gain one fewer reduction. Zhang &amp; Sennrich report comparable quality at lower cost <span class="verify">[verify numbers]</span>.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="s4">4. Backward: the Jacobian and its consequences</h2>
+
+<h3>4.1 Derivation (LN, without γ and β)</h3>
+<p>Let s = √(σ² + ε). The partial derivatives of the statistics are:</p>
+<div class="f">∂μ/∂x<sub>j</sub> = 1/n, &nbsp;&nbsp; ∂s/∂x<sub>j</sub> = (x<sub>j</sub> − μ)/(n·s) = ŷ<sub>j</sub>/n</div>
+<p>Apply the quotient rule to ŷ<sub>i</sub> = (x<sub>i</sub> − μ)/s:</p>
+<div class="f">∂ŷ<sub>i</sub>/∂x<sub>j</sub> = (δ<sub>ij</sub> − 1/n)/s − ((x<sub>i</sub> − μ)/s²)·(ŷ<sub>j</sub>/n)</div>
+<p>Since (x<sub>i</sub> − μ)/s = ŷ<sub>i</sub>, both terms share the factor 1/s:</p>
+<div class="f"><strong>J = (1/s) · (I − (1/n)·11ᵀ − (1/n)·ŷŷᵀ)</strong></div>
+<p>For RMSNorm, drop the 11ᵀ term: J = (1/r)(I − (1/n)ŷŷᵀ).</p>
+
+<h3>4.2 The backward formula you implement</h3>
+<p>Let ĝ = γ ⊙ g<sub>y</sub>, where g<sub>y</sub> = ∂L/∂y. J is symmetric, so:</p>
+<div class="f">
+    g<sub>x</sub> = (1/s) · (ĝ − mean(ĝ) − ŷ · mean(ĝ ⊙ ŷ))<br>
+    RMSNorm: g<sub>x</sub> = (1/r) · (ĝ − ŷ · mean(ĝ ⊙ ŷ))<br>
+    Parameter gradients: dγ = Σ<sub>tokens</sub> g<sub>y</sub> ⊙ ŷ, &nbsp; dβ = Σ<sub>tokens</sub> g<sub>y</sub>
+</div>
+<p>Two consequences:</p>
+<ul>
+    <li><strong>The input gradient is projected.</strong> J annihilates 1 (shift invariance) and, up to ε, also annihilates ŷ (scale invariance). So g<sub>x</sub> sums to zero and is orthogonal to x − μ.</li>
+    <li><strong>The gain is 1/s.</strong> The spectral norm of J is at most 1/s. If a large residual stream (pre-LN, Section 6) feeds the norm, the gradient into the stream is attenuated by 1/rms(stream).</li>
+</ul>
+
+<h3>4.3 Scale invariance and the effective learning rate</h3>
+<p>Let W feed a norm, so L(αW) = L(W) for α &gt; 0. Differentiate with respect to α at α = 1:</p>
+<div class="f">⟨∇<sub>W</sub>L, W⟩ = 0, &nbsp;&nbsp; ∇L(αW) = (1/α) ∇L(W)</div>
+<p>Now take a plain SGD step w′ = w − ηg. Because g ⊥ w:</p>
+<div class="f">‖w′‖² = ‖w‖² + η²‖g‖² &nbsp;⇒&nbsp; the norm only grows</div>
+<p>The angle of the update is η‖g‖/‖w‖. Since ‖g‖ ∝ 1/‖w‖, it follows that:</p>
+<div class="f"><strong>η<sub>eff</sub> ∝ η / ‖w‖²</strong></div>
+<ul>
+    <li>Without weight decay, ‖w‖ grows and the effective learning rate decays on its own.</li>
+    <li>Weight decay shrinks ‖w‖, which raises η<sub>eff</sub>. The two forces reach an equilibrium. This is why weight decay "matters" even though it cannot change the function the network computes <span class="verify">[verify: van Laarhoven 2017]</span>.</li>
+    <li>With Adam, the update magnitude is roughly η regardless of ‖g‖, so the angular step scales like η/‖w‖ instead.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="s5">5. Numerics of the statistics (links to Lessons 1 and 3)</h2>
+
+<h3>5.1 Catastrophic cancellation in E[x²] − E[x]²</h3>
+<p>Let u be the unit roundoff and write E[x²] = μ² + σ². Computing E[x²] in floating point introduces an absolute error of about u·(μ² + σ²) ≈ u·μ². The result is garbage once this error is comparable to σ²:</p>
+<div class="f">Failure when μ/σ ≳ u<sup>−1/2</sup>: &nbsp; FP32 (u = 2<sup>−24</sup>) → <strong>4096</strong>, &nbsp; FP16 (2<sup>−11</sup>) → ~45, &nbsp; BF16 (2<sup>−9</sup>) → ~22</div>
+<p>This is a lower bound. Accumulating over n terms makes it worse. When the result becomes negative, rsqrt(var + ε) returns <strong>NaN</strong>. Realistic triggers:</p>
+<ul>
+    <li>Uncentered inputs such as raw pixels in 0–255, sensor offsets or timestamps.</li>
+    <li>BN on channels with a large DC component.</li>
+    <li>Any statistics accumulated in BF16.</li>
+</ul>
+
+<h3>5.2 The fix: two-pass, Welford, and the parallel merge</h3>
+<p>Center first (two-pass), or use Welford's online update. GPU kernels reduce per thread, warp or block and then merge partial (n, μ, M2) triples with the Chan et al. formula:</p>
+<div class="f">
+    n = n<sub>a</sub> + n<sub>b</sub>, &nbsp; δ = μ<sub>b</sub> − μ<sub>a</sub>, &nbsp; μ = μ<sub>a</sub> + δ·n<sub>b</sub>/n, &nbsp; M2 = M2<sub>a</sub> + M2<sub>b</sub> + δ²·n<sub>a</sub>n<sub>b</sub>/n, &nbsp; Var = M2/n
+</div>
+<p>Every term in the merge is a sum of non-negative quantities. Nothing large is subtracted, so there is no cancellation.</p>
+
+<h3>5.3 RMSNorm in FP16: squaring overflows</h3>
+<p>The FP16 maximum is 65504, and √65504 ≈ 255.9. Any activation with |x| ≥ 256 gives x² = inf. Then the mean is inf, rsqrt(inf) = 0, and <strong>the whole token is silently set to zero</strong>. There is no NaN and no alarm. Large-magnitude outlier dimensions in LLM residual streams make this realistic <span class="verify">[verify: "massive activations", Sun et al. 2024]</span>.</p>
+<p>The fix is to upcast to FP32 <em>before</em> squaring, as reference LLaMA-style implementations do <span class="verify">[verify]</span>, and to cast the output back.</p>
+<div class="box warn">Subtlety: <code>x.pow(2).mean()</code> on an FP16 tensor may accumulate internally in FP32 and survive. <code>.sum()</code> overflows once the total exceeds 65504. The elementwise square overflows regardless of what accumulator the reduction uses.</div>
+
+<h3>5.4 Mixed precision in practice</h3>
+<ul>
+    <li><strong>Autocast:</strong> PyTorch autocast puts <code>layer_norm</code> and <code>group_norm</code> on its FP32 list, so the output dtype may be FP32 <span class="verify">[verify in your version]</span>. cuDNN BN accepts FP16 inputs with FP32 parameters and statistics <span class="verify">[verify]</span>.</li>
+    <li><strong>Fused kernels</strong> (Apex, Transformer Engine, Triton) read BF16 or FP16, accumulate statistics in FP32 and write BF16 or FP16. Save mean and rstd in FP32 for the backward pass.</li>
+    <li><strong>ε in low precision:</strong> 1e-5 and 1e-6 are FP16 <em>subnormals</em> (the minimum normal is 6.1e-5). Add ε in FP32.</li>
+    <li><strong>γ:</strong> γ is a parameter like any other. Keep it in FP32 or master precision (Lesson 2).</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="s6">6. Pre-LN vs post-LN</h2>
+<div class="f">Post-LN: x<sub>l+1</sub> = LN(x<sub>l</sub> + F(x<sub>l</sub>)) &nbsp;&nbsp;|&nbsp;&nbsp; Pre-LN: x<sub>l+1</sub> = x<sub>l</sub> + F(LN(x<sub>l</sub>)), with a final LN before the head</div>
+<table>
+    <thead><tr><th></th><th>Post-LN (original Transformer)</th><th>Pre-LN (GPT-2 onward <span class="verify">[verify]</span>)</th></tr></thead>
+    <tbody>
+    <tr><td>Stream scale at init</td><td>Fixed at ≈ 1 after every block</td><td>Grows: Var(x<sub>L</sub>) ≈ Var(x<sub>0</sub>) + L·c (Lesson 7)</td></tr>
+    <tr><td>Gradient path</td><td>No pure identity path. Every block's gradient goes through an LN Jacobian.</td><td>Exact identity term: ∂x<sub>L</sub>/∂x<sub>l</sub> = I + (branch terms)</td></tr>
+    <tr><td>Warmup</td><td>Typically required. Xiong et al.: gradients near the output are large at init <span class="verify">[verify]</span></td><td>Often trainable with little or no warmup <span class="verify">[verify]</span></td></tr>
+    <tr><td>Typical failure</td><td>Early divergence; sensitive to learning rate</td><td>Later blocks contribute relatively little (ratio ‖F‖/‖x‖ ≈ 1/√l); stream magnitudes and outliers grow</td></tr>
+    <tr><td>Quality when both train</td><td>Often reported as equal or better <span class="verify">[verify]</span></td><td>Robust default at scale</td></tr>
+    </tbody>
+</table>
+<p>Variants worth naming:</p>
+<ul>
+    <li><strong>DeepNorm:</strong> LN(α·x + F(x)) with α &gt; 1 and down-scaled branch init <span class="verify">[verify]</span>.</li>
+    <li><strong>Admin:</strong> Liu et al. argue that post-LN instability comes from amplified dependence on the residual branches <span class="verify">[verify]</span>.</li>
+    <li><strong>Sandwich-LN.</strong></li>
+    <li><strong>QK-norm:</strong> LN applied to q and k so that attention logits cannot grow. This is the same mechanism as √d<sub>k</sub> from Lesson 7, but enforced during training <span class="verify">[verify: ViT-22B]</span>.</li>
+</ul>
+<div class="box ok"><strong>A link interviewers like:</strong> in pre-LN, each block's norm divides by rms(x<sub>l</sub>) ≈ √l. Both the forward contribution and the gradient through that branch are therefore scaled down with depth. Residual scaling such as 1/√(2N) and zero-init of the output projections (Lesson 7) change this trade-off.</div>
+
+<!-- ============================================================ -->
+<h2 id="s7">7. BatchNorm in production</h2>
+
+<h3>7.1 Running statistics</h3>
+<ul>
+    <li><strong>PyTorch's momentum convention:</strong> running = (1 − m)·running + m·batch, with default m = 0.1. Keras and TF use the opposite convention, with momentum ≈ 0.99 as the decay <span class="verify">[verify]</span>. <code>momentum=None</code> gives a cumulative average.</li>
+    <li><strong>Small batches:</strong> per-GPU batches of 1–4 give noisy statistics. Fixes:
+        <ul>
+            <li>SyncBN, which combines per-rank mean, variance and count, not raw sums of squares.</li>
+            <li>GroupNorm.</li>
+            <li>Frozen BN statistics during fine-tuning.</li>
+        </ul>
+        With N = 1 and no spatial dimensions, <code>BatchNorm1d</code> raises an error in training mode.</li>
+    <li><strong>DDP:</strong> by default, buffers (the running statistics) are broadcast from rank 0 <span class="verify">[verify: <code>broadcast_buffers=True</code>]</span>. Without SyncBN, each rank normalizes with its <em>local</em> batch statistics.</li>
+    <li><strong>Batch coupling:</strong> samples in a batch influence each other. This can leak information, for example in contrastive learning, which is why MoCo uses shuffle-BN <span class="verify">[verify]</span>.</li>
+</ul>
+
+<h3>7.2 Folding BN into the preceding conv (inference)</h3>
+<p>Let s<sub>c</sub> be the per-channel scale:</p>
+<div class="f">s<sub>c</sub> = γ<sub>c</sub> / √(σ²<sub>run,c</sub> + ε), &nbsp;&nbsp; W′<sub>c</sub> = s<sub>c</sub> · W<sub>c</sub>, &nbsp;&nbsp; b′<sub>c</sub> = s<sub>c</sub>·(b<sub>c</sub> − μ<sub>run,c</sub>) + β<sub>c</sub></div>
+<p>TensorRT and similar compilers fold BN automatically. The numerics trap:</p>
+<ul>
+    <li>A nearly dead channel with a tiny σ²<sub>run</sub> gets an enormous s<sub>c</sub>.</li>
+    <li>Under <strong>per-tensor</strong> INT8 weight quantization, that one channel sets the scale, and most other weights round to 0.</li>
+    <li>Folded weights therefore need <strong>per-channel</strong> weight quantization. Also check the FP16 range of W′.</li>
+</ul>
+<p>This is the BN version of the outlier story from SmoothQuant (Lesson 10).</p>
+
+<h3>7.3 "Great in train mode, bad in eval mode": checklist</h3>
+<ol>
+    <li><code>model.eval()</code> was called, or forgotten, or a submodule was put back into train mode.</li>
+    <li>Running statistics are stale or were computed under different preprocessing.</li>
+    <li>The momentum convention was mixed up when porting from TF.</li>
+    <li>Small per-GPU batches were used without SyncBN.</li>
+    <li>The BN statistics were frozen, or should have been, during fine-tuning.</li>
+</ol>
+
+<!-- ============================================================ -->
+<h2 id="s8">8. Systems angle (Nvidia/Helsing relevance)</h2>
+
+<h3>8.1 Normalization is memory-bound</h3>
+<p>The LN forward pass in BF16 reads 2 B and writes 2 B per element and does ~8 FLOPs. That is an arithmetic intensity of ~2 FLOP/B, far below the ridge point of H100-class GPUs (a few hundred FLOP/B <span class="verify">[verify specs]</span>). So the goal is to minimize memory traffic.</p>
+
+<h3>8.2 Fuse add and norm</h3>
+<ul>
+    <li><strong>Unfused:</strong> the add reads x and F(x) and writes x′; the norm then reads x′ and writes y. That is 5 tensor passes.</li>
+    <li><strong>Fused:</strong> read x and F(x), write x′ and y. That is 4 passes, about 20% less traffic.</li>
+</ul>
+<p>Residual-add + dropout + LN fusions in Apex and Transformer Engine exist for exactly this reason.</p>
+
+<h3>8.3 One pass vs two passes</h3>
+<p>If a row with d ≲ 8–16K elements fits in registers or shared memory, a two-pass computation <em>on chip</em> is essentially free and numerically safe. Single-pass Welford matters when the row must be streamed from memory.</p>
+
+<h3>8.4 Backward-pass reductions and determinism</h3>
+<ul>
+    <li>dγ and dβ are <em>column</em> reductions over all tokens.</li>
+    <li>Implementations either compute partial sums per block followed by a second-stage reduction (deterministic), or use atomics (fast, <strong>non-deterministic</strong>, see Lesson 3).</li>
+    <li>Save mean and rstd per row in FP32 (8 B per row) rather than recomputing them.</li>
+</ul>
+
+<h3>8.5 Deployment</h3>
+<p>TensorRT has warned about LayerNorm accuracy in FP16 and recommends keeping norm layers in FP32 <span class="verify">[verify version]</span>. The cause is the overflow in 5.3 and the cancellation in 5.1, now at inference time.</p>
+
+<h3>8.6 Step-0 health check, extended from Lesson 7</h3>
+<p>For each block, log:</p>
+<ul>
+    <li>rms(stream)</li>
+    <li>rms(F)/rms(stream)</li>
+    <li>‖grad‖ of the branch weights</li>
+    <li>min/max of σ² inside every norm</li>
+</ul>
+<p>Values of σ² near ε, or max |x| ≥ 256 in FP16 paths, are red flags.</p>
+
+<!-- ============================================================ -->
+<h2 id="s9">9. Lab (~45 min)</h2>
+<p>Write down a prediction for each printed line <em>before</em> running. CPU is sufficient. Part 2 needs FP16 ops on CPU (recent PyTorch), so use <code>.cuda()</code> if they are unsupported.</p>
+<pre><code class="language-python">import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+
+# ---------------- Part 1: catastrophic cancellation in the variance ----------------
+def var_naive(x):                      # E[x^2] - E[x]^2, single pass
+    return (x * x).mean() - x.mean() ** 2
+
+def merge(a, b):                       # Chan et al. parallel merge of (n, mean, M2)
+    na, ma, M2a = a
+    nb, mb, M2b = b
+    n = na + nb
+    d = mb - ma
+    return n, ma + d * (nb / n), M2a + M2b + d * d * (na * nb / n)
+
+def var_welford_tree(x, chunk=256):    # per-"block" two-pass, then tree merge (like a GPU kernel)
+    stats = []
+    for c in x.split(chunk):
+        m = c.mean()
+        stats.append((c.numel(), m, ((c - m) ** 2).sum()))
+    while len(stats) > 1:
+        stats = [merge(stats[i], stats[i + 1]) if i + 1 &lt; len(stats) else stats[i]
+                 for i in range(0, len(stats), 2)]
+    n, _, M2 = stats[0]
+    return M2 / n
+
+x = 1e4 + 0.01 * torch.randn(65536)    # mean/std = 1e6, far above FP32's ~4096 threshold
+vn, vw = var_naive(x), var_welford_tree(x)
+print(f"naive={vn.item():.6g}  welford-tree={vw.item():.6g}  torch.var={x.var(unbiased=False).item():.6g}")
+print("rsqrt(naive + eps):", torch.rsqrt(vn + 1e-5).item())
+
+# ---------------- Part 2: RMSNorm in FP16 ----------------
+d = 4096
+h = (5 * torch.randn(d)).half()
+print("\nfp16 sum of squares :", h.pow(2).sum().item())
+print("fp16 mean of squares:", h.pow(2).mean().item())
+h[0] = 300.0                                         # one outlier dimension
+ms16 = h.pow(2).mean()
+y16 = h * torch.rsqrt(ms16 + 1e-6)
+ms32 = h.float().pow(2).mean()
+y32 = (h.float() * torch.rsqrt(ms32 + 1e-6)).half()
+print(f"ms16={ms16.item()}  max|y16|={y16.abs().max().item()}  "
+      f"nan={torch.isnan(y16).any().item()}  max|y32|={y32.abs().max().item():.2f}")
+
+# ---------------- Part 3: scale invariance of LN ----------------
+W0 = torch.randn(256, 256) / 16
+xin = torch.randn(64, 256)
+ln = nn.LayerNorm(256)
+for s in (1.0, 10.0):
+    W = (s * W0).requires_grad_()
+    ln(xin @ W.T).pow(3).mean().backward()           # arbitrary non-trivial loss
+    cos = (W.grad * W).sum() / (W.grad.norm() * W.norm())
+    print(f"scale={s:4.0f}  |grad|={W.grad.norm().item():.4e}  cos(grad, W)={cos.item():+.1e}")
+
+# ---------------- Part 4: pre-LN vs post-LN at init ----------------
+class Block(nn.Module):
+    def __init__(self, d, pre):
+        super().__init__()
+        self.pre, self.ln = pre, nn.LayerNorm(d)
+        self.fc1, self.fc2 = nn.Linear(d, 4 * d), nn.Linear(4 * d, d)
+        nn.init.kaiming_normal_(self.fc1.weight, nonlinearity="relu")
+        nn.init.normal_(self.fc2.weight, 0.0, (4 * d) ** -0.5)   # branch F is variance-preserving
+        nn.init.zeros_(self.fc1.bias)
+        nn.init.zeros_(self.fc2.bias)
+
+    def f(self, x):
+        return self.fc2(torch.relu(self.fc1(x)))
+
+    def forward(self, x):
+        return x + self.f(self.ln(x)) if self.pre else self.ln(x + self.f(x))
+
+def run(pre, depth=24, d=256, batch=128):
+    torch.manual_seed(0)
+    blocks = nn.ModuleList(Block(d, pre) for _ in range(depth))
+    x0 = torch.randn(batch, d, requires_grad=True)
+    h, rms, ratio = x0, [], []
+    for blk in blocks:
+        with torch.no_grad():
+            inp = blk.ln(h) if pre else h
+            ratio.append((blk.f(inp).pow(2).mean().sqrt() / h.pow(2).mean().sqrt()).item())
+        h = blk(h)
+        rms.append(h.pow(2).mean().sqrt().item())
+    out = nn.LayerNorm(d)(h) if pre else h
+    out.backward(torch.randn_like(out))
+    g = [blk.fc1.weight.grad.norm().item() for blk in blocks]
+    return rms, ratio, g, x0.grad.norm().item()
+
+for pre in (True, False):
+    rms, ratio, g, gx = run(pre)
+    tag = "pre-LN " if pre else "post-LN"
+    print(f"\n{tag} stream RMS  b1/6/12/24: {rms[0]:.2f} {rms[5]:.2f} {rms[11]:.2f} {rms[23]:.2f}")
+    print(f"{tag} |F|/|x|     b1/6/12/24: {ratio[0]:.2f} {ratio[5]:.2f} {ratio[11]:.2f} {ratio[23]:.2f}")
+    print(f"{tag} |dW_fc1|    b1/12/24  : {g[0]:.3e} {g[11]:.3e} {g[23]:.3e}   |dx0|={gx:.3e}")
+
+# ---------------- Part 5: BN folding and INT8 ----------------
+conv = nn.Conv2d(16, 32, 3, padding=1, bias=False)
+bn = nn.BatchNorm2d(32, momentum=None)               # cumulative running average
+with torch.no_grad():
+    for _ in range(20):
+        bn(conv(torch.randn(8, 16, 16, 16)))
+bn.eval()
+
+def fold(conv, bn):
+    s = bn.weight / torch.sqrt(bn.running_var + bn.eps)
+    return conv.weight * s[:, None, None, None], bn.bias - bn.running_mean * s
+
+def zero_frac(W, per_channel):
+    amax = W.abs().amax(dim=(1, 2, 3), keepdim=True) if per_channel else W.abs().max()
+    return ((W / (amax / 127)).round() == 0).float().mean().item()
+
+with torch.no_grad():
+    xb = torch.randn(4, 16, 16, 16)
+    Wf, bf = fold(conv, bn)
+    print("\nfold max abs err:", (bn(conv(xb)) - F.conv2d(xb, Wf, bf, padding=1)).abs().max().item())
+    bn.running_var[0] = 1e-6                         # a nearly dead channel
+    Wf, bf = fold(conv, bn)
+    print(f"INT8 zero fraction  per-tensor={zero_frac(Wf, False):.1%}  per-channel={zero_frac(Wf, True):.2%}")
+</code></pre>
+
+<details><summary>Expected behavior (open after running)</summary>
+    <p><strong>Part 1</strong></p>
+    <ul>
+        <li><code>naive</code> is garbage: typically a small multiple of 8 (the FP32 spacing near 10<sup>8</sup>), possibly 0 or negative.</li>
+        <li>If it is negative, <code>rsqrt</code> returns <strong>NaN</strong>.</li>
+        <li><code>welford-tree</code> and <code>torch.var</code> both give ≈ 1.0e-4.</li>
+    </ul>
+    <p><strong>Part 2</strong></p>
+    <ul>
+        <li>Sum of squares: <code>inf</code> (the expected total is ~102400, above 65504).</li>
+        <li>Mean of squares: ≈ 25, if the reduction accumulates in FP32 internally <span class="verify">[verify on your device]</span>.</li>
+        <li>With the outlier, 300² = 90000 overflows: <code>ms16 = inf</code>, <code>max|y16| = 0</code>, <code>nan = False</code>. The token is silently zeroed.</li>
+        <li>The FP32 path gives max |y| ≈ 300/6.85 ≈ 43.8.</li>
+    </ul>
+    <p><strong>Part 3</strong></p>
+    <ul>
+        <li>The gradient norm drops by exactly 10× at scale 10.</li>
+        <li>|cos(grad, W)| ≲ 1e-4. It is not exactly 0 only because of ε.</li>
+    </ul>
+    <p><strong>Part 4: firm predictions</strong></p>
+    <ul>
+        <li>Pre-LN stream RMS ≈ √(l+1): ≈ 1.41, 2.65, 3.61, 5.0.</li>
+        <li>Pre-LN |F|/|x| ≈ 1/√l: ≈ 1.0, 0.41, 0.29, 0.20.</li>
+        <li>Post-LN stream RMS ≈ 1.00 everywhere. Its |F|/|x| stays ≈ 1.</li>
+    </ul>
+    <p><strong>Part 4: measure, do not overclaim</strong></p>
+    <ul>
+        <li>Record the gradient profiles and compare them with Xiong et al.'s full-transformer analysis.</li>
+        <li>A pure MLP toy may show much milder differences than a full transformer. Being able to say "the theory depends on the block structure; here is what I measured" is the interview skill.</li>
+    </ul>
+    <p><strong>Part 5</strong></p>
+    <ul>
+        <li>Fold error ≈ 1e-6.</li>
+        <li>After killing channel 0: per-tensor zero fraction ≈ <strong>⅔</strong>, per-channel ≈ <strong>0.4%</strong>.</li>
+    </ul>
+</details>
+<p><strong>Stretch tasks:</strong></p>
+<ol>
+    <li>Implement the LN backward formula from 4.2 by hand and compare it with autograd using <code>torch.autograd.gradcheck</code> in FP64.</li>
+    <li>In Part 4, scale fc2 by 1/√(2·depth) and observe the stream growth flatten.</li>
+</ol>
+
+<!-- ============================================================ -->
+<h2 id="s10">10. Interview drills (~15 min)</h2>
+<h3>10.1 Thirty-second answer</h3>
+<blockquote>"Normalization rescales activations with statistics. BN computes them per channel over the batch, LN and RMSNorm per token over the features. The key property is scale invariance: LN(αWx) = LN(Wx). So gradients are orthogonal to W and scale like 1/‖W‖, the effective learning rate is η/‖W‖², and weight decay acts as a learning-rate controller. The backward pass is a projection scaled by 1/σ. Numerically, I compute the statistics in FP32 with a two-pass or Welford merge, because E[x²] − E[x]² fails once μ/σ exceeds about u<sup>−1/2</sup>. For RMSNorm I upcast before squaring, because x² overflows FP16 above 256 and silently zeroes tokens. Architecturally, pre-LN gives an exact identity gradient path and needs little warmup, but its stream grows. Post-LN keeps the scale fixed but needs warmup. For BN deployment I fold into the conv and use per-channel weight quantization."</blockquote>
+
+<h3>10.2 Whiteboard prompts</h3>
+<details><summary>Derive the LayerNorm input gradient. What two properties does it have?</summary>
+    <p>J = (1/s)(I − 11ᵀ/n − ŷŷᵀ/n), which gives g<sub>x</sub> = (1/s)(ĝ − mean(ĝ) − ŷ·mean(ĝ⊙ŷ)). The gradient sums to zero (shift invariance) and is orthogonal to x − μ, up to ε (scale invariance). Its gain is at most 1/s.</p></details>
+<details><summary>A LLaMA-style model in FP16 inference outputs zero vectors for some tokens. There is no NaN. Diagnose.</summary>
+    <p>RMSNorm is computed in FP16. An outlier with |x| ≥ 256 squares to inf, so rsqrt(inf) = 0 and the token becomes zeros. To confirm, log max |x| before each norm. The fix is to upcast to FP32 before squaring and add ε in FP32. The fused-kernel equivalent is FP32 accumulation.</p></details>
+<details><summary>Why does weight decay matter for weights followed by a norm, given that it cannot change the function?</summary>
+    <p>The gradient is orthogonal to w, so SGD steps only grow ‖w‖, and η<sub>eff</sub> ∝ η/‖w‖² decays. Weight decay shrinks ‖w‖ and so sets the equilibrium effective learning rate. It works as a schedule knob, not as a regularizer of the function.</p></details>
+<details><summary>A post-LN transformer diverges in the first 1k steps. What are your options?</summary>
+    <p>In order of effort:</p>
+    <ol>
+        <li>Learning-rate warmup or a lower peak learning rate.</li>
+        <li>Switch to pre-LN with a final LN, scaling the residual branches.</li>
+        <li>DeepNorm or Admin-style residual reweighting.</li>
+        <li>QK-norm if the attention logits grow.</li>
+    </ol>
+    <p>Also check:</p>
+    <ul>
+        <li>Gradient-norm spikes per layer.</li>
+        <li>Whether the loss scaler is skipping steps (Lesson 2).</li>
+    </ul></details>
+<details><summary>INT8 PTQ of a ResNet-style model loses 10 points. FP16 is fine. What do you check first?</summary>
+    <ul>
+        <li>BN-folded weights quantized per tensor, combined with channels whose tiny running variance makes s<sub>c</sub> = γ/√(σ²+ε) huge.</li>
+        <li>Compare per-channel amax distributions. Switch to per-channel weight scales.</li>
+        <li>Inspect or prune dead channels.</li>
+        <li>Then look at the activation calibration (Lesson 10).</li>
+    </ul></details>
+<details><summary>When is the single-pass E[x²] − E[x]² acceptable in a kernel?</summary>
+    <p>When it is accumulated in FP32 <em>and</em> μ/σ ≪ 4096 is guaranteed, which is rarely provable for arbitrary inputs. If the row fits on chip, a two-pass computation from registers or shared memory costs almost nothing, so it is usually the default. For streaming rows, use a Welford merge.</p></details>
+
+<!-- ============================================================ -->
+<h2 id="s11">11. Quiz</h2>
+<p>For numeric answers, enter a decimal number. Non-integer answers within ±2% are accepted.</p>
+<div class="quiz" id="quiz"></div>
+<p id="score"></p>
+
+<!-- ============================================================ -->
+<h2 id="s12">12. Sources (all from memory; verify)</h2>
+<ul>
+    <li>Ioffe &amp; Szegedy, "Batch Normalization", arXiv:1502.03167</li>
+    <li>Ba, Kiros &amp; Hinton, "Layer Normalization", arXiv:1607.06450</li>
+    <li>Zhang &amp; Sennrich, "Root Mean Square Layer Normalization", arXiv:1910.07467</li>
+    <li>Wu &amp; He, "Group Normalization", arXiv:1803.08494</li>
+    <li>Xiong et al., "On Layer Normalization in the Transformer Architecture", arXiv:2002.04745</li>
+    <li>Liu et al., "Understanding the Difficulty of Training Transformers" (Admin), arXiv:2004.08249</li>
+    <li>Wang et al., "DeepNet: Scaling Transformers to 1,000 Layers", arXiv:2203.00555</li>
+    <li>Dehghani et al., "Scaling Vision Transformers to 22 Billion Parameters" (QK-norm), arXiv:2302.05442</li>
+    <li>Santurkar et al., "How Does Batch Normalization Help Optimization?", arXiv:1805.11604</li>
+    <li>van Laarhoven, "L2 Regularization versus Batch and Weight Normalization", arXiv:1706.05350</li>
+    <li>Sun et al., "Massive Activations in Large Language Models", arXiv:2402.17762</li>
+    <li>Welford (1962); Chan, Golub &amp; LeVeque, parallel variance algorithms (1979/1983)</li>
+    <li>PyTorch docs: <code>nn.BatchNorm2d</code> (momentum, unbiased running variance), <code>nn.RMSNorm</code> (eps default), the autocast op lists, DDP <code>broadcast_buffers</code></li>
+</ul>
+
+<script>
+    const Q = [
+        {q:"Naive variance in FP32 with E[x²] ≈ 10<sup>8</sup>. What is the spacing between adjacent FP32 numbers near 10<sup>8</sup>?", type:"num", a:8,
+            why:"10⁸ ∈ [2²⁶, 2²⁷), so ulp = 2^(26−23) = 8. Any true variance far below 8 is invisible."},
+        {q:"Rule of thumb: naive E[x²] − E[x]² in FP32 (u = 2<sup>−24</sup>) breaks down once μ/σ exceeds roughly …?", type:"num", a:4096,
+            why:"The error is ≈ u·μ², which must stay ≪ σ². So μ/σ ≪ u^(−1/2) = 2¹² = 4096."},
+        {q:"Welford merge: chunk A = {0, 0} (n=2, μ=0, M2=0), chunk B = {2, 2} (n=2, μ=2, M2=0). Merged population variance?", type:"num", a:1,
+            why:"M2 = 0 + 0 + δ²·nₐn_b/n = 4·4/4 = 4, so Var = 4/4 = 1. Check: {0,0,2,2} has variance 1."},
+        {q:"Roughly the largest |x| whose square is still finite in FP16?", type:"num", a:255.94,
+            why:"√65504 ≈ 255.9. Squaring 256 or more overflows to inf, so the RMS is inf and rsqrt gives 0: silent zeros."},
+        {q:"BN folding: γ = 0.5, β = 0.1, μ<sub>run</sub> = 2, σ²<sub>run</sub> = 0.25 (ignore ε), conv bias 0. Folded bias b′?", type:"num", a:-1.9,
+            why:"s = 0.5/√0.25 = 1, so b′ = s·(0 − 2) + 0.1 = −1.9."},
+        {q:"W feeds a LayerNorm. You scale W by 4. By what factor does ‖∇<sub>W</sub>L‖ change?", type:"num", a:0.25,
+            why:"L(αW) = L(W) implies ∇L(αW) = ∇L(W)/α, so the factor is 1/4."},
+        {q:"RMSNorm with g = 1 and rms(x) = 8. Maximum gain ‖∂L/∂x‖ / ‖∂L/∂y‖?", type:"num", a:0.125,
+            why:"J = (1/r)(I − ŷŷᵀ/n) is a projection scaled by 1/r, so its spectral norm is 1/8. In pre-LN, a growing stream attenuates gradients through each branch."},
+        {q:"Pre-LN, no residual scaling, unit-variance branch outputs, Var(x₀) = 1. Stream RMS after L blocks?", type:"mc",
+            opts:["≈ 1, fixed","≈ √(L+1)","≈ 2<sup>L/2</sup>","≈ L"], a:1,
+            why:"Each branch sees a normalized input and adds ≈ 1 to the variance, so Var = L+1 and RMS = √(L+1). Without the norm (Lesson 7) it would be 2^L."},
+        {q:"PyTorch BatchNorm running-statistics update with default momentum?", type:"mc",
+            opts:["running = 0.9·running + 0.1·batch","running = 0.1·running + 0.9·batch","running = 0.99·running + 0.01·batch","The running stats are recomputed over the full dataset each epoch"], a:0,
+            why:"(1 − m)·running + m·batch with m = 0.1. Keras/TF use the opposite convention (momentum ≈ 0.99 as the decay), a classic porting bug."},
+        {q:"Why do BN-folded conv weights usually need per-channel INT8 scales?", type:"mc",
+            opts:["The folded scale γ/√(σ²+ε) differs per channel, so a single outlier channel would dominate a per-tensor amax",
+                "Because BN adds a bias term",
+                "Because INT8 cannot represent negative numbers",
+                "Because folding changes the convolution's receptive field"], a:0,
+            why:"Channels with tiny running variance get huge scales. Per-tensor quantization then rounds most other weights to 0 (≈ ⅔ in the lab)."},
+        {q:"Which property does the LayerNorm input gradient g<sub>x</sub> have?", type:"mc",
+            opts:["It sums to zero and is orthogonal to x − μ (up to ε)",
+                "It equals the upstream gradient scaled by γ",
+                "It is always larger than the upstream gradient",
+                "It is zero whenever β = 0"], a:0,
+            why:"J annihilates 1 (shift invariance) and ŷ (scale invariance), and J is symmetric. So g_x ⊥ 1 and g_x ⊥ (x − μ)."},
+        {q:"An FP16 RMSNorm sometimes produces all-zero tokens, with no NaN. The most likely cause?", type:"mc",
+            opts:["An activation with |x| ≥ 256 squares to inf, so rsqrt(inf) = 0",
+                "ε = 1e-6 is a subnormal in FP16 and is flushed, causing division by zero",
+                "Catastrophic cancellation in the mean subtraction",
+                "The loss scaler skipped a step"], a:0,
+            why:"RMSNorm has no mean subtraction, and a division by zero would give inf/NaN, not zeros. The silent zero comes from overflow in the elementwise square."}
+    ];
+
+    const root = document.getElementById("quiz"), done = {};
+    Q.forEach((it, i) => {
+        const s = document.createElement("section");
+        let h = `<p><b>Q${i + 1}.</b> ${it.q}</p>`;
+        h += it.type === "num"
+            ? `<input id="in${i}" type="text" inputmode="decimal">`
+            : it.opts.map((o, j) => `<label><input type="radio" name="q${i}" value="${j}"> ${o}</label><br>`).join("");
+        h += `<br><button data-i="${i}">Check</button><p class="fb" id="fb${i}"></p>`;
+        s.innerHTML = h;
+        root.appendChild(s);
+    });
+
+    root.addEventListener("click", e => {
+        if (e.target.tagName !== "BUTTON") return;
+        const i = +e.target.dataset.i, it = Q[i];
+        let ok;
+        if (it.type === "num") {
+            const v = parseFloat(document.getElementById("in" + i).value.replace(",", "."));
+            const tol = Number.isInteger(it.a) ? 1e-9 : 0.02 * Math.abs(it.a);
+            ok = Number.isFinite(v) && Math.abs(v - it.a) <= tol;
+        } else {
+            const c = document.querySelector(`input[name=q${i}]:checked`);
+            ok = !!c && +c.value === it.a;
+        }
+        const fb = document.getElementById("fb" + i);
+        fb.className = "fb " + (ok ? "ok" : "bad");
+        fb.innerHTML = (ok ? "Correct. " : "Not quite. ") + it.why;
+        done[i] = ok;
+        document.getElementById("score").textContent =
+            `Score: ${Object.values(done).filter(Boolean).length}/${Q.length}`;
+    });
+</script>

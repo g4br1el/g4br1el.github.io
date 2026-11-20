@@ -1,0 +1,287 @@
+---
+layout: tutorial
+tutorial: prep-nov26
+type: lesson
+lesson: 11
+total: 12
+title: "Lesson 11: Distributed Numerics"
+tags: []
+permalink: /heap/nov26/011/
+---
+
+
+
+    <p><i>BF16/FP32 reductions, FSDP2 <code>MixedPrecisionPolicy</code>, and bandwidth/memory accounting</i></p>
+
+    <div class="box"><b>Skill:</b> Given model size Ψ, world size N and a <code>MixedPrecisionPolicy</code>:
+        name the dtype of every tensor in one FSDP2 step, estimate per-rank communication and memory, and justify <code>reduce_dtype</code>.</div>
+
+    <h2>1. Collectives refresher (ring algorithm)</h2>
+    <p>S = full tensor size in bytes. The table shows per-rank traffic, where sent ≈ received.</p>
+    <div id="t-coll"></div>
+    <p>The ZeRO-3/FSDP full-shard step does all-gather (forward) + all-gather (backward) + reduce-scatter.
+        That is 3·(N−1)/N·S, compared with DDP's 2·(N−1)/N·S, so <b>1.5× DDP volume at equal dtype</b>.
+        FSDP2 shrinks this by all-gathering in <code>param_dtype</code>.</p>
+
+    <h2>2. Where precision is lost in a reduction</h2>
+    <ul>
+        <li><b>Rounding per hop.</b> A ring reduce-scatter adds each chunk over N−1 hops. With a BF16 accumulator, every hop rounds (unit roundoff u = 2<sup>−8</sup>).
+            <ul>
+                <li>The worst-case relative error grows ≈ (N−1)·u.</li>
+                <li>A typical random-walk error is ≈ √(N−1)·u.</li>
+                <li>Tree reductions have only log<sub>2</sub>N levels.</li>
+                <li>NCCL picks the algorithm by size and topology, so by default it is not under your control.</li>
+            </ul></li>
+        <li><b>Overflow (FP16).</b> Summing N gradients can exceed 65504 even when each one is small. The fix is to pre-divide. FSDP1 had <code>gradient_predivide_factor</code>; FSDP2 exposes a divide factor on the module (check your version). BF16 rarely overflows.</li>
+        <li><b>Divide timing.</b> mean = Σ/N.
+            <ul>
+                <li>Dividing <i>before</i> the reduction risks underflow in FP16.</li>
+                <li>Dividing <i>after</i> risks overflow.</li>
+                <li>Splitting the factor (√N before, √N after) is the classic compromise.</li>
+            </ul></li>
+        <li><b>Local precision is not restored.</b> <code>reduce_dtype=float32</code> protects only the cross-rank sum. Each rank's backward has already produced BF16 gradients.</li>
+    </ul>
+
+    <h2>3. FSDP2 <code>MixedPrecisionPolicy</code></h2>
+    <div id="t-mp"></div>
+    <div class="box warn"><b>Verify:</b> the search summary lists <code>param_dtype_override_fn</code> (selective overrides) in the <i>main</i> docs only.
+        I could not verify it, and it is not in the stable docs. Check <code>help(MixedPrecisionPolicy)</code> in your installed version before you mention it in an interview.</div>
+
+    <h3>Dtype flow in one step (param_dtype=BF16, reduce_dtype=FP32)</h3>
+    <pre><code>sharded FP32 params (DTensor; optimizer state lives here = master weights)
+   │  cast to param_dtype, all-gather       (2 B/param on the wire)
+   ▼
+unsharded BF16 params ──► forward
+   │  root inputs cast to BF16 if cast_forward_inputs=True
+   │  outputs cast to output_dtype at module boundary (if set)
+   │  reshard after forward (default) → all-gather again in backward
+   ▼
+unsharded BF16 grads
+   │  cast to reduce_dtype (FP32), reduce-scatter   (4 B/param on the wire)
+   ▼
+sharded FP32 grads ──► optimizer.step() on FP32 shards</code></pre>
+
+    <h3>Key facts</h3>
+    <ol>
+        <li><b>Master weights for free.</b> The sharded parameters keep their original dtype (FP32). Only the all-gathered copies are BF16, so there is no separate master copy (compare the L1 nuance on PyTorch AMP).</li>
+        <li><b><code>reduce_dtype=None</code></b> falls back to <code>param_dtype</code>. So <code>MixedPrecisionPolicy(param_dtype=torch.bfloat16)</code> reduces in BF16.</li>
+        <li><b>Module-level, not op-level.</b> Every parameter in a <code>fully_shard</code> group gets <code>param_dtype</code>, including norm weights.
+            <ul>
+                <li>Activations are saved for backward in low precision.</li>
+                <li>To keep a module in FP32 (for example a router or final norm), shard it in its own <code>fully_shard</code> call with its own policy.</li>
+            </ul></li>
+        <li><b><code>output_dtype</code> is per call.</b> Set <code>float32</code> on the root (or LM-head group) policy to get FP32 logits for softmax/CE (L3).</li>
+        <li><b>Order of operations.</b> Apply bottom-up (blocks first, then root). Build the optimizer <i>after</i> <code>fully_shard</code>, from the DTensor parameters.</li>
+        <li><b><code>autocast</code> on top</b> is possible but adds op-level casts. Decide deliberately, and avoid redundant casts.</li>
+    </ol>
+
+    <h2>4. Worked example: 7B model, N = 8, BF16 params, FP32 reduce</h2>
+    <p>Ψ = 7·10<sup>9</sup>, (N−1)/N = 0.875, <code>reshard_after_forward=True</code>.</p>
+    <div id="t-comm"></div>
+    <p>An FP32 reduce costs 49 / 36.75 ≈ <b>1.33×</b> the traffic of a BF16 reduce.
+        At an <i>assumed</i> ~400 GB/s effective per-rank bandwidth, that is ≈ 0.12 s vs 0.09 s per step, mostly overlappable with compute. This figure is illustrative only; measure on your hardware.</p>
+    <p><b>Persistent memory per rank</b> (Adam, FP32 shards): (4 param + 4 grad + 4 m + 4 v)·Ψ/N = 112 GB / 8 = <b>14 GB</b>.
+        On top of that come the transient unsharded BF16 params and grads of the current and prefetched groups, plus activations.</p>
+
+    <h2>5. Choosing a policy</h2>
+    <div id="t-cfg"></div>
+
+    <h2>6. DDP, FSDP1, FSDP2</h2>
+    <ul>
+        <li><b>DDP:</b> comm hooks <code>fp16_compress_hook</code> / <code>bf16_compress_hook</code> (in <code>torch.distributed.algorithms.ddp_comm_hooks.default_hooks</code>). They compress gradients for the all-reduce and decompress afterwards.</li>
+        <li><b>FSDP1:</b> <code>MixedPrecision(param_dtype, reduce_dtype, buffer_dtype)</code> on a FlatParameter. FP16 training used <code>ShardedGradScaler</code>.</li>
+        <li><b>FSDP2:</b> per-parameter DTensor sharding and <code>MixedPrecisionPolicy</code>, with no <code>buffer_dtype</code> field. For FP16, check which grad scaler your version supports.</li>
+    </ul>
+
+    <h2>7. Interview answer (30 s)</h2>
+    <div class="box">"FSDP2 keeps sharded params in FP32, so the optimizer steps on master weights. It all-gathers in <code>param_dtype</code>, usually BF16, which halves gather bandwidth.
+        Gradients come out of backward in BF16 and are cast to <code>reduce_dtype</code> before the reduce-scatter. I use FP32 there at large world sizes because ring reductions round at every hop, so the error grows with N. That costs about a third more traffic than a BF16 reduce when params are gathered in BF16.
+        Mixed precision is module-level, so I give sensitive modules their own policy and set <code>output_dtype=float32</code> at the root for the loss. With FP16 I'd also pre-divide gradients to avoid overflow in the sum."</div>
+
+    <h2>8. Lab (~30 min)</h2>
+    <p><b>Part A (CPU): reduction error vs N.</b> The inputs are BF16-rounded, so only the communication error is measured.</p>
+    <pre><code class="language-python">import torch
+torch.manual_seed(0)
+
+def ring_sum(gs, dt):
+    acc = gs[0].to(dt)
+    for g in gs[1:]:
+        acc = acc + g.to(dt)          # rounds to dt at every hop
+    return acc.double()
+
+def tree_sum(gs, dt):
+    xs = [g.to(dt) for g in gs]
+    while len(xs) > 1:
+        nxt = [xs[i] + xs[i + 1] for i in range(0, len(xs) - 1, 2)]
+        if len(xs) % 2:
+            nxt.append(xs[-1])
+        xs = nxt
+    return xs[0].double()
+
+for N in [2, 8, 64, 512]:
+    gs = [torch.randn(20_000).bfloat16().float() for _ in range(N)]
+    ref = torch.stack([g.double() for g in gs]).sum(0)
+    for name, f, dt in [("ring bf16", ring_sum, torch.bfloat16),
+                        ("tree bf16", tree_sum, torch.bfloat16),
+                        ("ring fp32", ring_sum, torch.float32)]:
+        err = ((f(gs, dt) - ref).norm() / ref.norm()).item()
+        print(f"N={N:4d} {name:9s} rel_err={err:.2e}")</code></pre>
+    <p><b>Predict first:</b> how does the ring BF16 error scale from N=8 to N=512? Linearly or as √N? Is the tree better?</p>
+
+    <p><b>Part B (CPU): FP16 overflow and pre-division.</b></p>
+    <pre><code class="language-python">import torch
+g = torch.full((64,), 2000.0, dtype=torch.float16)
+
+acc = torch.tensor(0.0, dtype=torch.float16)
+for x in g:
+    acc = acc + x
+print("sum then divide:", acc.item())          # inf (64*2000 = 128000 > 65504)
+
+acc = torch.tensor(0.0, dtype=torch.float16)
+for x in g:
+    acc = acc + x / 64
+print("pre-divide:", acc.item())               # 2000.0</code></pre>
+
+    <p><b>Part C (optional, ≥ 2 GPUs): inspect FSDP2 dtypes.</b> Run with <code>torchrun --nproc_per_node=2 lab11.py</code>.</p>
+    <pre><code class="language-python">import os, torch, torch.distributed as dist
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+
+dist.init_process_group("nccl")
+torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+rank = dist.get_rank()
+mesh = init_device_mesh("cuda", (dist.get_world_size(),))
+
+class Probe(torch.nn.Linear):
+    def forward(self, x):
+        if rank == 0:
+            print(f"[{self.tag}] input={x.dtype} weight={self.weight.dtype}")
+        return super().forward(x)
+
+model = torch.nn.Sequential(Probe(1024, 1024), torch.nn.GELU(), Probe(1024, 1024)).cuda()
+model[0].tag, model[2].tag = "lin0", "lin2"
+
+block_mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+root_mp  = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32,
+                                output_dtype=torch.float32)   # FP32 output for the loss
+for m in (model[0], model[2]):
+    fully_shard(m, mesh=mesh, mp_policy=block_mp)
+fully_shard(model, mesh=mesh, mp_policy=root_mp)
+opt = torch.optim.AdamW(model.parameters(), lr=1e-3)          # after fully_shard
+
+x = torch.randn(8, 1024, device="cuda")                       # FP32 input
+out = model(x)
+out.float().pow(2).mean().backward()
+if rank == 0:
+    p = model[0].weight
+    print("output:", out.dtype)
+    print("sharded param:", type(p).__name__, p.dtype, "local shape", p.to_local().shape)
+    print("sharded grad:", p.grad.dtype)
+opt.step()
+dist.destroy_process_group()</code></pre>
+    <p><b>Expected:</b></p>
+    <ul>
+        <li>Inputs and weights inside the layers are BF16.</li>
+        <li>The output is FP32, because of the root policy.</li>
+        <li>The sharded params and grads are FP32 DTensors with half the rows per rank.</li>
+    </ul>
+    <p><b>Stretch:</b> remove <code>output_dtype</code> from the root policy and confirm that the output becomes BF16.</p>
+
+    <h2>9. Quiz</h2>
+    <p>Numeric answers: digits only (decimals allowed).</p>
+    <div id="quiz"></div>
+    <p id="score"></p>
+
+    <h2>Sources</h2>
+    <ul>
+        <li>PyTorch, <i>torch.distributed.fsdp.fully_shard</i>, main docs (updated 5 Nov 2026): <a href="https://docs.pytorch.org/docs/main/distributed/fsdp.fully_shard.html">docs.pytorch.org/docs/main/distributed/fsdp.fully_shard.html</a></li>
+        <li>PyTorch, <i>fully_shard</i>, stable docs: <a href="https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.md">docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.md</a></li>
+        <li>To verify (from memory): Rajbhandari et al., <i>ZeRO</i>, arXiv:1910.02054 (the 1.5× comm-volume result); the NCCL docs on ring/tree algorithm selection.</li>
+    </ul>
+</main>
+
+<script>
+    function tbl(id, head, rows) {
+        const t = document.createElement("table");
+        [head, ...rows].forEach((r, i) => {
+            const tr = t.insertRow();
+            r.forEach(c => { const cell = document.createElement(i ? "td" : "th"); cell.innerHTML = c; tr.appendChild(cell); });
+        });
+        document.getElementById(id).appendChild(t);
+    }
+    tbl("t-coll", ["Collective", "Per-rank traffic", "Used by"], [
+        ["All-reduce", "2·(N−1)/N · S", "DDP gradients"],
+        ["Reduce-scatter", "(N−1)/N · S", "FSDP gradients"],
+        ["All-gather", "(N−1)/N · S", "FSDP parameters (forward and backward)"]
+    ]);
+    tbl("t-mp", ["Field", "Default", "Effect"], [
+        ["<code>param_dtype</code>", "None (keep original)", "Dtype of the all-gathered, unsharded params used in forward/backward. Also the all-gather wire dtype."],
+        ["<code>reduce_dtype</code>", "None → param_dtype", "Dtype of the gradient reduce-scatter. FP32 = stabler sum, 2× wire bytes vs BF16."],
+        ["<code>output_dtype</code>", "None (no cast)", "Casts module outputs at this FSDP boundary, e.g. FP32 logits at the root."],
+        ["<code>cast_forward_inputs</code>", "True", "Casts floating-point forward inputs to param_dtype."],
+        ["<code>param_dtype_override_fn</code>", "?", "Main docs only, per the search summary. <b>Unverified.</b>"]
+    ]);
+    tbl("t-comm", ["Collective", "Wire dtype", "Payload Ψ·b", "Per-rank ×0.875"], [
+        ["All-gather (forward)", "BF16", "14 GB", "12.25 GB"],
+        ["All-gather (backward)", "BF16", "14 GB", "12.25 GB"],
+        ["Reduce-scatter", "FP32", "28 GB", "24.5 GB"],
+        ["<b>Total</b>", "", "", "<b>49 GB</b> (36.75 GB with BF16 reduce)"]
+    ]);
+    tbl("t-cfg", ["Policy (param / reduce / root output)", "When", "Cost", "Risk"], [
+        ["BF16 / FP32 / FP32", "Default for large N, long runs, research baselines", "+33% traffic vs BF16 reduce", "Lowest"],
+        ["BF16 / BF16 / FP32", "Bandwidth-bound, small N, validated against the FP32-reduce run", "Cheapest", "Reduction error grows with N"],
+        ["FP16 / FP32 / FP32", "Hardware without fast BF16", "Needs loss scaling and pre-division", "Overflow/underflow (L1/L2)"],
+        ["Separate FP32 group", "Routers, final norm, small sensitive modules", "Extra comm group", "More casts at module boundaries"]
+    ]);
+
+    const Q = [
+        {q:"Ring all-reduce with N = 8: per-rank traffic is k·S. Enter k.", type:"num", a:1.75, tol:0.01,
+            why:"2·(N−1)/N = 2·7/8 = 1.75."},
+        {q:"FSDP full shard (reshard after forward) vs DDP, same dtype: traffic ratio?", type:"num", a:1.5, tol:0.01,
+            why:"FSDP: 2 all-gathers + 1 reduce-scatter = 3·(N−1)/N·S. DDP: 1 all-reduce = 2·(N−1)/N·S. Ratio 3/2."},
+        {q:"MixedPrecisionPolicy(param_dtype=torch.bfloat16) with no other fields. Reduce-scatter dtype?", type:"mc",
+            opts:["float32","bfloat16","Same as the original parameter dtype","float16"], a:1,
+            why:"reduce_dtype=None falls back to param_dtype, so the reduction runs in BF16."},
+        {q:"FP32 model, policy param_dtype=BF16. Which dtype does optimizer.step() update?", type:"mc",
+            opts:["BF16 unsharded params","FP32 sharded DTensor params","BF16 sharded params","FP32 unsharded copy on rank 0"], a:1,
+            why:"Sharded params keep their original dtype. Only the all-gathered copies are BF16, so FSDP2 provides master weights for free."},
+        {q:"7B params, N = 8, BF16 all-gather in forward and backward, FP32 reduce-scatter. Per-rank traffic per step in GB?", type:"num", a:49, tol:0.5,
+            why:"(14 + 14 + 28) GB × 7/8 = 49 GB."},
+        {q:"FP16 sequential sum of 64 gradients, each 2000. Result, and the fix?", type:"mc",
+            opts:["128000, no fix needed","Inf; pre-divide by N (or split √N before and after)","0; increase the loss scale","NaN; use Kahan summation"], a:1,
+            why:"128000 exceeds the FP16 max of 65504. Pre-dividing keeps the partial sums in range."},
+        {q:"Does reduce_dtype=float32 recover precision lost in each rank's BF16 backward?", type:"mc",
+            opts:["Yes, gradients are recomputed in FP32","No, it only protects the cross-rank summation"], a:1,
+            why:"The local gradients are already BF16. FP32 reduce only avoids per-hop rounding in the reduction."},
+        {q:"Why set output_dtype=float32 on the root policy?", type:"mc",
+            opts:["It makes the all-gather faster","It gives FP32 logits, so softmax/CE and the loss run at full precision","It turns on FP32 master weights","It is required for reduce_dtype=float32"], a:1,
+            why:"output_dtype casts outputs at that FSDP boundary. FP32 logits keep the LSE/CE stable (L3)."},
+        {q:"Which statement about FSDP2 mixed precision vs autocast is correct?", type:"mc",
+            opts:["Both decide precision per operator","FSDP2 casts at module boundaries and saves low-precision activations; autocast decides per op","FSDP2 keeps LayerNorm weights in FP32 automatically","autocast controls the reduce-scatter dtype"], a:1,
+            why:"FSDP2 is module-level: all params in a group get param_dtype, including norm weights. Use a separate group to keep them in FP32."}
+    ];
+    const root = document.getElementById("quiz"), done = {};
+    Q.forEach((it, i) => {
+        const s = document.createElement("section"); s.className = "q";
+        let h = `<p><b>Q${i+1}.</b> ${it.q}</p>`;
+        h += it.type === "num" ? `<input id="in${i}" type="text">`
+            : it.opts.map((o, j) => `<label><input type="radio" name="q${i}" value="${j}"> ${o}</label><br>`).join("");
+        h += `<br><button data-i="${i}">Check</button><p class="fb" id="fb${i}"></p>`;
+        s.innerHTML = h; root.appendChild(s);
+    });
+    root.addEventListener("click", e => {
+        if (e.target.tagName !== "BUTTON") return;
+        const i = +e.target.dataset.i, it = Q[i]; let ok;
+        if (it.type === "num") {
+            const v = parseFloat(document.getElementById("in" + i).value);
+            ok = !isNaN(v) && Math.abs(v - it.a) <= (it.tol || 0);
+        } else {
+            const c = document.querySelector(`input[name=q${i}]:checked`); ok = !!c && +c.value === it.a;
+        }
+        const fb = document.getElementById("fb" + i);
+        fb.className = "fb " + (ok ? "ok" : "bad");
+        fb.textContent = (ok ? "Correct. " : "Not quite. ") + it.why;
+        done[i] = ok;
+        document.getElementById("score").textContent = `Score: ${Object.values(done).filter(Boolean).length}/${Q.length}`;
+    });
+</script>

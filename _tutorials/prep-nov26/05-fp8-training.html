@@ -1,0 +1,227 @@
+---
+layout: tutorial
+tutorial: prep-nov26
+type: lesson
+lesson: 5
+total: 12
+title: "Lesson 5: FP8 Training"
+tags: []
+permalink: /heap/nov26/005/
+---
+
+
+
+
+    <b>Interview skill:</b> Design and defend an FP8 training recipe: format per tensor, scale computation, what stays in higher precision, and how it fails.</p>
+
+<div class="box"><b>Legend:</b>
+    <span class="ver ok">verified</span> = checked against the primary source in this session &middot;
+    <span class="ver tv">verify</span> = from memory; check before quoting in an interview.</div>
+
+<h2>1. Why FP8, and the core problem</h2>
+<ul>
+    <li><b>Throughput:</b> On Hopper/Ada, dense FP8 Tensor Core throughput is about 2&times; BF16 <span class="ver tv">verify (NVIDIA spec sheets)</span>.</li>
+    <li><b>Bandwidth and memory:</b> FP8 uses half the bytes of BF16 for GEMM inputs and for activations saved for backward.</li>
+    <li><b>The catch:</b> The dynamic range is tiny. Count it in <i>binades</i>, log<sub>2</sub>(max / min subnormal):</li>
+</ul>
+<table>
+    <tr><th>Format</th><th>Max</th><th>Min subnormal</th><th>Binades (log<sub>2</sub> ratio)</th><th>eps</th></tr>
+    <tr><td>BF16</td><td>&asymp;3.39e38</td><td>2<sup>&minus;133</sup></td><td>&asymp;261</td><td>2<sup>&minus;7</sup></td></tr>
+    <tr><td>FP16</td><td>65504</td><td>2<sup>&minus;24</sup></td><td>&asymp;40</td><td>2<sup>&minus;10</sup></td></tr>
+    <tr><td>FP8 E5M2</td><td>57344 = 1.75&middot;2<sup>15</sup></td><td>2<sup>&minus;16</sup></td><td>&asymp;31.8</td><td>2<sup>&minus;2</sup></td></tr>
+    <tr><td>FP8 E4M3</td><td>448 = 1.75&middot;2<sup>8</sup></td><td>2<sup>&minus;9</sup></td><td>&asymp;17.8</td><td>2<sup>&minus;3</sup></td></tr>
+</table>
+<p><b>Consequence:</b> FP16 got away with one <i>global</i> loss scale because 40 binades cover most tensors once they are shifted. E4M3's ~18 binades (~15 counting normals only) cannot cover activations, weights and gradients that differ by many orders of magnitude. So FP8 needs a <b>separate scale for each tensor (or each block)</b>. That one sentence is the key idea of FP8 training.</p>
+
+<h2>2. Two encodings, two roles</h2>
+<table>
+    <tr><th></th><th>E4M3</th><th>E5M2</th></tr>
+    <tr><td>Special values</td><td>No Inf; only <code>S.1111.111</code> is NaN, so the top exponent is usable <span class="ver tv">verify</span></td><td>IEEE-like: Inf and NaN exist <span class="ver tv">verify</span></td></tr>
+    <tr><td>Strength</td><td>Precision (3 mantissa bits)</td><td>Range (5 exponent bits, same as FP16)</td></tr>
+    <tr><td>Recommended use</td><td>Weights and activations (forward)</td><td>Gradients (backward)</td></tr>
+</table>
+<p>The recommendation in the last row is stated directly in Micikevicius et al. 2022: <i>"The recommended use of FP8 encodings is E4M3 for weight and activation tensors, and E5M2 for gradient tensors."</i>
+    <span class="ver ok">verified</span> (<a href="https://arxiv.org/abs/2209.05433v2">arXiv:2209.05433</a>).
+    Transformer Engine calls this E4M3-forward / E5M2-backward split the <code>HYBRID</code> format <span class="ver tv">verify</span>.</p>
+<p><b>Why gradients get E5M2:</b> Gradient magnitudes vary more across tokens, layers and steps, and they shift over the course of training. Range matters more than the extra mantissa bit there. Forward tensors are better behaved, so precision wins.</p>
+
+<h2>3. Scaling math</h2>
+<pre>
+quantize:    x_q = cast_fp8( clamp(x * s, -FMAX, FMAX) )
+scale:       s   = (FMAX / amax) / 2^margin          # FMAX = 448 (E4M3) or 57344 (E5M2)
+dequantize:  x  ~= x_q / s
+FP8 GEMM:    C   = (A_q @ B_q) / (s_A * s_B)          # FP8 inputs, higher-precision accumulate,
+                                                      # 1/(s_A s_B) applied in the GEMM epilogue
+</pre>
+<p><b>Worked example (E4M3, amax = 3.5, margin 0):</b> s = 448 / 3.5 = 128 = 2<sup>7</sup>.</p>
+<ul>
+    <li><b>Without a scale:</b> x = 0.001 lies below the min normal (2<sup>&minus;6</sup>), so it lands on the subnormal grid with step 2<sup>&minus;9</sup> &asymp; 0.00195. 0.001 / 0.00195 = 0.51, which rounds to 1 step = 0.00195. That is a <b>95% error</b>.</li>
+    <li><b>With s = 128:</b> 0.128 lies in [2<sup>&minus;3</sup>, 2<sup>&minus;2</sup>), where the ulp is 2<sup>&minus;6</sup>. 0.128 / 2<sup>&minus;6</sup> = 8.19, which rounds to 8, giving 0.125. Dividing by 128 gives 0.000977, a <b>2.3% error</b>.</li>
+</ul>
+<p><b>Tip:</b> If you pick power-of-two scales, multiplying by the scale only shifts the exponent and adds no rounding error of its own. MX formats require power-of-two scales (E8M0); see L6.</p>
+
+<h2>4. Scaling strategies</h2>
+<table>
+    <tr><th>Strategy</th><th>How amax is obtained</th><th>Pro</th><th>Con</th></tr>
+    <tr><td><b>Current (just-in-time) per-tensor</b></td><td>Reduce over the tensor <i>now</i>, then cast</td><td>Accurate and reacts immediately to spikes</td><td>Needs an extra pass over the tensor (read, reduce, then cast), and the cast is harder to fuse into the producing kernel</td></tr>
+    <tr><td><b>Delayed per-tensor</b> (Transformer Engine's classic default)</td><td>Max over an <i>amax history</i> from previous iterations; the current amax is recorded for later</td><td>The cast can be fused into the producer kernel, with no extra read</td><td>Stale: a sudden outlier saturates in the current step</td></tr>
+    <tr><td><b>Fine-grained block/tile</b></td><td>One scale per tile, e.g. 1&times;128 for activations and 128&times;128 for weights (DeepSeek-V3) <span class="ver tv">verify</span></td><td>Outliers only affect their own block</td><td>More scale metadata; the GEMM must apply scales per block</td></tr>
+    <tr><td><b>MXFP8</b> (Blackwell)</td><td>One E8M0 scale per 32 elements, in hardware <span class="ver tv">verify</span></td><td>Hardware-native block scaling</td><td>Covered in L6</td></tr>
+</table>
+<p><b>Delayed scaling settings:</b> <code>amax_history_len</code>, <code>amax_compute_algo</code> ("max" or "most_recent"), and <code>margin</code>. Margin gives 2<sup>margin</sup> of headroom at the cost of precision. With data or tensor parallelism, amaxes are typically all-reduced so that ranks use the same scales <span class="ver tv">verify (TE docs)</span>.</p>
+<pre>
+# Transformer Engine sketch; the API changes between versions, so check your installed version
+import transformer_engine.pytorch as te
+from transformer_engine.common.recipe import DelayedScaling, Format
+
+recipe = DelayedScaling(fp8_format=Format.HYBRID, amax_history_len=16, amax_compute_algo="max")
+layer  = te.Linear(4096, 4096).cuda()
+with te.fp8_autocast(enabled=True, fp8_recipe=recipe):
+    y = layer(x)
+</pre>
+
+<h2>5. What stays in higher precision, and the memory reality</h2>
+<ul>
+    <li><b>FP8 is used only for GEMM inputs</b> in Linear layers (QKV, out-proj, MLP). Softmax, norms, residual adds, loss, optimizer, and often attention BMMs, embeddings and the LM head stay BF16/FP32. The reasons are the same as in L1 and L3: reductions and exponentials.</li>
+    <li><b>Accumulation:</b> FP8 GEMMs accumulate in higher precision. DeepSeek-V3 reports that H100 FP8 accumulation keeps only about 14 bits, so they move partial sums to FP32 on CUDA cores every 128 elements along K <span class="ver tv">verify</span>. This is a good systems detail to bring up.</li>
+    <li><b>Master weights and optimizer state</b> stay FP32/BF16. FP8 adds <i>extra</i> cached FP8 weight copies, plus transposed copies for backward, because Hopper FP8 GEMMs need a specific layout <span class="ver tv">verify</span>. <b>FP8 does not shrink parameter or optimizer memory</b>. It saves GEMM time, bandwidth and saved-activation memory.</li>
+</ul>
+
+<h2>6. Failure modes and a debugging checklist</h2>
+<table>
+    <tr><th>Symptom</th><th>Likely cause</th><th>Check or fix</th></tr>
+    <tr><td>Loss spike right after a data or LR change</td><td>Stale delayed scale, so outliers saturate</td><td>Log per-tensor amax and saturation rate; shorter history, margin=1, or current scaling</td></tr>
+    <tr><td>Diverges only after a long run (many tokens); BF16 is fine</td><td>Activation outliers grow over training (e.g. SwiGLU amplification), beyond per-tensor range (Fishman et al. 2024, <i>Smooth-SwiGLU</i>) <span class="ver tv">verify</span></td><td>Per-channel/block scaling, or keep that GEMM in BF16</td></tr>
+    <tr><td>Gradients are mostly zero in some layers</td><td>Underflow: scale too small, or the history is dominated by an old spike</td><td>Compare amax with history max; look for subnormal/zero fractions</td></tr>
+    <tr><td>NaN with E4M3</td><td>Non-saturating cast overflow (there is no Inf, so it becomes NaN)</td><td>Make sure the cast saturates; check the lab, part 2</td></tr>
+</table>
+<p><b>Methodology:</b> Always A/B against a BF16 baseline with identical seeds and data. Bisect by switching FP8 off layer by layer: first and last blocks first, then the MLP versus the attention projections.</p>
+
+<h2>7. Interview answer (~30 s)</h2>
+<div class="box">"FP8 doubles Tensor Core throughput over BF16, but E4M3 covers only about 18 binades, so one global loss scale like in FP16 isn't enough. You need a scale per tensor or per block. We use E4M3 forward for precision and E5M2 for gradients for range. Each tensor is scaled by FMAX over amax, and the GEMM applies the inverse scales in its epilogue with higher-precision accumulation. Delayed scaling takes amax from a history so the cast can be fused, but it lags behind outliers. Current or block scaling fixes that at some cost. Norms, softmax, the optimizer and master weights stay in high precision. So FP8 saves compute and bandwidth, not optimizer memory."</div>
+
+<h2>8. Lab (~15 min, CPU is fine, PyTorch &ge; 2.1)</h2>
+<pre>
+import torch
+torch.manual_seed(0)
+E4M3, E5M2 = torch.float8_e4m3fn, torch.float8_e5m2
+FMAX = {E4M3: 448.0, E5M2: 57344.0}
+
+def q(x, dt, scale=1.0):
+    """Quantize-dequantize with a saturating cast."""
+    y = (x * scale).clamp(-FMAX[dt], FMAX[dt]).to(dt)
+    return y.float() / scale
+
+def rel_err(x, xh):
+    return ((x - xh).norm() / x.norm()).item()
+
+# 1) Small-magnitude tensor (like activation gradients)
+g = torch.randn(4096) * 1e-5
+print("E4M3 no scale        :", rel_err(g, q(g, E4M3)))
+print("E5M2 no scale        :", rel_err(g, q(g, E5M2)))
+s = FMAX[E4M3] / g.abs().max()
+print("E4M3 per-tensor scale:", rel_err(g, q(g, E4M3, s)))
+
+# 2) PREDICT FIRST: what does an UNclamped overflow give in your PyTorch version?
+print(torch.tensor([500.0, -1000.0]).to(E4M3).float())
+
+# 3) Delayed scaling hit by an outlier spike
+hist, H, margin = [], 16, 0
+for step in range(48):
+    x = torch.randn(4096)
+    if step == 30:
+        x[0] = 50.0                                   # outlier
+    amax_now = x.abs().max().item()
+    scale = (FMAX[E4M3] / max(hist) / 2**margin) if hist else 1.0
+    sat = ((x * scale).abs() &gt; FMAX[E4M3]).sum().item()
+    err = rel_err(x, q(x, E4M3, scale))
+    hist = (hist + [amax_now])[-H:]
+    if step in (0, 1, 29, 30, 31, 46, 47):
+        print(f"step {step:2d}  scale={scale:7.2f}  saturated={sat}  rel_err={err:.4f}")
+</pre>
+<p><b>Tasks:</b></p>
+<ol>
+    <li>Before running part 1, predict which unscaled format does better, and why.</li>
+    <li>Predict when the scale recovers after the spike, given <code>H=16</code>. Then rerun with <code>margin=1</code> and with <code>H=1</code> (equivalent to "most_recent"), and explain the trade-off.</li>
+    <li><b>Stretch:</b> Implement 1&times;128 block scaling for part 3 and show that the spike now affects only one block.</li>
+</ol>
+
+<h2>9. Quiz</h2>
+<p>Numeric questions: enter digits only. Feedback appears immediately.</p>
+<div id="quiz"></div>
+<p id="score"></p>
+
+<h2>10. Sources</h2>
+<ul>
+    <li>Micikevicius et al., "FP8 Formats for Deep Learning", 2022, <a href="https://arxiv.org/abs/2209.05433v2">arXiv:2209.05433</a> <span class="ver ok">verified: E4M3/E5M2 definitions and recommended use</span>. The E4M3 special-value encoding and 448 max <span class="ver tv">verify (Section 3 of the paper)</span>.</li>
+    <li>NVIDIA Transformer Engine documentation, FP8 primer and <code>DelayedScaling</code> recipe <span class="ver tv">verify</span></li>
+    <li>DeepSeek-AI, "DeepSeek-V3 Technical Report", arXiv:2412.19437, FP8 framework section <span class="ver tv">verify</span></li>
+    <li>Fishman et al., "Scaling FP8 Training to Trillion-Token LLMs", arXiv:2409.12517 <span class="ver tv">verify</span></li>
+    <li>OCP Microscaling (MX) Formats Specification v1.0 (preview of L6) <span class="ver tv">verify</span></li>
+</ul>
+
+<script>
+    const Q = [
+        {q:"Largest finite FP8 E4M3 ('fn' variant) value?", type:"num", a:448, tol:0,
+            why:"No Inf, so exponent field 1111 is usable: 2^(15-7) * 1.75 = 448. An IEEE-style formula would give 240."},
+        {q:"Largest finite FP8 E5M2 value?", type:"num", a:57344, tol:0,
+            why:"IEEE-like: top usable exponent 11110 gives 2^(30-15) = 2^15, times 1.75 = 57344."},
+        {q:"About how many binades (log2 of max / min subnormal) does E4M3 cover?", type:"mc",
+            opts:["~8","~18","~32","~40"], a:1,
+            why:"log2(448) + 9 = 8.8 + 9 = 17.8. E5M2 covers ~32 and FP16 ~40. This is why one global scale isn't enough."},
+        {q:"Why is E5M2 recommended for gradients?", type:"mc",
+            opts:["It has more mantissa bits",
+                "Gradient magnitudes span a wider and shifting range, so range matters more than precision",
+                "It has no NaN encoding",
+                "Tensor Cores only accept E5M2 in backward"], a:1,
+            why:"E5M2 trades a mantissa bit for an exponent bit (~32 vs ~18 binades). Gradients vary more than forward tensors."},
+        {q:"E4M3, amax = 3.5, margin = 0. Scale factor s?", type:"num", a:128, tol:0,
+            why:"s = FMAX / amax = 448 / 3.5 = 128 = 2^7. A power of two adds no rounding error."},
+        {q:"FP8 GEMM with s_A = 64 and s_B = 16. The accumulator holds 2048. What is the true output value?", type:"num", a:2, tol:1e-9,
+            why:"C = acc / (s_A * s_B) = 2048 / 1024 = 2, applied in the epilogue."},
+        {q:"Main <i>systems</i> benefit of delayed scaling over current scaling?", type:"mc",
+            opts:["Higher accuracy on outliers",
+                "The scale is known before the tensor is produced, so the FP8 cast can be fused into the producer kernel (no extra pass)",
+                "It removes the need for FP32 master weights",
+                "It reduces optimizer memory"], a:1,
+            why:"Current scaling has to read and reduce the tensor before casting, which costs an extra pass. Delayed scaling uses amax from history."},
+        {q:"Main risk of delayed scaling?", type:"mc",
+            opts:["Scales are recomputed too often",
+                "A sudden amax spike saturates in the current step, and an old spike in the history depresses precision for up to history_len steps",
+                "It only works with E5M2",
+                "It forces BF16 accumulation"], a:1,
+            why:"The scale lags behind the data in both directions. The lab, part 3, shows both effects."},
+        {q:"Which of these typically stays in BF16/FP32 in an FP8 recipe?", type:"mc",
+            opts:["MLP up-projection GEMM inputs","QKV projection GEMM inputs","LayerNorm/RMSNorm and softmax","Attention output projection GEMM inputs"], a:2,
+            why:"Only Linear-layer GEMM inputs go to FP8. Reductions and exponentials stay in high precision (see L1 and L3)."},
+        {q:"Compared with BF16 mixed precision + Adam, FP8 training mainly reduces...", type:"mc",
+            opts:["Optimizer-state memory","Master-weight memory","GEMM time, bandwidth and saved-activation memory","Gradient all-reduce precision requirements"], a:2,
+            why:"Optimizer state and master weights stay in high precision. FP8 even adds cached FP8 copies and transposes of the weights."}
+    ];
+    const root = document.getElementById("quiz"), done = {};
+    Q.forEach((it, i) => {
+        const s = document.createElement("section"); s.className = "q";
+        let h = `<p><b>Q${i+1}.</b> ${it.q}</p>`;
+        h += it.type === "num"
+            ? `<input id="in${i}" type="text">`
+            : it.opts.map((o, j) => `<label><input type="radio" name="q${i}" value="${j}"> ${o}</label><br>`).join("");
+        h += `<br><button data-i="${i}">Check</button><p class="fb" id="fb${i}"></p>`;
+        s.innerHTML = h; root.appendChild(s);
+    });
+    root.addEventListener("click", e => {
+        if (e.target.tagName !== "BUTTON") return;
+        const i = +e.target.dataset.i, it = Q[i]; let ok;
+        if (it.type === "num") {
+            const v = parseFloat(document.getElementById("in" + i).value);
+            ok = !isNaN(v) && Math.abs(v - it.a) <= it.tol;
+        } else {
+            const c = document.querySelector(`input[name=q${i}]:checked`); ok = !!c && +c.value === it.a;
+        }
+        const fb = document.getElementById("fb" + i);
+        fb.className = "fb " + (ok ? "good" : "bad");
+        fb.textContent = (ok ? "Correct. " : "Not quite. ") + it.why;
+        done[i] = ok;
+        document.getElementById("score").textContent =
+            `Score: ${Object.values(done).filter(Boolean).length}/${Q.length}`;
+    });
+</script>

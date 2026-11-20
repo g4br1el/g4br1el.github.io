@@ -1,0 +1,157 @@
+---
+layout: tutorial
+tutorial: prep-nov26
+type: lesson
+lesson: 12
+total: 12
+title: "Lesson 12: Mock Interview"
+tags: []
+permalink: /heap/nov26/012/
+---
+
+
+    <div class="box"><b>Rules:</b>
+        <ul>
+            <li>Answer out loud, or on paper, <i>before</i> opening "Key points".</li>
+            <li>Tick only the points you actually covered without prompting.</li>
+            <li>Record yourself if possible. Interviewers judge structure and trade-offs, not just facts.</li>
+        </ul></div>
+
+    <div id="timer">
+        <span id="clock">60:00</span>
+        <button id="start">Start</button><button id="pause">Pause</button><button id="reset">Reset</button>
+        <span class="meta" id="round-hint"></span>
+    </div>
+
+    <div id="rounds"></div>
+
+    <h2>Result</h2>
+    <button id="calc">Calculate score</button>
+    <p id="result"></p>
+    <div id="bands" class="meta"></div>
+
+    <h2>After the mock</h2>
+    <ol>
+        <li>For every unticked key point, reopen the relevant lesson (the tag on each question).</li>
+        <li>Write a 3-sentence answer for your two weakest questions and say it out loud again tomorrow.</li>
+        <li>Repeat this mock in 5–7 days with the questions in reverse order.</li>
+    </ol>
+</main>
+
+<script>
+    const R = [
+        {title:"Round 1 — Numerics fundamentals", min:15, qs:[
+                {tag:"L1", q:"Derive FP16's max finite value, smallest subnormal and machine epsilon from its bit layout. Then contrast with BF16: which is 'more precise'?",
+                    k:["Layout 1/5/10, bias 15; all-ones exponent reserved for Inf/NaN",
+                        "Max = (2 − 2^−10)·2^15 = 65504",
+                        "Min subnormal 2^−24, eps 2^−10",
+                        "BF16 1/8/7: FP32 range, eps 2^−7 (8× coarser); FP16 finer but narrow range"]},
+                {tag:"L5", q:"Why is the max of FP8 E4M3 448 and not 240? Which FP8 format do you use for gradients, and why?",
+                    k:["E4M3 (fn variant) has no Inf; only S.1111.111 is NaN, so the top exponent is usable",
+                        "2^8 · 1.75 = 448",
+                        "E5M2 for gradients: wider dynamic range; E4M3 for weights/activations: more precision",
+                        "Scaling (per-tensor/delayed or block) is mandatory either way"]},
+                {tag:"L3", q:"Derive a numerically stable log-sum-exp and the gradient of softmax cross-entropy w.r.t. the logits.",
+                    k:["LSE(x) = m + log Σ exp(x_i − m), with m = max x",
+                        "Prevents overflow in exp; at least one term equals 1, so no log(0)",
+                        "CE = LSE(z) − z_y, from the MLE / negative log-likelihood",
+                        "∂CE/∂z = softmax(z) − onehot(y); compute it in FP32"]},
+                {tag:"L7", q:"Sketch the derivation of He initialization.",
+                    k:["Var(y) = fan_in · Var(W) · E[x²] for independent zero-mean weights",
+                        "ReLU halves the second moment: E[x²] = ½ Var(pre-activation)",
+                        "Keeping the variance constant across layers ⇒ Var(W) = 2 / fan_in",
+                        "Xavier: 2 / (fan_in + fan_out) for linear/tanh, balancing forward and backward"]}
+            ]},
+        {title:"Round 2 — Debugging", min:15, qs:[
+                {tag:"L4 · L9 · L11", q:"Scenario: a 7B transformer, BF16 with FSDP2, trained fine on 8 GPUs. On 64 GPUs the loss spikes repeatedly after warmup and hits NaN at step ~12k. Walk me through your investigation.",
+                    k:["Structure first: reproduce from a checkpoint before the spike; fix the seed and data order",
+                        "Locate the first non-finite tensor (forward/backward hooks, anomaly mode on a short replay)",
+                        "Inspect the grad-norm, update/weight-ratio and per-layer activation/attention-logit histories",
+                        "Ask what changed from 8 to 64 GPUs: effective batch/LR scaling, warmup length, reduce dtype",
+                        "Numerics fixes: FP32 reduce_dtype, FP32 logits/softmax, norms in FP32, QK-norm or logit soft-capping",
+                        "Rule out data: a bad batch (replay it), tokenization outliers",
+                        "Validate the fix with A/B runs and change one variable at a time"]},
+                {tag:"L2", q:"Your FP16 run's GradScaler scale keeps dropping and many steps are skipped. What does that tell you, and what do you check?",
+                    k:["Repeated Inf/NaN in the scaled gradients ⇒ a genuine overflow source, not just a scale that is too high",
+                        "Check unscale_ before clip_grad_norm_; order of scaler.step / scaler.update",
+                        "Find the op that overflows (attention scores, exp, large activations) and keep it in FP32",
+                        "Consider BF16 if the hardware supports it"]}
+            ]},
+        {title:"Round 3 — Systems design", min:20, qs:[
+                {tag:"L5 · L6 · L11", q:"Design an FP8 training recipe for a 70B transformer on 64 H100-class GPUs with FSDP2. Estimate the persistent memory per GPU and name the main communication costs.",
+                    k:["FP8 for the linear-layer GEMMs; softmax, norms, loss and optimizer stay BF16/FP32",
+                        "Scaling: per-tensor delayed scaling (amax history) vs current scaling; block/MX scaling on newer hardware",
+                        "FP32 sharded master weights and Adam state: 16 B · 70e9 / 64 ≈ 17.5 GB per GPU, plus activations",
+                        "Comm: BF16 all-gathers twice per step + reduce-scatter (FP32 vs BF16 trade-off); overlap with compute",
+                        "Activation memory: activation checkpointing, sequence/tensor parallelism if needed",
+                        "Validation: loss parity vs a BF16 baseline on a short run; monitor amax and overflow counts",
+                        "Fallback plan: keep sensitive layers (first/last, router) in BF16"]}
+            ]},
+        {title:"Round 4 — Normalization & quantization rapid-fire", min:5, qs:[
+                {tag:"L8", q:"Pre-norm vs post-norm: why do most large models use pre-norm? RMSNorm vs LayerNorm?",
+                    k:["Pre-norm keeps an identity residual path ⇒ better gradient flow, less warmup sensitivity",
+                        "Post-norm can reach better final quality but is harder to train deep",
+                        "RMSNorm drops mean-centering and the bias: cheaper, works as well empirically"]},
+                {tag:"L10", q:"What problem does SmoothQuant solve, and when do you choose QAT over PTQ?",
+                    k:["Activation outlier channels make per-tensor INT8 activation quantization fail",
+                        "Migrate the scale: X·diag(s)^−1 and diag(s)·W balance the difficulty between activations and weights",
+                        "QAT when PTQ loses too much accuracy (low bit-widths, sensitive models) and you can afford training"]}
+            ]},
+        {title:"Round 5 — Behavioral", min:5, qs:[
+                {tag:"All", q:"Tell me about a time you found a hard numerical or performance bug.",
+                    k:["STAR structure: Situation, Task, Action, Result",
+                        "Concrete measurements (before/after numbers)",
+                        "A hypothesis-driven process, not trial and error",
+                        "What you changed afterwards (tests, monitoring, team practice)"]}
+            ]}
+    ];
+
+    const root = document.getElementById("rounds");
+    let qid = 0;
+    R.forEach(r => {
+        const h = document.createElement("h2");
+        h.textContent = `${r.title} (${r.min} min)`;
+        root.appendChild(h);
+        r.qs.forEach(q => {
+            const id = qid++;
+            const c = document.createElement("div"); c.className = "card";
+            c.innerHTML = `<p class="meta">Q${id + 1} · review: ${q.tag}</p><p><b>${q.q}</b></p>
+      <textarea id="n${id}" placeholder="Your notes (saved in this browser)"></textarea>
+      <details><summary>Key points (open after answering)</summary>
+      ${q.k.map((t, j) => `<label><input type="checkbox" class="kp" id="k${id}_${j}"> ${t}</label>`).join("")}
+      </details>`;
+            root.appendChild(c);
+            const ta = c.querySelector("textarea");
+            ta.value = localStorage.getItem("l12n" + id) || "";
+            ta.addEventListener("input", () => localStorage.setItem("l12n" + id, ta.value));
+        });
+    });
+
+    // Timer
+    let left = 3600, tick = null;
+    const clock = document.getElementById("clock"), hint = document.getElementById("round-hint");
+    const ends = []; let acc = 0; R.forEach(r => { acc += r.min * 60; ends.push(acc); });
+    function draw() {
+        const m = String(Math.floor(left / 60)).padStart(2, "0"), s = String(left % 60).padStart(2, "0");
+        clock.textContent = `${m}:${s}`;
+        const used = 3600 - left, idx = ends.findIndex(e => used < e);
+        hint.textContent = idx === -1 ? "Time is up — finish your sentence." : `Now: ${R[idx].title}`;
+    }
+    document.getElementById("start").onclick = () => {
+        if (tick) return;
+        tick = setInterval(() => { if (left > 0) { left--; draw(); } else { clearInterval(tick); tick = null; } }, 1000);
+    };
+    document.getElementById("pause").onclick = () => { clearInterval(tick); tick = null; };
+    document.getElementById("reset").onclick = () => { clearInterval(tick); tick = null; left = 3600; draw(); };
+    draw();
+
+    // Score
+    document.getElementById("calc").onclick = () => {
+        const all = document.querySelectorAll(".kp"), got = [...all].filter(x => x.checked).length;
+        const pct = Math.round(100 * got / all.length);
+        let verdict = pct >= 80 ? "Strong hire signal" : pct >= 60 ? "Borderline — tighten weak areas" : "Not ready yet — revisit the tagged lessons";
+        document.getElementById("result").textContent = `${got}/${all.length} key points (${pct}%) — ${verdict}`;
+    };
+    document.getElementById("bands").textContent =
+        "Bands: ≥80% strong · 60–79% borderline · below 60% revisit. Also self-rate structure and clarity (1–5) in your notes.";
+</script>
