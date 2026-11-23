@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 6: Block-Scaled Formats — Gabriel Dax</title>
+  <!-- Begin Jekyll SEO tag v2.9.1 -->
+<meta name="generator" content="Jekyll v4.4.1" />
+<meta property="og:title" content="Lesson 6: Block-Scaled Formats" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="Interview skill: Design and defend an FP8 training recipe: format per tensor, scale computation, what stays in higher precision, and how it fails." />
+<meta name="twitter:description" property="og:description" content="Interview skill: Design and defend an FP8 training recipe: format per tensor, scale computation, what stays in higher precision, and how it fails." />
+<link rel="canonical" href="https://www.gabrieldax.de/heap/nov26/006/" />
+<meta property="og:url" content="https://www.gabrieldax.de/heap/nov26/006/" />
+<meta property="og:site_name" content="Gabriel Dax — ML Research Engineer" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2026-11-23T09:53:36+00:00" />
+<meta property="article:modified_time" content="2026-11-23T09:53:36+00:00" />
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:title" content="Lesson 6: Block-Scaled Formats" />
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"BlogPosting","dateModified":"2026-11-23T09:53:36+00:00","datePublished":"2026-11-23T09:53:36+00:00","description":"Interview skill: Design and defend an FP8 training recipe: format per tensor, scale computation, what stays in higher precision, and how it fails.","headline":"Lesson 6: Block-Scaled Formats","mainEntityOfPage":{"@type":"WebPage","@id":"https://www.gabrieldax.de/heap/nov26/006/"},"url":"https://www.gabrieldax.de/heap/nov26/006/"}</script>
+<!-- End Jekyll SEO tag -->
+
+  <meta content='text/html; charset=utf-8' http-equiv='Content-Type'>
+<meta http-equiv='X-UA-Compatible' content='IE=edge'>
+<meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0'>
+
+
+<meta property="og:description" content="Interview skill: Design and defend an FP8 training recipe: format per tensor, scale computation, what stays in higher precision, and how it fails." />
+
+<meta name="author" content="Gabriel Dax" />
+
+
+
+<meta property="og:title" content="Lesson 6: Block-Scaled Formats" />
+<meta property="twitter:title" content="Lesson 6: Block-Scaled Formats" />
+
+
+
+<meta property="og:image" content="https://www.gabrieldax.de/images/self.png"/>
+<meta property="twitter:image" content="https://www.gabrieldax.de/images/self.png"/>
+
+
+  <link rel="stylesheet" href="/assets/style.css">
+  <link rel="icon" type="image/png" sizes="32x32" href="/images/favicon.jpg">
+  <link rel="canonical" href="https://www.gabrieldax.de/heap/nov26/006/">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  
+
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div>
+      <a href="/" class="site-name">Gabriel Dax</a>
+      <span class="site-tagline">ML Research Engineer</span>
+    </div>
+    <nav>
+      <a href="/" >Home</a>
+      <a href="/projects" >Projects</a>
+      <a href="/publications" >Publications</a>
+      <a href="/bio" >CV</a>
+    </nav>
+  </div>
+</header>
+
+<main class="main-content">
+  <div class="container">
+    <div class="tutorial-wrapper">
+
+    <nav class="tutorial-breadcrumb">
+        <a href="/heap/">← All Tutorials</a>
+        
+        <span class="tutorial-position">Lesson 6 / 12</span>
+        
+    </nav>
+
+    <article class="tutorial-article">
+        
+        <div class="tutorial-lesson-header">
+            <span class="tutorial-tag">Lesson 006</span>
+            
+        </div>
+        
+
+        <h1>Lesson 6: Block-Scaled Formats</h1>
+
+        <p><b>Interview skill:</b> Design and defend an FP8 training recipe: format per tensor, scale computation, what stays in higher precision, and how it fails.</p>
+
+<div class="box"><b>Legend:</b>
+    <span class="ver ok">verified</span> = checked against the primary source in this session &middot;
+    <span class="ver tv">verify</span> = from memory; check before quoting in an interview.</div>
+
+<h2>1. From L5: why per-tensor scaling stops working</h2>
+<p>Per-tensor scaling puts the tensor's amax at the top of the format. Every other element then has to fit in the binades below it. The fewer binades the element format has, the more one outlier pushes the bulk of the tensor into underflow or coarse rounding:</p>
+<table>
+    <tr><th>Element format</th><th>Max</th><th>Min subnormal</th><th>Binades</th></tr>
+    <tr><td>FP8 E4M3</td><td>448</td><td>2<sup>&minus;9</sup></td><td>&asymp;17.8</td></tr>
+    <tr><td>FP6 E3M2</td><td>28</td><td>2<sup>&minus;4</sup></td><td>&asymp;8.8</td></tr>
+    <tr><td>FP6 E2M3</td><td>7.5</td><td>2<sup>&minus;3</sup></td><td>&asymp;5.9</td></tr>
+    <tr><td>FP4 E2M1</td><td>6</td><td>0.5</td><td><b>&asymp;3.6</b></td></tr>
+</table>
+<p>FP4 has only ~3.6 binades, so a single scale for the whole tensor cannot work. The fix is to <b>shrink the scaling domain</b> until the values inside it share a local magnitude: one scale per block of 16 or 32 elements.</p>
+
+<h2>2. Element bit layouts (derive them yourself)</h2>
+<p><b>FP4 E2M1</b> (bias 1, no Inf/NaN). All 8 non-negative values:</p>
+<table>
+    <tr><th>Exp field</th><th>Meaning</th><th>m=0</th><th>m=1</th></tr>
+    <tr><td>00</td><td>subnormal: 2<sup>0</sup>&middot;(m/2)</td><td>0</td><td>0.5</td></tr>
+    <tr><td>01</td><td>2<sup>0</sup>&middot;(1+m/2)</td><td>1</td><td>1.5</td></tr>
+    <tr><td>10</td><td>2<sup>1</sup>&middot;(1+m/2)</td><td>2</td><td>3</td></tr>
+    <tr><td>11</td><td>2<sup>2</sup>&middot;(1+m/2)</td><td>4</td><td><b>6</b></td></tr>
+</table>
+<p>The grid is {0, 0.5, 1, 1.5, 2, 3, 4, 6}. The relative gap is 50% between 4 and 6, and 33% between 1.5 and 2. Rounding error is large by construction. That's why scale quality and outlier handling dominate FP4 accuracy.</p>
+<table>
+    <tr><th>Format</th><th>Bias</th><th>emax (largest exponent)</th><th>Max</th><th>Min normal</th><th>Inf/NaN</th></tr>
+    <tr><td>E2M1 (FP4)</td><td>1</td><td>2</td><td>6</td><td>1</td><td>none</td></tr>
+    <tr><td>E2M3 (FP6)</td><td>1</td><td>2</td><td>7.5</td><td>1</td><td>none</td></tr>
+    <tr><td>E3M2 (FP6)</td><td>3</td><td>4</td><td>28</td><td>0.25</td><td>none</td></tr>
+    <tr><td>E4M3 (FP8)</td><td>7</td><td>8</td><td>448</td><td>2<sup>&minus;6</sup></td><td>NaN only</td></tr>
+    <tr><td>E5M2 (FP8)</td><td>15</td><td>15</td><td>57344</td><td>2<sup>&minus;14</sup></td><td>Inf + NaN</td></tr>
+</table>
+<p>The FP6/FP4 encodings follow the OCP MX spec <span class="ver tv">verify (OCP MX v1.0)</span>. MXINT8 elements are 8-bit two's-complement values with an implicit fixed-point scale <span class="ver tv">verify details</span>.</p>
+
+<h2>3. The MX (OCP Microscaling) standard</h2>
+<ul>
+    <li><b>Structure:</b> k narrow elements share one scale X. The value of element i is X &middot; P<sub>i</sub>. The paper evaluates MX as "a block-level scale on top of narrow bit-width elements" <span class="ver ok">verified</span> (<a href="https://arxiv.org/abs/2310.10537v3">arXiv:2310.10537</a>).</li>
+    <li><b>Shared scale is E8M0:</b> "All concrete MX formats use E8M0 (an 8-bit exponent) as the format for the shared scale. The representable exponents of these formats is a superset of the representable exponents of FP32." <span class="ver ok">verified</span> (<a href="https://arxiv.org/abs/2310.10537v3">arXiv:2310.10537</a>)</li>
+    <li><b>E8M0</b> means no sign bit and no mantissa: X = 2<sup>e&minus;127</sup>, with 0xFF reserved for NaN and no encoding for zero <span class="ver tv">verify</span>. Scales are therefore <b>powers of two only</b>. Applying one only shifts the exponent, but the scale itself can be off by up to 2&times; from ideal.</li>
+    <li><b>Block size k = 32</b> for all concrete formats: MXFP8 (E4M3/E5M2), MXFP6 (E3M2/E2M3), MXFP4 (E2M1), MXINT8 <span class="ver tv">verify (Table 1)</span>.</li>
+    <li><b>Storage cost:</b> MXFP8 = 8 + 8/32 = 8.25 bits/element; MXFP4 = 4 + 8/32 = <b>4.25</b> bits/element.</li>
+</ul>
+
+<h3>Scale rule and its clipping problem</h3>
+<pre>
+OCP rule:     X = 2^( floor(log2(amax_block)) - emax_elem )      # emax: E2M1=2, E4M3=8
+              P_i = quantize_saturating( V_i / X )
+Consequence:  amax / X lies in [2^emax, 2^(emax+1))
+              E2M1: [4, 8)    but max is 6   -> values in (6, 8) clip
+              E4M3: [256,512) but max is 448 -> values in (448, 512) clip
+Fix (used in MXFP8 training recipes): round the scale UP
+              X = 2^ceil( log2(amax_block / FMAX) )   # never clips, but wastes up to 1 binade
+</pre>
+<p><b>Worked example (E2M1, block amax = 7.5):</b></p>
+<ul>
+    <li><b>Floor rule:</b> floor(log2 7.5) = 2, so X = 2<sup>2&minus;2</sup> = 1. Then 7.5 saturates to 6, a <b>20% error on the largest element</b>. The largest element is often the one that matters most.</li>
+    <li><b>Ceil rule:</b> X = 2<sup>ceil(log2 1.25)</sup> = 2. Then 7.5/2 = 3.75 rounds to 4, giving 8: <b>6.7% error</b>. But every other element in the block is now on a grid twice as coarse.</li>
+</ul>
+<p>Rounding the scale up for MXFP8 is recommended in NVIDIA's MXFP8 pre-training recipe <span class="ver tv">verify (Mishra et al. 2025, arXiv:2506.08027)</span>. This is a good concrete example of a choice the spec leaves open but that affects training.</p>
+
+<h2>4. NVFP4: smaller blocks, finer scales, two levels</h2>
+<table>
+    <tr><th></th><th>MXFP4</th><th>NVFP4</th></tr>
+    <tr><td>Elements</td><td>E2M1</td><td>E2M1</td></tr>
+    <tr><td>Block size</td><td>32</td><td><b>16</b></td></tr>
+    <tr><td>Block scale</td><td>E8M0 (power of two)</td><td><b>E4M3</b> (fractional)</td></tr>
+    <tr><td>Second level</td><td>none</td><td>FP32 per-tensor scale</td></tr>
+    <tr><td>Bits/element</td><td>4.25</td><td>4.5 (+ negligible per-tensor scale)</td></tr>
+</table>
+<p>All NVFP4 rows: <span class="ver tv">verify (NVIDIA Blackwell docs / NVFP4 paper)</span>.</p>
+<pre>
+g        = amax_tensor / (6 * 448)                     # FP32 per-tensor scale
+s_block  = cast_e4m3( (amax_block / 6) / g ) * g       # block scale, ~3-bit mantissa
+x_q      = cast_e2m1( x / s_block )
+</pre>
+<ul>
+    <li><b>Why an E4M3 scale:</b> The block amax lands close to 6 instead of anywhere in [4, 8). This recovers most of the "up to 1 binade" waste of E8M0.</li>
+    <li><b>Why the FP32 second level:</b> E4M3 covers only ~18 binades (L5), while E8M0 covers more than FP32. Without g, block scales of small tensors (e.g. gradients ~1e&minus;6) would underflow in E4M3. g moves the whole tensor into the range where E4M3 scales work.</li>
+    <li><b>Why block 16:</b> Fewer elements share an outlier's scale. The cost is twice the scale metadata and scale-handling work.</li>
+</ul>
+
+<h2>5. Systems: what block scaling does to the GEMM</h2>
+<pre>
+per-tensor:  C[i,j] = (1 / (sA * sB)) * Σ_k Aq[i,k] Bq[k,j]          # scale factors out -> epilogue
+per-block:   C[i,j] = Σ_b  sA[i,b] * sB[b,j] * Σ_{k in b} Aq[i,k] Bq[k,j]
+</pre>
+<ul>
+    <li><b>Blocks must run along K, the reduction dimension.</b> Then each partial dot product has one constant scale product. Block scales cannot be pulled out into the epilogue: they must be applied <i>inside</i> the K loop. Blackwell does this in hardware with block-scaled MMA (MXFP8/6/4, NVFP4) <span class="ver tv">verify (PTX ISA / Blackwell docs)</span>. On Hopper there is no native support. DeepSeek-V3 emulated it with FP8 MMAs and FP32 promotion on CUDA cores (L5).</li>
+    <li><b>Transpose problem:</b> Forward reduces W over input features. Backward computes dgrad = dY&middot;W and wgrad = X<sup>T</sup>&middot;dY, which reduce over other dimensions. A 1&times;32 block along rows is the wrong blocking for the transposed use. You need a second quantization of the <i>original high-precision</i> tensor along the other axis. Re-quantizing the quantized one adds error twice. That means two FP8/FP4 copies (rowwise and columnwise), extra memory traffic, and <b>forward and backward that see slightly different weights</b>. The NVFP4 recipe uses <b>16&times;16 2D blocks for weights</b> so both directions see the same quantized W <span class="ver tv">verify</span>.</li>
+    <li><b>Scale-factor layout:</b> Hardware expects scale factors in a specific swizzled layout. Producing them is part of the quantize kernel, and if it isn't fused it shows up in profiles as extra memory-bound work <span class="ver tv">verify (cuBLAS / TE docs)</span>.</li>
+</ul>
+
+<h2>6. Making FP4 <i>training</i> work: the extra tricks</h2>
+<table>
+    <tr><th>Problem</th><th>Technique</th><th>Why it works</th></tr>
+    <tr><td>Outliers inflate block amax</td><td><b>Random Hadamard transform</b> (RHT) along K, e.g. 16&times;16, on selected GEMM inputs (wgrad)</td><td>Orthogonal: (AH)(H<sup>T</sup>B) = AB exactly. It spreads one outlier over the block, lowering amax/RMS.</td></tr>
+    <tr><td>Round-to-nearest bias accumulates in gradients</td><td><b>Stochastic rounding</b> on gradients, round-to-nearest on forward</td><td>E[SR(x)] = x is unbiased; on a 50%-gap grid, the bias of round-to-nearest is not negligible.</td></tr>
+    <tr><td>Fwd/bwd weight inconsistency</td><td>2D weight blocks</td><td>One quantized W serves both directions.</td></tr>
+    <tr><td>Some layers are sensitive</td><td>Keep a few layers (e.g. the last blocks) in BF16; attention, norms, optimizer stay high precision</td><td>Same as L5's FP32 islands.</td></tr>
+</table>
+<p>Recipe details: NVIDIA's NVFP4 pre-training report and Quartet (MXFP4) <span class="ver tv">verify (arXiv:2509.25642, arXiv:2505.14669)</span>. The MX paper reports results for direct-cast inference, error-diffusion inference, finetuned inference and training, and calls MXINT8 "a compelling" option <span class="ver ok">verified (passage)</span>. Its specific claims about FP6/FP4 training quality: <span class="ver tv">verify</span>.</p>
+
+<h2>7. Block vs. tensor scaling: trade-off summary</h2>
+<table>
+    <tr><th></th><th>Per-tensor (FP8, L5)</th><th>MX (k=32, E8M0)</th><th>NVFP4 (k=16, E4M3 + FP32)</th></tr>
+    <tr><td>Outlier isolation</td><td>none</td><td>32 elements</td><td>16 elements</td></tr>
+    <tr><td>Scale precision</td><td>exact (FP32)</td><td>power of two (up to 2&times; off)</td><td>~3 mantissa bits</td></tr>
+    <tr><td>Metadata</td><td>negligible</td><td>0.25 bit/element</td><td>0.5 bit/element</td></tr>
+    <tr><td>GEMM</td><td>epilogue rescale; any FP8 Tensor Core</td><td>in-loop rescale; Blackwell native</td><td>in-loop rescale; Blackwell native</td></tr>
+    <tr><td>Scale timing</td><td>delayed or current</td><td>current (computed per block at cast)</td><td>current + per-tensor amax</td></tr>
+</table>
+<p><b>Note:</b> Block scaling is always "current" scaling. The block amax is computed when the cast happens, so delayed scaling's staleness problem from L5 goes away. The cost is a reduction inside the quantize kernel.</p>
+
+<h2>8. Interview answer (~30 s)</h2>
+<div class="box">"Below 8 bits the element format has only a few binades. E2M1 covers about 3.6, so one scale per tensor can't hold both outliers and the bulk of the values. MX puts a shared power-of-two E8M0 scale on every 32 elements. NVFP4 uses 16-element blocks with an E4M3 scale, plus an FP32 per-tensor scale that keeps those block scales in range. Blocks run along the GEMM's K dimension, so scales are applied inside the MMA loop, which Blackwell does in hardware. The costs: separate rowwise and columnwise quantized copies for backward, scale metadata, and the scale-rounding choice. The OCP floor rule can clip the block max, so recipes round the scale up. FP4 training also needs Hadamard rotations against outliers, stochastic rounding for gradients, and a few BF16 layers."</div>
+
+<h2>9. Lab (~15 min, CPU is fine, PyTorch &ge; 2.1)</h2>
+<pre>
+import torch, math
+torch.manual_seed(0)
+GRID = torch.tensor([0., .5, 1., 1.5, 2., 3., 4., 6.])   # non-negative E2M1 values
+FP4_MAX, E4M3_MAX = 6.0, 448.0
+
+def round_fp4(y):
+    """Round to nearest E2M1 value, saturating at +-6.
+    argmin breaks exact ties toward the smaller magnitude (true RNE differs only on exact ties)."""
+    a = y.abs().clamp(max=FP4_MAX)
+    idx = (a.unsqueeze(-1) - GRID).abs().argmin(dim=-1)
+    return torch.sign(y) * GRID[idx]
+
+def quant(x, block, scale_fmt):
+    """Fake-quantize x to FP4 with one scale per `block` contiguous elements (last dim)."""
+    xb = x.reshape(-1, block)
+    amax = xb.abs().amax(dim=1, keepdim=True).clamp(min=1e-30)
+    if scale_fmt == "fp32":            # exact scale (reference)
+        s = amax / FP4_MAX
+    elif scale_fmt == "e8m0_floor":    # OCP MX rule, emax(E2M1) = 2
+        s = torch.exp2(torch.floor(torch.log2(amax)) - 2)
+    elif scale_fmt == "e8m0_ceil":     # round scale up: block max never clips
+        s = torch.exp2(torch.ceil(torch.log2(amax / FP4_MAX)))
+    elif scale_fmt == "nvfp4":         # E4M3 block scale + FP32 per-tensor scale
+        g = x.abs().max().clamp(min=1e-30) / (FP4_MAX * E4M3_MAX)
+        s = ((amax / FP4_MAX) / g).clamp(max=E4M3_MAX).to(torch.float8_e4m3fn).float() * g
+        s = s.clamp(min=1e-30)
+    y = xb / s
+    clip = (y.abs() &gt; FP4_MAX).float().mean().item()
+    return (round_fp4(y) * s).reshape(x.shape), clip
+
+def rel_err(x, xh):
+    return ((x - xh).norm() / x.norm()).item()
+
+def rand_hadamard(n, seed=1):
+    H = torch.ones(1, 1)
+    for _ in range(int(math.log2(n))):
+        H = torch.cat([torch.cat([H, H], 1), torch.cat([H, -H], 1)], 0)
+    g = torch.Generator().manual_seed(seed)
+    d = torch.randint(0, 2, (n,), generator=g).float() * 2 - 1
+    return (H * d) / math.sqrt(n)      # H @ diag(d): orthonormal
+
+# ---- Part 1: format comparison on three distributions ----
+N = 4096 * 64
+data = {
+    "gaussian":                torch.randn(N),
+    "student-t(3)":            torch.distributions.StudentT(3.0).sample((N,)),
+    "gauss + 0.1% outliers x50": torch.randn(N) * (1 + 49 * (torch.rand(N) &lt; 1e-3).float()),
+}
+configs = [("per-tensor FP4",      N,  "fp32"),
+           ("MXFP4 floor (k=32)",  32, "e8m0_floor"),
+           ("MXFP4 ceil  (k=32)",  32, "e8m0_ceil"),
+           ("NVFP4       (k=16)",  16, "nvfp4")]
+R = rand_hadamard(16)
+for name, x in data.items():
+    print(f"\n{name}")
+    for label, k, fmt in configs:
+        xh, clip = quant(x, k, fmt)
+        print(f"  {label:22s} rel_err={rel_err(x, xh):.4f}  clipped={clip:.4%}")
+    xr = (x.reshape(-1, 16) @ R).reshape(-1)          # rotate along K in chunks of 16
+    xh, _ = quant(xr, 16, "nvfp4")
+    back = (xh.reshape(-1, 16) @ R.T).reshape(-1)     # rotate back (exact inverse)
+    print(f"  {'NVFP4 + RHT(16)':22s} rel_err={rel_err(x, back):.4f}")
+
+# ---- Part 2: the transpose problem ----
+W = torch.randn(256, 256)
+Wr, _ = quant(W, 32, "e8m0_floor")                    # blocks along dim 1 (fprop K)
+Wc, _ = quant(W.t().contiguous(), 32, "e8m0_floor")   # blocks along dim 0 (bwd K)
+print("\nrowwise vs columnwise quantized W differ by rel", rel_err(Wr, Wc.t()))
+</pre>
+<p><b>Tasks:</b></p>
+<ol>
+    <li><b>Predict first:</b> For each distribution, rank the four configurations by error. Where does per-tensor FP4 fail badly? Is floor or ceil better on Gaussian data, and why could the answer differ for heavy tails?</li>
+    <li>Explain the <code>clipped</code> column for <code>e8m0_floor</code> from the [4, 8) vs. max 6 argument in Section 3.</li>
+    <li>Does RHT help on Gaussian data? On the outlier data? Explain both using amax/RMS per block.</li>
+    <li>Part 2: Why is the difference not zero? Which training computation sees <code>Wr</code> and which sees <code>Wc</code>?</li>
+    <li><b>Stretch:</b> Implement stochastic rounding onto the E2M1 grid. Check that the mean of SR(0.7) over 10<sup>5</sup> samples is about 0.7, while round-to-nearest always gives 0.5.</li>
+    <li><b>Stretch:</b> Implement 16&times;16 2D weight blocks and show that rowwise and columnwise uses now match exactly.</li>
+</ol>
+
+<h2>10. Quiz</h2>
+<p>Numeric questions: enter digits only (decimals allowed). Feedback appears immediately.</p>
+<div id="quiz"></div>
+<p id="score"></p>
+
+<h2>11. Sources</h2>
+<ul>
+    <li>Rouhani et al., "Microscaling Data Formats for Deep Learning", 2023, <a href="https://arxiv.org/abs/2310.10537v3">arXiv:2310.10537</a> <span class="ver ok">verified: block-level shared scale; E8M0 scale for all concrete MX formats; scale exponents are a superset of FP32's; evaluation scope (direct-cast, error-diffusion, finetuned inference, training)</span>. Block size 32 and per-format accuracy claims: <span class="ver tv">verify (Table 1, results)</span></li>
+    <li>OCP Microscaling Formats (MX) Specification v1.0: element encodings, floor scale rule <span class="ver tv">verify</span></li>
+    <li>Mishra et al., "Recipes for Pre-training LLMs with MXFP8", arXiv:2506.08027: scale rounding up <span class="ver tv">verify</span></li>
+    <li>NVIDIA, "Pretraining Large Language Models with NVFP4", arXiv:2509.25642: 2D weight blocks, RHT, stochastic rounding, BF16 layers <span class="ver tv">verify</span></li>
+    <li>Castro et al., "Quartet: Native FP4 Training Can Be Optimal for LLMs", arXiv:2505.14669 <span class="ver tv">verify</span></li>
+    <li>NVIDIA PTX ISA (block-scaled MMA), Transformer Engine docs (<code>MXFP8BlockScaling</code>, NVFP4 recipe) <span class="ver tv">verify API names for your version</span></li>
+</ul>
+
+<script>
+    const Q = [
+        {q:"Largest finite FP4 E2M1 magnitude?", type:"num", a:6, tol:0,
+            why:"Bias 1, top exponent field 11 gives 2^2, times 1.5 = 6. No Inf/NaN encodings."},
+        {q:"About how many binades (log2 of max / min subnormal) does E2M1 cover?", type:"mc",
+            opts:["~1.6","~3.6","~8","~18"], a:1,
+            why:"log2(6 / 0.5) = log2(12) = 3.58. This is why per-tensor scaling cannot work for FP4."},
+        {q:"Which format do all concrete MX formats use for the shared scale?", type:"mc",
+            opts:["FP32","E4M3","E8M0","BF16"], a:2,
+            why:"E8M0: an 8-bit exponent with no sign and no mantissa, so powers of two only. Its exponent range covers FP32's (verified in the MX paper)."},
+        {q:"Storage bits per element for MXFP4 (4-bit elements, one 8-bit scale per 32)?", type:"num", a:4.25, tol:1e-9,
+            why:"4 + 8/32 = 4.25."},
+        {q:"Storage bits per element for NVFP4 (block 16, 8-bit scale), ignoring the per-tensor scale?", type:"num", a:4.5, tol:1e-9,
+            why:"4 + 8/16 = 4.5. That is twice MXFP4's scale overhead, paid for finer outlier isolation."},
+        {q:"OCP floor rule, E2M1 (emax = 2), block amax = 7.5. What value does the 7.5 element dequantize to?", type:"num", a:6, tol:1e-9,
+            why:"X = 2^(floor(log2 7.5) - 2) = 2^0 = 1, so 7.5 saturates to 6. That is a 20% error on the block max. Rounding the scale up gives X = 2, so 7.5 becomes 8 (6.7% error)."},
+        {q:"Stochastic rounding of x = 0.7 onto the E2M1 grid: probability of rounding UP to 1.0?", type:"num", a:0.4, tol:1e-9,
+            why:"Neighbors 0.5 and 1.0: P(up) = (0.7 - 0.5) / 0.5 = 0.4, so E = 0.6*0.5 + 0.4*1.0 = 0.7 (unbiased). Round-to-nearest always gives 0.5."},
+        {q:"Why must scaling blocks run along the GEMM's K (reduction) dimension?", type:"mc",
+            opts:["It minimizes scale-metadata memory",
+                "Each partial dot product then has a constant scale product sA*sB that can be applied to that partial sum",
+                "Tensor Cores cannot read along M or N",
+                "It makes the scales powers of two"], a:1,
+            why:"C = sum over blocks b of sA[i,b]*sB[b,j] * (dot product within b). Scales that vary inside one dot product could not be factored out."},
+        {q:"Why does MXFP8/MXFP4 training typically keep rowwise AND columnwise quantized copies of a tensor?", type:"mc",
+            opts:["For redundancy against bit flips",
+                "Forward and backward GEMMs reduce over different dimensions, and quantizing along one axis is not the same as quantizing along the other",
+                "The optimizer needs both copies",
+                "cuBLAS requires two copies for any FP8 GEMM"], a:1,
+            why:"Transposing a 1x32-blocked tensor gives 32x1 blocks, which is the wrong axis. So you re-quantize from high precision, and fwd and bwd see slightly different values (2D weight blocks fix this)."},
+        {q:"Why can a random Hadamard transform be applied before quantization without changing the GEMM result (ignoring quantization)?", type:"mc",
+            opts:["It is a diagonal scaling",
+                "It is orthogonal: (A H)(H^T B) = A B, and it spreads outliers across the block",
+                "It only touches zero entries",
+                "Tensor Cores apply it implicitly"], a:1,
+            why:"H H^T = I along K. Spreading an outlier reduces block amax/RMS, so the bulk of the values get a finer grid."},
+        {q:"Why does NVFP4 add an FP32 per-tensor scale on top of the E4M3 block scales?", type:"mc",
+            opts:["To make the scales powers of two",
+                "E4M3 covers only ~18 binades; the per-tensor scale moves the block scales of small-magnitude tensors (e.g. gradients) into E4M3's range",
+                "To enable delayed scaling",
+                "To reduce metadata"], a:1,
+            why:"E8M0 covers more than FP32's range, but E4M3 does not. The two-level design gives fine block scales without underflow or overflow of the scale itself."}
+    ];
+    const root = document.getElementById("quiz"), done = {};
+    Q.forEach((it, i) => {
+        const s = document.createElement("section"); s.className = "q";
+        let h = `<p><b>Q${i+1}.</b> ${it.q}</p>`;
+        h += it.type === "num"
+            ? `<input id="in${i}" type="text">`
+            : it.opts.map((o, j) => `<label><input type="radio" name="q${i}" value="${j}"> ${o}</label><br>`).join("");
+        h += `<br><button data-i="${i}">Check</button><p class="fb" id="fb${i}"></p>`;
+        s.innerHTML = h; root.appendChild(s);
+    });
+    root.addEventListener("click", e => {
+        if (e.target.tagName !== "BUTTON") return;
+        const i = +e.target.dataset.i, it = Q[i]; let ok;
+        if (it.type === "num") {
+            const v = parseFloat(document.getElementById("in" + i).value);
+            ok = !isNaN(v) && Math.abs(v - it.a) <= it.tol;
+        } else {
+            const c = document.querySelector(`input[name=q${i}]:checked`); ok = !!c && +c.value === it.a;
+        }
+        const fb = document.getElementById("fb" + i);
+        fb.className = "fb " + (ok ? "good" : "bad");
+        fb.textContent = (ok ? "Correct. " : "Not quite. ") + it.why;
+        done[i] = ok;
+        document.getElementById("score").textContent =
+            `Score: ${Object.values(done).filter(Boolean).length}/${Q.length}`;
+    });
+</script>
+
+
+        
+        <!-- _includes/tutorial-nav.html -->
+
+
+
+
+
+
+
+
+
+
+
+
+<nav class="tutorial-nav" aria-label="Lesson navigation">
+    
+    <a href="/heap/nov26/005/" class="tutorial-nav-btn tutorial-nav-prev">
+        <span class="tutorial-nav-label">← Previous</span>
+        <span class="tutorial-nav-title">005 — Lesson 5: FP8 Training</span>
+    </a>
+    
+
+    
+    <a href="/heap/nov26/007/" class="tutorial-nav-btn tutorial-nav-next">
+        <span class="tutorial-nav-label">Next →</span>
+        <span class="tutorial-nav-title">007 — Lesson 7: Xavier/He - Deriving Var(W) from Signal Propagation</span>
+    </a>
+    
+</nav>
+        
+    </article>
+
+</div>
+  </div>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <div class="footer-links">
+      <a href="https://github.com/g4br1el">GitHub</a>
+      <a href="https://www.linkedin.com/in/gadax">LinkedIn</a>
+      <a href="mailto:gdax.science@gmail.com">Email</a>
+      <a href="/files/CV-Gabriel_Dax.pdf">Resume ↓</a>
+    </div>
+    <p class="footer-copyright">© 2026 Gabriel Dax</p>
+  </div>
+</footer>
+
+
+
+</body>
+</html>

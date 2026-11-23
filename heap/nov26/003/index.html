@@ -1,0 +1,594 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 3: TF32, Choosing FP32 Islands and NaN Forensics — Gabriel Dax</title>
+  <!-- Begin Jekyll SEO tag v2.9.1 -->
+<meta name="generator" content="Jekyll v4.4.1" />
+<meta property="og:title" content="Lesson 3: TF32, Choosing FP32 Islands and NaN Forensics" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="0. Interview skills Explain what TF32 changes and what it does not. Configure it with the current PyTorch API and say when to switch it off. Decide which ops need FP32, including the ones autocast does not know about. Justify each choice with Lesson 1 numbers. Run a structured NaN investigation: when, reproduce, which stage, where, why, fix. Recognize the classic NaN traps on sight: sqrt(0), the torch.where gradient trap, fully masked softmax, 0·log 0, and FP16 epsilon underflow." />
+<meta name="twitter:description" property="og:description" content="0. Interview skills Explain what TF32 changes and what it does not. Configure it with the current PyTorch API and say when to switch it off. Decide which ops need FP32, including the ones autocast does not know about. Justify each choice with Lesson 1 numbers. Run a structured NaN investigation: when, reproduce, which stage, where, why, fix. Recognize the classic NaN traps on sight: sqrt(0), the torch.where gradient trap, fully masked softmax, 0·log 0, and FP16 epsilon underflow." />
+<link rel="canonical" href="https://www.gabrieldax.de/heap/nov26/003/" />
+<meta property="og:url" content="https://www.gabrieldax.de/heap/nov26/003/" />
+<meta property="og:site_name" content="Gabriel Dax — ML Research Engineer" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2026-11-23T09:53:36+00:00" />
+<meta property="article:modified_time" content="2026-11-23T09:53:36+00:00" />
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:title" content="Lesson 3: TF32, Choosing FP32 Islands and NaN Forensics" />
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"BlogPosting","dateModified":"2026-11-23T09:53:36+00:00","datePublished":"2026-11-23T09:53:36+00:00","description":"0. Interview skills Explain what TF32 changes and what it does not. Configure it with the current PyTorch API and say when to switch it off. Decide which ops need FP32, including the ones autocast does not know about. Justify each choice with Lesson 1 numbers. Run a structured NaN investigation: when, reproduce, which stage, where, why, fix. Recognize the classic NaN traps on sight: sqrt(0), the torch.where gradient trap, fully masked softmax, 0·log 0, and FP16 epsilon underflow.","headline":"Lesson 3: TF32, Choosing FP32 Islands and NaN Forensics","mainEntityOfPage":{"@type":"WebPage","@id":"https://www.gabrieldax.de/heap/nov26/003/"},"url":"https://www.gabrieldax.de/heap/nov26/003/"}</script>
+<!-- End Jekyll SEO tag -->
+
+  <meta content='text/html; charset=utf-8' http-equiv='Content-Type'>
+<meta http-equiv='X-UA-Compatible' content='IE=edge'>
+<meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0'>
+
+
+<meta property="og:description" content="
+    0. Interview skills
+    
+        
+            Explain what TF32 changes and what it does not. Configure it with the current PyTorch API and say when to switch it off.
+            Decide which ops need FP32, including the ones autocast does not know about. Justify each choice with Lesson 1 numbers.
+            Run a structured NaN investigation: when, reproduce, which stage, where, why, fix.
+            Recognize the classic NaN traps on sight: sqrt(0), the torch.where gradient trap, fully masked softmax, 0·log 0, and FP16 epsilon underflow.
+        
+    
+" />
+
+<meta name="author" content="Gabriel Dax" />
+
+
+
+<meta property="og:title" content="Lesson 3: TF32, Choosing FP32 Islands and NaN Forensics" />
+<meta property="twitter:title" content="Lesson 3: TF32, Choosing FP32 Islands and NaN Forensics" />
+
+
+
+<meta property="og:image" content="https://www.gabrieldax.de/images/self.png"/>
+<meta property="twitter:image" content="https://www.gabrieldax.de/images/self.png"/>
+
+
+  <link rel="stylesheet" href="/assets/style.css">
+  <link rel="icon" type="image/png" sizes="32x32" href="/images/favicon.jpg">
+  <link rel="canonical" href="https://www.gabrieldax.de/heap/nov26/003/">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  
+
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div>
+      <a href="/" class="site-name">Gabriel Dax</a>
+      <span class="site-tagline">ML Research Engineer</span>
+    </div>
+    <nav>
+      <a href="/" >Home</a>
+      <a href="/projects" >Projects</a>
+      <a href="/publications" >Publications</a>
+      <a href="/bio" >CV</a>
+    </nav>
+  </div>
+</header>
+
+<main class="main-content">
+  <div class="container">
+    <div class="tutorial-wrapper">
+
+    <nav class="tutorial-breadcrumb">
+        <a href="/heap/">← All Tutorials</a>
+        
+        <span class="tutorial-position">Lesson 3 / 12</span>
+        
+    </nav>
+
+    <article class="tutorial-article">
+        
+        <div class="tutorial-lesson-header">
+            <span class="tutorial-tag">Lesson 003</span>
+            
+        </div>
+        
+
+        <h1>Lesson 3: TF32, Choosing FP32 Islands and NaN Forensics</h1>
+
+        <section id="goal">
+    <h2>0. Interview skills</h2>
+    <div class="box">
+        <ol>
+            <li>Explain what TF32 changes and what it does not. Configure it with the <b>current</b> PyTorch API and say when to switch it off.</li>
+            <li>Decide which ops need FP32, including the ones autocast does <i>not</i> know about. Justify each choice with Lesson 1 numbers.</li>
+            <li>Run a structured NaN investigation: when, reproduce, which stage, where, why, fix.</li>
+            <li>Recognize the classic NaN traps on sight: <code>sqrt(0)</code>, the <code>torch.where</code> gradient trap, fully masked softmax, <code>0·log 0</code>, and FP16 epsilon underflow.</li>
+        </ol>
+    </div>
+</section>
+
+<section id="warmup">
+    <h2>1. Warm-up (recall from Lesson 2, no notes)</h2>
+    <details><summary>Inside FP16 autocast, what dtype does <code>F.layer_norm</code> return?</summary><p>FP32. It is on the FP32 list because it does a reduction and an rsqrt.</p></details>
+    <details><summary>The loss scale halves on every step toward ~0. What does that tell you?</summary><p>The Inf/NaN does not depend on S. It comes from the forward pass, from data, or from diverged weights. Loss scaling cannot fix it, and this lesson's forensics workflow can.</p></details>
+    <details><summary>ZeRO-3 per-GPU model-state memory for Ψ params on N<sub>d</sub> GPUs?</summary><p>16Ψ / N<sub>d</sub>.</p></details>
+</section>
+
+<section id="tf32">
+    <h2>2. TF32: FP32 range, FP16 precision, only inside GEMMs and convolutions</h2>
+
+    <h3>2.1 Format (compare with Lesson 1)</h3>
+    <table>
+        <tr><th>Format</th><th>Sign / Exp / Mantissa</th><th>Unit roundoff u</th><th>Max</th></tr>
+        <tr><td>FP32</td><td>1 / 8 / 23</td><td class="n">2<sup>−24</sup> ≈ 6.0e−8</td><td class="n">≈ 3.4e38</td></tr>
+        <tr><td>TF32</td><td>1 / 8 / 10 (19 bits used, stored in 32)</td><td class="n">2<sup>−11</sup> ≈ 4.9e−4</td><td class="n">≈ 3.4e38</td></tr>
+        <tr><td>FP16</td><td>1 / 5 / 10</td><td class="n">2<sup>−11</sup></td><td class="n">65504</td></tr>
+        <tr><td>BF16</td><td>1 / 8 / 7</td><td class="n">2<sup>−8</sup> ≈ 3.9e−3</td><td class="n">≈ 3.4e38</td></tr>
+    </table>
+
+    <h3>2.2 What TF32 actually does</h3>
+    <ul>
+        <li>On Ampere and newer Tensor Cores, the <b>inputs</b> of an FP32 matmul or convolution are rounded to TF32. Products are accumulated in <b>FP32</b>, and the output is FP32.</li>
+        <li><b>Storage does not change.</b> Tensors stay <code>torch.float32</code>, so TF32 does not save any memory.</li>
+        <li>The error comes mostly from rounding the inputs. The normwise relative error is about 1e−4 to 1e−3 and is roughly independent of K. Lab part 1 measures it.</li>
+        <li>Elementwise ops, reductions and softmax are not affected. They run in normal FP32.</li>
+    </ul>
+
+    <h3>2.3 Controls in current PyTorch</h3>
+    <table>
+        <tr><th>Control</th><th>Values</th><th>Notes</th></tr>
+        <tr><td><code>torch.backends.cuda.matmul.fp32_precision</code></td><td><code>"ieee"</code>, <code>"tf32"</code></td><td>Current API for CUDA matmuls. The main docs also list a BF16x9-emulation value. Check its exact name and availability for your version.</td></tr>
+        <tr><td><code>torch.backends.cuda.matmul.allow_tf32</code></td><td>bool</td><td><b>Deprecated.</b> Don't use it in new code, and don't mix it with the new API.</td></tr>
+        <tr><td><code>torch.set_float32_matmul_precision</code></td><td><code>"highest"</code>, <code>"high"</code>, <code>"medium"</code></td><td>Global hint. <code>"high"</code> may use TF32. <code>"medium"</code> may use BF16 internally if fast kernels exist.</td></tr>
+        <tr><td><code>torch.backends.cudnn.conv.fp32_precision</code> (verify)</td><td><code>"ieee"</code>, <code>"tf32"</code></td><td>Convolutions are controlled separately. TF32 for cuDNN convolutions has historically been <b>on</b> by default. Print yours in Lab part 1.</td></tr>
+        <tr><td><code>torch.backends.mkldnn.matmul.fp32_precision</code></td><td></td><td>The CPU oneDNN backend has its own setting. None of these switches is global for every FP32 op.</td></tr>
+    </table>
+    <pre>import torch
+torch.backends.cuda.matmul.fp32_precision = "tf32"   # performance (typical DL training)
+torch.backends.cuda.matmul.fp32_precision = "ieee"   # strict FP32 math
+print(torch.backends.cuda.matmul.fp32_precision, torch.get_float32_matmul_precision())
+</pre>
+
+    <h3>2.4 When to use <code>"ieee"</code></h3>
+    <ul>
+        <li>Linear algebra on ill-conditioned matrices: solves, inverses, eigendecompositions, Cholesky. Error is amplified by the condition number κ.</li>
+        <li>Reference implementations, unit tests with tight tolerances, and numerical gradient checks.</li>
+        <li>Comparisons across hardware. "Results differ between V100 and A100" is often TF32, because convolutions had it on by default.</li>
+        <li>Scientific or simulation code where FP32 accuracy is part of the specification.</li>
+    </ul>
+    <div class="box warn"><b>Island trap:</b> an FP32 island (<code>autocast(enabled=False)</code> plus <code>.float()</code>) still runs its matmuls in <b>TF32</b> if TF32 is enabled. "FP32 island" means FP32 storage and FP32 elementwise math. It does not automatically mean IEEE GEMMs.</div>
+</section>
+
+<section id="islands">
+    <h2>3. Choosing FP32 islands</h2>
+    <p>Autocast already handles its lists (softmax, losses, norms). Your job is the ops it does <b>not</b> know about: custom math, positional encodings, routers and optimizer-adjacent code. Ask five questions:</p>
+    <table>
+        <tr><th>#</th><th>Question</th><th>Lesson 1 number</th></tr>
+        <tr><td>1</td><td><b>Range:</b> can the value exceed the format's max or fall below its min (exp, squares, sums of squares, large products)?</td><td>FP16 max 65504; exp overflows for x &gt; ≈11.09</td></tr>
+        <tr><td>2</td><td><b>Cancellation:</b> do you subtract nearly equal numbers, as in E[x²] − E[x]²?</td><td>Relative error is amplified by |a| / |a − b|</td></tr>
+        <tr><td>3</td><td><b>Accumulation / swamping:</b> are many small terms added to a large one (long sums, w + lr·g)?</td><td>An update below ulp/2 is lost: BF16 at 1.0 has ulp 2<sup>−7</sup></td></tr>
+        <tr><td>4</td><td><b>Integers / discretization:</b> are positions, indices or timesteps stored as floats?</td><td>Exact integers only up to 256 (BF16) and 2048 (FP16)</td></tr>
+        <tr><td>5</td><td><b>Decisions:</b> does a small numeric difference flip a discrete choice (argmax, top-k, routing)?</td><td>BF16 spacing near 1 is ≈ 0.008</td></tr>
+    </table>
+
+    <h3>3.1 Catalogue</h3>
+    <table>
+        <tr><th>Candidate</th><th>Risk (question #)</th><th>Typical treatment</th></tr>
+        <tr><td>Logits → cross-entropy over a large vocabulary</td><td>1, 3</td><td>Autocast already runs CE in FP32. Pass <code>logits.float()</code> into custom losses, and use <code>log_softmax</code> instead of <code>log(softmax)</code>.</td></tr>
+        <tr><td>Attention scores / softmax</td><td>1, masked rows</td><td>Use fused SDPA / FlashAttention, which accumulate in FP32 with an online softmax. Scale by 1/√d. Watch logit growth.</td></tr>
+        <tr><td>Normalization statistics</td><td>2, 3</td><td>Compute statistics in FP32 (Welford or a two-pass algorithm). Autocast does this for its listed norms. Custom RMSNorm should do <code>x.float()</code> before <code>pow/mean/rsqrt</code>.</td></tr>
+        <tr><td>RoPE / sinusoidal positions</td><td>4, 1</td><td>Compute <code>pos · inv_freq</code> and sin/cos in FP32, then cast the result.</td></tr>
+        <tr><td>MoE router logits / softmax / top-k</td><td>5</td><td>Run the router in FP32. The Switch Transformer used "selective precision" (verify).</td></tr>
+        <tr><td>Weights, optimizer states, update</td><td>3</td><td>FP32 parameters/master weights and FP32 Adam states (Lesson 2).</td></tr>
+        <tr><td>Grad norms, metrics, loss averaging across steps</td><td>3</td><td>Accumulate in FP32.</td></tr>
+        <tr><td>Custom <code>exp/log/pow</code>, diffusion schedules, timestep embeddings</td><td>1, 4</td><td>Use FP32 or work in log space.</td></tr>
+    </table>
+    <div class="box"><b>Cost model:</b> islands are usually elementwise ops or reductions, which are memory-bound. The FP32 math is nearly free. You pay for <b>bytes moved</b> and extra cast kernels, and for FP32 activations saved for backward. Keep islands small and fuse them where possible (e.g. <code>torch.compile</code>). Don't put GEMMs in islands unless you have to.</div>
+</section>
+
+<section id="nan">
+    <h2>4. NaN forensics</h2>
+    <h3>4.1 Workflow</h3>
+    <table>
+        <tr><th>Step</th><th>Question</th><th>How</th></tr>
+        <tr><td>1 · When</td><td>What is the first non-finite step? Were there precursors?</td><td>Cheap telemetry: loss, grad norm, loss scale, max|activation| per block. Accumulate on the device and sync only every N steps.</td></tr>
+        <tr><td>2 · Reproduce</td><td>Can you trigger it on demand?</td><td>Resume from the last good checkpoint with the same seed and data order. Save the offending batch.</td></tr>
+        <tr><td>3 · Stage</td><td>Forward, backward, optimizer or communication?</td><td>Loss non-finite → forward. Loss finite but grads not → backward. Grads finite but params NaN after <code>step()</code> → optimizer. One rank bad before all-reduce → that rank's data or hardware.</td></tr>
+        <tr><td>4 · Where</td><td>Which op?</td><td>Forward hooks: find the first module whose <b>inputs are finite and outputs are not</b>. For backward, run <code>torch.autograd.detect_anomaly(check_nan=True)</code> on that single step (slow).</td></tr>
+        <tr><td>5 · Why</td><td>What about its inputs?</td><td>Check magnitude vs. format max, exact zeros, masks, dtype, and the data.</td></tr>
+        <tr><td>6 · Fix</td><td>Fix the cause, not the symptom</td><td><code>nan_to_num</code> or skipping steps only hides the bug.</td></tr>
+    </table>
+
+    <h3>4.2 Common sources</h3>
+    <table>
+        <tr><th>Pattern</th><th>Symptom</th><th>Fix</th></tr>
+        <tr><td><code>sqrt(x)</code> at x = 0 (hand-written norms, pairwise distances, std)</td><td>Forward is fine. Backward gives Inf, which becomes NaN via 0·Inf.</td><td><code>clamp_min(eps)</code> or eps inside the sqrt; <code>torch.linalg.vector_norm</code></td></tr>
+        <tr><td><code>torch.where(m, f(x), 0)</code> where f is undefined on the masked x</td><td>Forward is finite, but the gradient is NaN</td><td>"Double where": sanitize x before calling f</td></tr>
+        <tr><td>Softmax over a fully masked row (all −Inf)</td><td>NaN row</td><td>Fill with <code>finfo.min</code> and zero the row afterwards. Check the padding logic.</td></tr>
+        <tr><td><code>p·log p</code> at p = 0, <code>log(softmax)</code></td><td>NaN / −Inf</td><td><code>torch.xlogy</code>, <code>log_softmax</code></td></tr>
+        <tr><td>Division by zero variance or an empty count</td><td>Inf</td><td>eps; guard against empty batches and masks</td></tr>
+        <tr><td>FP16 epsilon underflow (1e−8 → 0)</td><td>0/0 in Adam or normalization running in FP16</td><td>Do that math in FP32 (FP16's smallest subnormal is ≈ 6e−8)</td></tr>
+        <tr><td>FP16 forward overflow (&gt; 65504)</td><td>Inf, then NaN; GradScaler skips every step</td><td>Fix the scale, add an FP32 island, or switch to BF16</td></tr>
+        <tr><td>Divergence (logit / activation growth)</td><td>Loss spikes and rising max|act| <i>before</i> the NaN</td><td>LR/warmup, clipping, QK-norm, z-loss (verify refs)</td></tr>
+        <tr><td>Bad data</td><td>Reproducible at one specific batch</td><td>Assert <code>isfinite</code> on inputs; validate labels</td></tr>
+        <tr><td>Uninitialized memory (<code>torch.empty</code>)</td><td>Non-deterministic NaNs</td><td><code>zeros</code>, or make sure every element is written</td></tr>
+    </table>
+    <div class="box warn">Every <code>isfinite(...).item()</code> is a device→host sync. In production, accumulate flags on the device and check them every N steps. Use hooks and anomaly mode only during debugging. With DDP, a NaN on one rank reaches every rank through the all-reduce, so check per-rank values <i>before</i> reduction.</div>
+</section>
+
+<section id="answer">
+    <h2>5. Interview answers (30 s each, say them out loud)</h2>
+    <div class="box"><b>"Should we enable TF32?"</b><br>"TF32 keeps FP32 range but rounds GEMM and conv inputs to a 10-bit mantissa, then accumulates in FP32. Storage stays FP32, so it buys speed, not memory. For DL training it's usually fine. I set <code>fp32_precision="ieee"</code> for solvers, reference tests and cross-hardware comparisons. <code>allow_tf32</code> is deprecated now. Also, FP32 islands still use TF32 GEMMs unless I switch them to IEEE."</div>
+    <div class="box"><b>"What do you keep in FP32 in BF16 training?"</b><br>"Weights and optimizer states, because of swamping. Softmax, losses and norm statistics, which autocast handles. Then the things autocast doesn't know about: RoPE angles, because BF16 is only exact for integers up to 256; router logits, because top-k decisions can flip; custom exp/log; and metric reductions. My criteria are range, cancellation, accumulation, integers and decisions."</div>
+    <div class="box"><b>"Loss went NaN at step 40k. What do you do?"</b><br>"First the telemetry: was it a sudden NaN or a spike preceded by growing activations or logits? Then I resume from the last good checkpoint with the same data order and save the batch. I find the stage: is the loss non-finite, the grads, or the params after the step? For forward problems I use hooks to find the first module with finite inputs and non-finite outputs. For backward problems I run anomaly mode on that step. Then I fix the root cause, whether it's data, a numeric trap like sqrt(0) or a masked softmax, FP16 overflow, or real divergence, which needs LR/warmup, QK-norm or z-loss. I don't fix it with nan_to_num."</div>
+</section>
+
+<section id="lab">
+    <h2>6. Lab (~50 min)</h2>
+    <p>Write down a prediction for every printed line before you run it.</p>
+
+    <h3>Part 0: Rounding explorer (in this page)</h3>
+    <div class="calc">
+        <label>Value <input id="rx" type="text" value="4095"></label>
+        <button id="rbtn">Round</button>
+        <span class="presets">
+      <button data-v="0.1">0.1</button><button data-v="1.001">1.001</button><button data-v="257">257</button>
+      <button data-v="4095">4095</button><button data-v="65519">65519</button><button data-v="65520">65520</button><button data-v="1e-8">1e-8</button>
+    </span>
+        <div id="rout"></div>
+        <p style="color:var(--muted);font-size:.85rem">Round-to-nearest-even from a float64 input, with FP16 subnormals and overflow. TF32 is shown as a rounding of the GEMM input.</p>
+    </div>
+
+    <h3>Part 1: TF32 vs. IEEE matmul error (CUDA, Ampere+)</h3>
+    <pre>import torch
+assert torch.cuda.is_available()
+print(torch.cuda.get_device_name(), "capability", torch.cuda.get_device_capability())
+print("matmul:", getattr(torch.backends.cuda.matmul, "fp32_precision", "n/a"),
+      "| cudnn.conv:", getattr(getattr(torch.backends.cudnn, "conv", None), "fp32_precision", "n/a"),
+      "| float32_matmul_precision:", torch.get_float32_matmul_precision())
+
+def set_matmul(mode):                       # "ieee" or "tf32"
+    m = torch.backends.cuda.matmul
+    if hasattr(m, "fp32_precision"):
+        m.fp32_precision = mode             # current API
+    else:
+        m.allow_tf32 = (mode == "tf32")     # legacy fallback for old PyTorch only
+
+def rel_err(c, ref):
+    return ((c.double() - ref).norm() / ref.norm()).item()
+
+torch.manual_seed(0)
+for K in (256, 4096, 65536):
+    a = torch.randn(256, K, device="cuda")
+    b = torch.randn(K, 256, device="cuda")
+    ref = a.double() @ b.double()
+    err = {}
+    for mode in ("ieee", "tf32"):
+        set_matmul(mode)
+        err[mode] = rel_err(a @ b, ref)
+    print(f"K={K:6}: ieee {err['ieee']:.1e}  tf32 {err['tf32']:.1e}  ratio {err['tf32']/err['ieee']:.0f}x")
+set_matmul("ieee")
+</pre>
+    <details><summary>Expected</summary>
+        <p>IEEE: about 1e−7 to 1e−6, growing slowly with K. TF32: about 3–5e−4, roughly <b>flat in K</b>, because input rounding at u = 2<sup>−11</sup> dominates. The ratio is in the hundreds to thousands. On pre-Ampere GPUs both errors are the same, because there is no TF32. Note the defaults you printed: the matmul and convolution settings may differ.</p></details>
+
+    <h3>Part 2: Integers, swamping, epsilon (CPU)</h3>
+    <pre>import torch
+pos = torch.arange(4096, dtype=torch.float32)
+for dt in (torch.float16, torch.bfloat16):
+    p = pos.to(dt).float()
+    first_bad = int((p != pos).nonzero()[0])
+    print(f"{str(dt):15} distinct={p.unique().numel():5}  first inexact={first_bad}  4095 -> {p[4095].item():.0f}")
+
+for dt in (torch.float32, torch.float16, torch.bfloat16):
+    w = torch.ones((), dtype=dt)
+    for _ in range(1000):
+        w = w + 1e-3
+    print(f"{str(dt):15} 1 + 1000 x 1e-3 = {w.item():.7f}")
+
+print("1e-8 in fp16:", torch.tensor(1e-8).half().item(), "| bf16:", torch.tensor(1e-8).bfloat16().item())
+m = torch.zeros(1, dtype=torch.float16); v = torch.zeros(1, dtype=torch.float16)
+print("Adam-style m / (sqrt(v) + 1e-8) in fp16:", m / (v.sqrt() + 1e-8))
+</pre>
+    <details><summary>Expected and why</summary>
+        <ul>
+            <li>FP16: distinct = 3073, first inexact = 2049, 4095 → 4096. BF16: distinct = 769, first inexact = 257, 4095 → 4096. That is why RoPE angles are computed in FP32.</li>
+            <li>FP32 ≈ 2.0000. FP16 = <b>1.9765625</b>: each +1e−3 rounds to one ulp of 2<sup>−10</sup>, so the total is 1 + 1000/1024. BF16 = <b>1.0000000</b>: 1e−3 is below half an ulp (2<sup>−8</sup>), so every update is lost. This is the master-weights argument in one line.</li>
+            <li>1e−8 becomes 0.0 in FP16, because it is below half of 2<sup>−24</sup>. In BF16 it is ≈ 1e−8. As a result, the FP16 expression evaluates to 0/0 = <b>nan</b>.</li>
+        </ul></details>
+
+    <h3>Part 3: NaN traps (CPU)</h3>
+    <pre>import torch
+x = torch.tensor([0.0, 4.0], requires_grad=True)
+x.sqrt().sum().backward();                                   print("a ", x.grad)
+
+x = torch.tensor([0.0, 2.0], requires_grad=True)
+torch.where(x > 0, torch.log(x), torch.zeros_like(x)).sum().backward();  print("b ", x.grad)
+
+x = torch.tensor([0.0, 2.0], requires_grad=True)
+safe = torch.where(x > 0, x, torch.ones_like(x))             # double-where fix
+torch.where(x > 0, torch.log(safe), torch.zeros_like(x)).sum().backward(); print("b'", x.grad)
+
+s = torch.tensor([[1.0, 2.0, 3.0], [1.0, 2.0, 3.0]])
+keep = torch.tensor([[True, True, False], [False, False, False]])
+print("c ", torch.softmax(s.masked_fill(~keep, float("-inf")), -1))
+print("c'", torch.softmax(s.masked_fill(~keep, torch.finfo(s.dtype).min), -1))
+
+p = torch.tensor([0.0, 0.5, 0.5])
+print("d ", (p * p.log()).sum().item(), torch.xlogy(p, p).sum().item())
+</pre>
+    <details><summary>Expected and why</summary>
+        <ul>
+            <li>a: <code>[inf, 0.25]</code>, because d/dx √x = 1/(2√x).</li>
+            <li>b: <code>[nan, 0.5]</code>. <code>where</code> sends a gradient of 0 into the log branch, and 0 · (1/0) = 0 · Inf = NaN. Masking the forward does not mask the backward.</li>
+            <li>b': <code>[0., 0.5]</code>.</li>
+            <li>c: row 0 is <code>[0.269, 0.731, 0]</code>, row 1 is <b>NaN</b>, because (−Inf) − (−Inf) = NaN. c': row 1 is uniform 1/3. It is finite but meaningless, so zero fully masked rows explicitly.</li>
+            <li>d: <code>nan</code> vs. <code>−0.6931</code>.</li>
+        </ul></details>
+
+    <h3>Part 4: Forensics tools</h3>
+    <p><b>4a: forward hooks (CUDA).</b> The bug is an FP16 overflow that FP32 hides.</p>
+    <pre>import torch, torch.nn as nn
+
+class Scale(nn.Module):
+    def __init__(self, s): super().__init__(); self.s = s
+    def forward(self, x): return x * self.s
+
+def nonfinite(t):
+    return torch.is_tensor(t) and t.is_floating_point() and not torch.isfinite(t).all()
+
+def install_nan_hooks(model):
+    """Debug only: every check is a device-to-host sync."""
+    report, handles = [], []
+    for name, mod in model.named_modules():
+        if not name:
+            continue
+        def hook(m, inp, out, name=name):
+            outs = out if isinstance(out, (tuple, list)) else (out,)
+            if any(nonfinite(t) for t in outs) and not any(nonfinite(t) for t in inp):
+                amax = max((t.abs().max().item() for t in inp if torch.is_tensor(t)), default=float("nan"))
+                report.append(f"{name} ({type(m).__name__}): finite in (max|x|={amax:.3g}) -> non-finite out, {outs[0].dtype}")
+        handles.append(mod.register_forward_hook(hook))
+    return report, handles
+
+torch.manual_seed(0)
+model = nn.Sequential(nn.Linear(64, 64), nn.GELU(), Scale(1e6),
+                      nn.Linear(64, 64), nn.LayerNorm(64), nn.Linear(64, 1)).cuda()
+report, handles = install_nan_hooks(model)
+x = torch.randn(32, 64, device="cuda")
+for amp in (False, True):
+    report.clear()
+    with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
+        loss = model(x).float().pow(2).mean()
+    print(f"amp={amp}: loss={loss.item():.3g}", report or "no non-finite values")
+for h in handles:
+    h.remove()
+</pre>
+    <details><summary>Expected</summary>
+        <p>With amp=False, the loss is finite because LayerNorm rescales the ~1e6 activations. With amp=True, the loss is <b>nan</b> and the report points at <code>2 (Scale)</code>: the max |x| is about 2–3, and ×1e6 exceeds 65504. If your version runs GELU in FP32, the report points at <code>3 (Linear)</code> instead, because the overflow happens in its FP16 input cast. LayerNorm is <i>not</i> reported because its input was already non-finite, and that is exactly why the "first finite-in / non-finite-out" rule works. With GradScaler, this bug would show up as "S halves every step".</p></details>
+
+    <p><b>4b: anomaly mode (CPU).</b> The example is a hand-written distance at zero, e.g. identical embeddings.</p>
+    <pre>import torch
+x = torch.zeros(4, 3, requires_grad=True)
+try:
+    with torch.autograd.detect_anomaly(check_nan=True):   # forward must also run inside the context
+        dist = torch.sqrt((x ** 2).sum(-1))
+        dist.sum().backward()
+except RuntimeError as e:
+    print("anomaly:", str(e).splitlines()[0])
+
+x.grad = None
+torch.linalg.vector_norm(x, dim=-1).sum().backward()
+print("vector_norm grad finite:", torch.isfinite(x.grad).all().item())
+x.grad = None
+torch.sqrt((x ** 2).sum(-1).clamp_min(1e-12)).sum().backward()
+print("clamped grad row 0:", x.grad[0])
+</pre>
+    <details><summary>Expected</summary>
+        <p>Something like <code>Function 'PowBackward0' returned nan values in its 0th output.</code> The exact name depends on the version. A warning shows the forward traceback of <code>x ** 2</code>. Note that <code>SqrtBackward0</code> produces Inf, which anomaly mode does not flag, and the NaN appears one op later as Inf · 2 · 0. <code>vector_norm</code> → True, because it uses a zero subgradient at 0 (verify on your version). The clamped grad row is zeros.</p></details>
+</section>
+
+<section id="quiz">
+    <h2>7. Quiz</h2>
+    <p>For numeric questions, enter digits only (decimals allowed).</p>
+    <div id="quizRoot"></div>
+    <p id="score"></p>
+    <button id="reset">Reset quiz</button>
+</section>
+
+<section id="sources">
+    <h2>8. Sources</h2>
+    <h3>Verified this session</h3>
+    <ul>
+        <li>PyTorch, <a href="https://docs.pytorch.org/docs/main/backends.html">torch.backends (main)</a>: <code>fp32_precision</code> values; <code>allow_tf32</code> deprecated; don't mix the APIs.</li>
+        <li>PyTorch, <a href="https://docs.pytorch.org/docs/main/generated/torch.set_float32_matmul_precision.html">torch.set_float32_matmul_precision</a> (also the <a href="https://docs.pytorch.org/docs/2.14/generated/torch.set_float32_matmul_precision.html">2.14 version</a>): highest / high / medium.</li>
+        <li>PyTorch, <a href="https://docs.pytorch.org/docs/2.15/notes/mkldnn.html">MKLDNN backend notes</a>: separate CPU setting.</li>
+        <li>PyTorch, <a href="https://docs.pytorch.org/docs/main/notes/numerical_accuracy.html">Numerical accuracy notes</a>.</li>
+    </ul>
+    <h3>From memory, verify before relying on them</h3>
+    <ul>
+        <li>The <code>torch.backends.cudnn.conv.fp32_precision</code> name and default; historical cuDNN convolution TF32 default = on; CUDA matmul TF32 default off since PyTorch 1.12.</li>
+        <li>NVIDIA, "TensorFloat-32 in the A100 GPU" (blog) and the Ampere architecture whitepaper.</li>
+        <li>PyTorch docs: <code>torch.autograd.detect_anomaly</code>, <code>register_forward_hook</code>, <code>torch.xlogy</code>, <code>linalg.vector_norm</code> backward at 0.</li>
+        <li>Fedus et al., Switch Transformers (selective-precision router); Dehghani et al., ViT-22B (QK-norm); Chowdhery et al., PaLM (z-loss).</li>
+        <li>Higham, <i>Accuracy and Stability of Numerical Algorithms</i> (summation error, cancellation); Welford's algorithm.</li>
+    </ul>
+</section>
+
+<footer>Next (planned): Lesson 4 covers stable reductions: pairwise and Kahan summation, log-sum-exp, online softmax, and why FlashAttention is numerically safe. Send your L1–L3 quiz scores and lab surprises when you have them.</footer>
+
+<script>
+    // Rounding explorer
+    const FMT = [
+        {n:"FP32", p:24, emin:-126, max:(2 - 2**-23) * 2**127},
+        {n:"TF32", p:11, emin:-126, max:(2 - 2**-10) * 2**127},
+        {n:"FP16", p:11, emin:-14,  max:65504},
+        {n:"BF16", p:8,  emin:-126, max:(2 - 2**-7) * 2**127},
+    ];
+    function rne(v) { const f = Math.floor(v), d = v - f; if (d > 0.5) return f + 1; if (d < 0.5) return f; return (f % 2 === 0) ? f : f + 1; }
+    function roundTo(x, F) {
+        if (!isFinite(x) || x === 0) return {v: x, ulp: NaN, sub: false};
+        const a = Math.abs(x);
+        let e = Math.floor(Math.log2(a));
+        if (2**e > a) e--; if (2**(e + 1) <= a) e++;
+        const sub = e < F.emin;
+        e = Math.max(e, F.emin);
+        const ulp = 2**(e - F.p + 1);
+        let r = rne(a / ulp) * ulp;
+        if (r > F.max) r = Infinity;
+        return {v: Math.sign(x) * r, ulp, sub};
+    }
+    function showRound() {
+        const x = parseFloat(document.getElementById("rx").value);
+        const out = document.getElementById("rout");
+        if (isNaN(x)) { out.textContent = "Enter a number."; return; }
+        out.innerHTML = "<table><tr><th>Format</th><th>Rounded</th><th>Rel. error</th><th>ulp here</th><th>Note</th></tr>" +
+            FMT.map(F => {
+                const r = roundTo(x, F);
+                const note = !isFinite(r.v) ? "overflow → Inf" : (r.v === 0 && x !== 0 ? "underflow → 0" : (r.sub ? "subnormal" : ""));
+                const rel = (isFinite(r.v) && x !== 0) ? (Math.abs(r.v - x) / Math.abs(x)).toExponential(2) : "–";
+                return `<tr><td>${F.n}</td><td class="n">${isFinite(r.v) ? r.v.toPrecision(12) : "Inf"}</td><td class="n">${rel}</td><td class="n">${isNaN(r.ulp) ? "–" : r.ulp.toExponential(3)}</td><td>${note}</td></tr>`;
+            }).join("") + "</table>";
+    }
+    document.getElementById("rbtn").addEventListener("click", showRound);
+    document.querySelectorAll(".presets button").forEach(b => b.addEventListener("click", () => {
+        document.getElementById("rx").value = b.dataset.v; showRound();
+    }));
+    showRound();
+
+    // Quiz
+    const Q = [
+        {q:"How many explicit mantissa bits does TF32 have?", type:"num", a:10,
+            why:"TF32 is 1/8/10: FP32's exponent with FP16's mantissa."},
+        {q:"How many times larger is TF32's unit roundoff than FP32's?", type:"num", a:8192,
+            why:"2^-11 / 2^-24 = 2^13 = 8192."},
+        {q:"You set torch.backends.cuda.matmul.fp32_precision = 'tf32'. What changes?", type:"mc",
+            opts:["FP32 tensors are stored in 19 bits","FP32 matmul inputs are rounded to TF32 internally; storage and outputs stay FP32",
+                "All FP32 ops, including elementwise, use TF32","Autocast is enabled"], a:1,
+            why:"TF32 is a Tensor Core math mode for matmuls. It saves no memory and doesn't touch elementwise ops."},
+        {q:"Ampere GPU, TF32 enabled for matmul. Your FP32 island runs head(h.float()) with autocast disabled. What precision does the head's matmul math use?", type:"mc",
+            opts:["IEEE FP32","TF32","FP16","BF16"], a:1,
+            why:"Disabling autocast doesn't disable TF32. If you need IEEE GEMMs in the island, set fp32_precision='ieee'."},
+        {q:"What is the status of torch.backends.cuda.matmul.allow_tf32 in current PyTorch?", type:"mc",
+            opts:["The recommended API","Deprecated; use fp32_precision ('ieee'/'tf32')","Removed and raises an error","Only for CPU"], a:1,
+            why:"Current docs mark it as legacy and recommend the precision string. Don't mix the two styles."},
+        {q:"Largest N such that every integer 0..N is exactly representable in BF16?", type:"num", a:256,
+            why:"BF16 has 8 significant bits: integers are exact up to 2^8 = 256, and 257 rounds. That's why RoPE positions belong in FP32."},
+        {q:"Same question for FP16?", type:"num", a:2048,
+            why:"11 significant bits: exact up to 2^11 = 2048."},
+        {q:"BF16 w = 1.0. Value of w + 1e-3 (in BF16)?", type:"num", a:1,
+            why:"The ulp at 1.0 is 2^-7 ≈ 0.0078. 1e-3 is below half an ulp, so the update is swamped."},
+        {q:"What does 1e-8 round to in FP16?", type:"num", a:0,
+            why:"The smallest subnormal is 2^-24 ≈ 5.96e-8, and 1e-8 is less than half of that, so it rounds to 0. An Adam-style eps in FP16 disappears and gives 0/0."},
+        {q:"x = 0. Gradient of torch.where(x > 0, torch.log(x), 0) w.r.t. x?", type:"mc",
+            opts:["0","NaN","-Inf","1"], a:1,
+            why:"where passes 0 to the log branch, and 0 · (1/0) = NaN. Fix it with a double where, sanitizing x before log."},
+        {q:"Softmax over a row whose entries are all -Inf?", type:"mc",
+            opts:["Uniform","All zeros","NaN","Error"], a:2,
+            why:"max = -Inf, so x - max = -Inf - (-Inf) = NaN. Use finfo.min and zero the row explicitly."},
+        {q:"The loss and the unscaled grads are finite, but params are NaN right after optimizer.step(). Which stage?", type:"mc",
+            opts:["Forward","Backward","Optimizer","Data loading"], a:2,
+            why:"Everything going into the step is finite, so look at the update math: eps, division, LR, or the state dtype."},
+        {q:"What does torch.autograd.detect_anomaly(check_nan=True) do?", type:"mc",
+            opts:["Replaces NaNs with zeros","Raises when a backward function returns NaN and shows the forward traceback of the op that created it",
+                "Checks forward outputs for Inf","Makes kernels deterministic"], a:1,
+            why:"It's slow and catches NaN, not Inf (Inf is often the precursor one op earlier). Run it on the single reproduced step."},
+        {q:"With forward hooks, which module is the prime suspect?", type:"mc",
+            opts:["The last module with non-finite output","The first module whose inputs are finite but outputs are non-finite",
+                "The module with the largest weights","The loss function"], a:1,
+            why:"Everything downstream inherits the NaN. The first finite-in / non-finite-out transition is where it was created."}
+    ];
+
+    const root = document.getElementById("quizRoot"), scoreEl = document.getElementById("score");
+    let done = {};
+    function render() {
+        root.innerHTML = ""; done = {}; scoreEl.textContent = "";
+        Q.forEach((it, i) => {
+            const s = document.createElement("div"); s.className = "q";
+            let h = `<p><b>Q${i+1}.</b> ${it.q}</p>`;
+            h += it.type === "num"
+                ? `<input id="in${i}" type="text" inputmode="decimal">`
+                : it.opts.map((o, j) => `<label><input type="radio" name="q${i}" value="${j}"> ${o}</label>`).join("");
+            h += `<br><button data-i="${i}">Check</button><p class="fb" id="fb${i}"></p>`;
+            s.innerHTML = h; root.appendChild(s);
+        });
+    }
+    root.addEventListener("click", e => {
+        if (e.target.tagName !== "BUTTON") return;
+        const i = +e.target.dataset.i, it = Q[i];
+        let ok;
+        if (it.type === "num") {
+            const v = parseFloat(document.getElementById("in" + i).value.replace(/[\s,]/g, ""));
+            ok = !isNaN(v) && Math.abs(v - it.a) <= (it.tol || 1e-9);
+        } else {
+            const c = document.querySelector(`input[name=q${i}]:checked`);
+            ok = !!c && +c.value === it.a;
+        }
+        const fb = document.getElementById("fb" + i);
+        fb.className = "fb " + (ok ? "ok" : "bad");
+        fb.textContent = (ok ? "Correct. " : "Not quite. ") + it.why;
+        done[i] = ok;
+        const n = Object.keys(done).length, c = Object.values(done).filter(Boolean).length;
+        scoreEl.textContent = `Score: ${c}/${Q.length} (answered ${n}/${Q.length})`;
+    });
+    document.getElementById("reset").addEventListener("click", render);
+    render();
+</script>
+
+
+        
+        <!-- _includes/tutorial-nav.html -->
+
+
+
+
+
+
+
+
+
+
+
+
+<nav class="tutorial-nav" aria-label="Lesson navigation">
+    
+    <a href="/heap/nov26/002/" class="tutorial-nav-btn tutorial-nav-prev">
+        <span class="tutorial-nav-label">← Previous</span>
+        <span class="tutorial-nav-title">002 — Lesson 2: Autocast Op Policy, GradScaler Internals and Memory Accounting</span>
+    </a>
+    
+
+    
+    <a href="/heap/nov26/004/" class="tutorial-nav-btn tutorial-nav-next">
+        <span class="tutorial-nav-label">Next →</span>
+        <span class="tutorial-nav-title">004 — Lesson 4: Stable Reductions: Kahan, Log-Sum-Exp, Online Softmax and FlashAttention</span>
+    </a>
+    
+</nav>
+        
+    </article>
+
+</div>
+  </div>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <div class="footer-links">
+      <a href="https://github.com/g4br1el">GitHub</a>
+      <a href="https://www.linkedin.com/in/gadax">LinkedIn</a>
+      <a href="mailto:gdax.science@gmail.com">Email</a>
+      <a href="/files/CV-Gabriel_Dax.pdf">Resume ↓</a>
+    </div>
+    <p class="footer-copyright">© 2026 Gabriel Dax</p>
+  </div>
+</footer>
+
+
+
+</body>
+</html>

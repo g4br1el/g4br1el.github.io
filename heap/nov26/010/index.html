@@ -1,0 +1,855 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 10: INT8 PTQ, SmoothQuant and QAT — Gabriel Dax</title>
+  <!-- Begin Jekyll SEO tag v2.9.1 -->
+<meta name="generator" content="Jekyll v4.4.1" />
+<meta property="og:title" content="Lesson 10: INT8 PTQ, SmoothQuant and QAT" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="&lt;div class=&quot;box&quot;&gt; &lt;strong&gt;Three ideas that do most of the work:&lt;/strong&gt; &lt;ol&gt; &lt;li&gt;&lt;strong&gt;A scale must factor out of the integer sum.&lt;/strong&gt; Per-token (activation rows) and per-output-channel (weight rows) scales are free in an INT8 GEMM. Per-&lt;em&gt;input&lt;/em&gt;-channel scales are not, because they index the reduction dimension k. This is exactly why channel-wise activation outliers hurt.&lt;/li&gt; &lt;li&gt;&lt;strong&gt;SmoothQuant moves that per-channel difficulty from X into W, exactly.&lt;/strong&gt; It uses XW&lt;sup&gt;T&lt;/sup&gt; = (X·diag(s)&lt;sup&gt;−1&lt;/sup&gt;)(W·diag(s))&lt;sup&gt;T&lt;/sup&gt; and folds s into the previous op (norm γ, V-projection, up-projection) offline.&lt;/li&gt; &lt;li&gt;&lt;strong&gt;QAT = fake quantization + a straight-through estimator.&lt;/strong&gt; Learn the step size (LSQ). Use QAT when PTQ fails: at low…" />
+<meta name="twitter:description" property="og:description" content="&lt;div class=&quot;box&quot;&gt; &lt;strong&gt;Three ideas that do most of the work:&lt;/strong&gt; &lt;ol&gt; &lt;li&gt;&lt;strong&gt;A scale must factor out of the integer sum.&lt;/strong&gt; Per-token (activation rows) and per-output-channel (weight rows) scales are free in an INT8 GEMM. Per-&lt;em&gt;input&lt;/em&gt;-channel scales are not, because they index the reduction dimension k. This is exactly why channel-wise activation outliers hurt.&lt;/li&gt; &lt;li&gt;&lt;strong&gt;SmoothQuant moves that per-channel difficulty from X into W, exactly.&lt;/strong&gt; It uses XW&lt;sup&gt;T&lt;/sup&gt; = (X·diag(s)&lt;sup&gt;−1&lt;/sup&gt;)(W·diag(s))&lt;sup&gt;T&lt;/sup&gt; and folds s into the previous op (norm γ, V-projection, up-projection) offline.&lt;/li&gt; &lt;li&gt;&lt;strong&gt;QAT = fake quantization + a straight-through estimator.&lt;/strong&gt; Learn the step size (LSQ). Use QAT when PTQ fails: at low…" />
+<link rel="canonical" href="https://www.gabrieldax.de/heap/nov26/010/" />
+<meta property="og:url" content="https://www.gabrieldax.de/heap/nov26/010/" />
+<meta property="og:site_name" content="Gabriel Dax — ML Research Engineer" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2026-11-23T09:53:36+00:00" />
+<meta property="article:modified_time" content="2026-11-23T09:53:36+00:00" />
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:title" content="Lesson 10: INT8 PTQ, SmoothQuant and QAT" />
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"BlogPosting","dateModified":"2026-11-23T09:53:36+00:00","datePublished":"2026-11-23T09:53:36+00:00","description":"\u0026lt;div class=\u0026quot;box\u0026quot;\u0026gt; \u0026lt;strong\u0026gt;Three ideas that do most of the work:\u0026lt;/strong\u0026gt; \u0026lt;ol\u0026gt; \u0026lt;li\u0026gt;\u0026lt;strong\u0026gt;A scale must factor out of the integer sum.\u0026lt;/strong\u0026gt; Per-token (activation rows) and per-output-channel (weight rows) scales are free in an INT8 GEMM. Per-\u0026lt;em\u0026gt;input\u0026lt;/em\u0026gt;-channel scales are not, because they index the reduction dimension k. This is exactly why channel-wise activation outliers hurt.\u0026lt;/li\u0026gt; \u0026lt;li\u0026gt;\u0026lt;strong\u0026gt;SmoothQuant moves that per-channel difficulty from X into W, exactly.\u0026lt;/strong\u0026gt; It uses XW\u0026lt;sup\u0026gt;T\u0026lt;/sup\u0026gt; = (X·diag(s)\u0026lt;sup\u0026gt;−1\u0026lt;/sup\u0026gt;)(W·diag(s))\u0026lt;sup\u0026gt;T\u0026lt;/sup\u0026gt; and folds s into the previous op (norm γ, V-projection, up-projection) offline.\u0026lt;/li\u0026gt; \u0026lt;li\u0026gt;\u0026lt;strong\u0026gt;QAT = fake quantization + a straight-through estimator.\u0026lt;/strong\u0026gt; Learn the step size (LSQ). Use QAT when PTQ fails: at low…","headline":"Lesson 10: INT8 PTQ, SmoothQuant and QAT","mainEntityOfPage":{"@type":"WebPage","@id":"https://www.gabrieldax.de/heap/nov26/010/"},"url":"https://www.gabrieldax.de/heap/nov26/010/"}</script>
+<!-- End Jekyll SEO tag -->
+
+  <meta content='text/html; charset=utf-8' http-equiv='Content-Type'>
+<meta http-equiv='X-UA-Compatible' content='IE=edge'>
+<meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0'>
+
+
+<meta property="og:description" content="    
+        Three ideas that do most of the work:
+        
+            A scale must factor out of the integer sum. Per-token (activation rows) and per-output-channel (weight rows) scales are free in an INT8 GEMM. Per-input-channel scales are not, because they index the reduction dimension k. This is exactly why channel-wise activation outliers hurt.
+            SmoothQuant moves that per-channel difficulty from X into W, exactly. It uses XWT = (X·diag(s)−1)(W·diag(s))T and folds s into the previous op (norm γ, V-projection, up-projection) offline.
+            QAT = fake quantization + a straight-through estimator. Learn the step size (LSQ). Use QAT when PTQ fails: at low bit widths, on fixed-function INT8 hardware, or for small models with no redundancy.
+        
+    
+    [verify] marks claims from memory. No external sources were retrieved for this lesson." />
+
+<meta name="author" content="Gabriel Dax" />
+
+
+
+<meta property="og:title" content="Lesson 10: INT8 PTQ, SmoothQuant and QAT" />
+<meta property="twitter:title" content="Lesson 10: INT8 PTQ, SmoothQuant and QAT" />
+
+
+
+<meta property="og:image" content="https://www.gabrieldax.de/images/self.png"/>
+<meta property="twitter:image" content="https://www.gabrieldax.de/images/self.png"/>
+
+
+  <link rel="stylesheet" href="/assets/style.css">
+  <link rel="icon" type="image/png" sizes="32x32" href="/images/favicon.jpg">
+  <link rel="canonical" href="https://www.gabrieldax.de/heap/nov26/010/">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  
+
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div>
+      <a href="/" class="site-name">Gabriel Dax</a>
+      <span class="site-tagline">ML Research Engineer</span>
+    </div>
+    <nav>
+      <a href="/" >Home</a>
+      <a href="/projects" >Projects</a>
+      <a href="/publications" >Publications</a>
+      <a href="/bio" >CV</a>
+    </nav>
+  </div>
+</header>
+
+<main class="main-content">
+  <div class="container">
+    <div class="tutorial-wrapper">
+
+    <nav class="tutorial-breadcrumb">
+        <a href="/heap/">← All Tutorials</a>
+        
+        <span class="tutorial-position">Lesson 10 / 12</span>
+        
+    </nav>
+
+    <article class="tutorial-article">
+        
+        <div class="tutorial-lesson-header">
+            <span class="tutorial-tag">Lesson 010</span>
+            
+        </div>
+        
+
+        <h1>Lesson 10: INT8 PTQ, SmoothQuant and QAT</h1>
+
+            <div class="box">
+        <strong>Three ideas that do most of the work:</strong>
+        <ol>
+            <li><strong>A scale must factor out of the integer sum.</strong> Per-token (activation rows) and per-output-channel (weight rows) scales are free in an INT8 GEMM. Per-<em>input</em>-channel scales are not, because they index the reduction dimension k. This is exactly why channel-wise activation outliers hurt.</li>
+            <li><strong>SmoothQuant moves that per-channel difficulty from X into W, exactly.</strong> It uses XW<sup>T</sup> = (X·diag(s)<sup>−1</sup>)(W·diag(s))<sup>T</sup> and folds s into the previous op (norm γ, V-projection, up-projection) offline.</li>
+            <li><strong>QAT = fake quantization + a straight-through estimator.</strong> Learn the step size (LSQ). Use QAT when PTQ fails: at low bit widths, on fixed-function INT8 hardware, or for small models with no redundancy.</li>
+        </ol>
+    </div>
+    <p><span class="verify">[verify]</span> marks claims from memory. No external sources were retrieved for this lesson.</p>
+
+
+<!-- ============================================================ -->
+<h2 id="s1">1. Affine quantization from first principles</h2>
+<div class="f">q = clamp(round(x / s) + z, q<sub>min</sub>, q<sub>max</sub>) &nbsp;&nbsp;·&nbsp;&nbsp; x̂ = s · (q − z)</div>
+<table>
+    <thead><tr><th>Scheme</th><th>Parameters</th><th>Why</th></tr></thead>
+    <tbody>
+    <tr><td>Symmetric, restricted range (INT8)</td><td>z = 0, s = amax/127, q ∈ [−127, 127]</td><td>Zero-points disappear from the GEMM. It wastes one of 256 codes (−128) but keeps the range symmetric, so −q is always representable. This is the standard choice for weights.</td></tr>
+    <tr><td>Asymmetric (UINT8)</td><td>s = (max − min)/255, z = round(−min/s)</td><td>Uses the whole range for skewed data such as post-ReLU or post-GELU activations. The integer z makes 0.0 exactly representable, so padding and ReLU zeros stay exact.</td></tr>
+    </tbody>
+</table>
+<h3>Worked example (symmetric INT8)</h3>
+<p>x = [−1.20, 0.313, 0.80, 2.54] → amax = 2.54 → s = 2.54/127 = <strong>0.02</strong></p>
+<table>
+    <thead><tr><th>x</th><th>x/s</th><th>q</th><th>x̂</th><th>error</th></tr></thead>
+    <tbody>
+    <tr><td>−1.20</td><td>−60.0</td><td>−60</td><td>−1.20</td><td>0</td></tr>
+    <tr><td>0.313</td><td>15.65</td><td>16</td><td>0.32</td><td>+0.007</td></tr>
+    <tr><td>0.80</td><td>40.0</td><td>40</td><td>0.80</td><td>0</td></tr>
+    <tr><td>2.54</td><td>127.0</td><td>127</td><td>2.54</td><td>0</td></tr>
+    </tbody>
+</table>
+<p>The error is bounded by s/2 = 0.01 inside the range. Asymmetric example: on the range [−0.2, 4.9], s = 5.1/255 = 0.02 and z = 10, so x = 0 maps to q = 10 <em>exactly</em>.</p>
+
+<!-- ============================================================ -->
+<h2 id="s2">2. Error model</h2>
+<h3>2.1 Rounding noise: s²/12</h3>
+<p>Inside the range, if s is small relative to the signal, the error e = x̂ − x is approximately uniform on [−s/2, s/2]:</p>
+<div class="f">E[e²] = (1/s) ∫<sub>−s/2</sub><sup>s/2</sup> e² de = s²/12</div>
+<h3>2.2 About 6 dB per bit</h3>
+<p>Take a full-scale uniform signal on [−A, A] with b bits:</p>
+<ul>
+    <li>s = 2A/2<sup>b</sup></li>
+    <li>signal power = A²/3</li>
+    <li>noise power = A²/(3·2<sup>2b</sup>)</li>
+</ul>
+<div class="f">SQNR = 2<sup>2b</sup> &nbsp;→&nbsp; 20·log<sub>10</sub>(2)·b ≈ <strong>6.02·b dB</strong></div>
+<p><strong>Gaussian example:</strong> with min-max scaling over 10⁶ samples, amax ≈ 4.9σ. At 8 bits, SQNR = 10·log<sub>10</sub>(12·127²/4.9²) ≈ <strong>39 dB</strong>.</p>
+<p><strong>Add a single outlier at 60:</strong></p>
+<ul>
+    <li>s = 60/127 = 0.47 and SQNR ≈ <strong>17 dB</strong>.</li>
+    <li>Typical values with |x| ≤ 1 now land on q ∈ {−2, …, 2}. That is about 2.3 effective bits.</li>
+</ul>
+<h3>2.3 Clipping versus rounding</h3>
+<p>If you clip at c &lt; amax:</p>
+<ul>
+    <li>The rounding MSE (∝ c²) shrinks.</li>
+    <li>The clipping MSE, E[(|x| − c)²; |x| &gt; c], grows.</li>
+</ul>
+<div class="f">MSE(c) = c²/(3·q<sub>max</sub>²) · P(|x| ≤ c) &nbsp;+&nbsp; E[(|x| − c)²; |x| &gt; c]</div>
+<p>The optimum c* lies inside the range, and it moves further below amax as the bit width drops and the tails get heavier. At 4 bits, clipping is not optional.</p>
+<h3>2.4 Propagating through a GEMM</h3>
+<p>With y = Σ<sub>k</sub> x<sub>k</sub>w<sub>k</sub>, x̂ = x + e<sub>x</sub> and ŵ = w + e<sub>w</sub>, independent zero-mean errors, and the e<sub>x</sub>e<sub>w</sub> term dropped:</p>
+<div class="f">Var(Δy) ≈ K · ( E[w²] · s<sub>x</sub>²/12 &nbsp;+&nbsp; E[x²] · s<sub>w</sub>²/12 )</div>
+<p>This is the variance lemma from Lesson 7 again. It uses <strong>E[x²], not Var(x)</strong>, which matters for non-zero-mean post-ReLU inputs. Activation and weight error contribute additively, so the worse of the two dominates. That is why "balance the difficulty" (SmoothQuant) is the right goal.</p>
+
+<!-- ============================================================ -->
+<h2 id="s3">3. Granularity and the GEMM constraint (the key insight)</h2>
+<p>Consider Y = XW<sup>T</sup> with X ∈ ℝ<sup>T×K</sup> (tokens × input channels) and W ∈ ℝ<sup>N×K</sup> (output × input channels). With a token scale a<sub>t</sub> and a channel scale b<sub>n</sub>:</p>
+<div class="f">Y[t,n] = Σ<sub>k</sub> X[t,k]·W[n,k] ≈ Σ<sub>k</sub> a<sub>t</sub>q<sub>X</sub>[t,k] · b<sub>n</sub>q<sub>W</sub>[n,k] = <strong>a<sub>t</sub>·b<sub>n</sub></strong> · Σ<sub>k</sub> q<sub>X</sub>[t,k]·q<sub>W</sub>[n,k]</div>
+<p>The integer sum runs on INT8 Tensor Cores with INT32 accumulation, and a<sub>t</sub>b<sub>n</sub> is applied once in the <em>epilogue</em>. A scale c<sub>k</sub> that depends on k cannot be pulled out of the sum, so it would need a float multiply inside the reduction.</p>
+<table>
+    <thead><tr><th>Granularity</th><th>Scale shape</th><th>INT8-GEMM friendly?</th><th>Typical use</th></tr></thead>
+    <tbody>
+    <tr><td>X per-tensor</td><td>scalar</td><td>✓</td><td>Static calibrated activations (edge NPUs, TensorRT)</td></tr>
+    <tr><td>X per-token</td><td>[T, 1]</td><td>✓ (epilogue)</td><td>Dynamic LLM activations</td></tr>
+    <tr><td>X per-input-channel</td><td>[1, K]</td><td><strong>✗</strong> (indexes k)</td><td>Only as a reference. Its scale can instead be <em>moved into W</em>, which is SmoothQuant.</td></tr>
+    <tr><td>W per-output-channel</td><td>[N, 1]</td><td>✓ (epilogue)</td><td>The default for weights. Convs after BN folding need it.</td></tr>
+    <tr><td>Per-group along K (e.g. g = 128)</td><td>[N, K/g]</td><td>Partial: dequantize per K-block inside the main loop</td><td>Weight-only W4A16 kernels. Block-scaled formats (MX) do this in hardware (Lesson 11).</td></tr>
+    </tbody>
+</table>
+<div class="box warn"><strong>Why per-token does not fix LLM outliers:</strong> the outliers live in a few fixed <em>channels</em> k and appear in almost <em>every token</em>. So every row's amax is set by the outlier channels, and per-token scaling barely helps. The structure is per-channel, and per-channel is the one granularity the GEMM forbids for X.</div>
+
+<!-- ============================================================ -->
+<h2 id="s4">4. Calibration (post-training quantization)</h2>
+<p>Weights are always quantized statically, from their own values. Activations need statistics from about 128–512 representative samples, run through the same preprocessing pipeline as deployment.</p>
+<table>
+    <thead><tr><th>Method</th><th>How</th><th>Notes</th></tr></thead>
+    <tbody>
+    <tr><td>Min-max</td><td>c = max|x|</td><td>No clipping error. Very sensitive to a single outlier, and gets worse the more data you see.</td></tr>
+    <tr><td>Percentile</td><td>c = 99.9–99.999th percentile of |x|</td><td>Cheap and robust. The percentile is a hyperparameter.</td></tr>
+    <tr><td>MSE search</td><td>argmin<sub>c</sub> ‖x − Q<sub>c</sub>(x)‖²</td><td>Directly optimizes §2.3. Can be done per layer, or on the <em>layer output</em> instead of the tensor.</td></tr>
+    <tr><td>Entropy / KL</td><td>Minimizes KL(P<sub>fp</sub> ‖ P<sub>quant</sub>) of histograms</td><td>The classic TensorRT INT8 calibrator <span class="verify">[verify]</span>.</td></tr>
+    </tbody>
+</table>
+<ul>
+    <li><strong>Static vs dynamic activations.</strong>
+        <ul>
+            <li>Static: fixed scales and zero runtime cost, but brittle when the deployment distribution shifts.</li>
+            <li>Dynamic per-token: one amax reduction per row at runtime, fused into the preceding norm kernel. This is the norm for LLMs.</li>
+        </ul>
+    </li>
+    <li><strong>BN folding (Lesson 8)</strong> happens <em>before</em> weight quantization:
+        <div class="f">W′<sub>c</sub> = W<sub>c</sub> · γ<sub>c</sub>/√(σ<sub>c</sub>² + ε), &nbsp; b′<sub>c</sub> = β<sub>c</sub> + (b<sub>c</sub> − μ<sub>c</sub>) · γ<sub>c</sub>/√(σ<sub>c</sub>² + ε)</div>
+        Channels with tiny σ<sub>c</sub> get huge folded weights. The per-channel spread can reach 100× or more (MobileNet depthwise convs), which forces per-channel weight scales or <em>cross-layer equalization</em>. CLE is SmoothQuant's ancestor for ReLU networks <span class="verify">[verify: Nagel et al. 2019]</span>.</li>
+    <li><strong>Bias correction.</strong> Weight quantization error shifts the output mean by ΔW·E[x]. Subtract that from the bias <span class="verify">[verify: DFQ]</span>.</li>
+    <li><strong>Sensitivity analysis.</strong> Quantize one layer at a time and rank the layers by output SQNR or task metric. The usual suspects are kept in higher precision: the first conv, the last layer or lm_head, softmax, and norms.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="s5">5. LLM outliers and SmoothQuant</h2>
+<h3>5.1 The phenomenon</h3>
+<p>Beyond a few billion parameters, a handful of hidden channels carry activations about 20× or more larger than the rest. They appear systematically, in the same channels across tokens and layers <span class="verify">[verify: LLM.int8(), Dettmers et al. 2022, ~6.7B onset]</span>. Weights are well-behaved. <em>Activations are hard to quantize; weights are easy.</em></p>
+
+<h3>5.2 Derivation</h3>
+<p>For any positive vector s ∈ ℝ<sup>K</sup>:</p>
+<div class="f">Y = XW<sup>T</sup> = (X · diag(s)<sup>−1</sup>) · (W · diag(s))<sup>T</sup> &nbsp;=&nbsp; X̂ Ŵ<sup>T</sup></div>
+<p>This is mathematically exact in exact arithmetic. SmoothQuant chooses, per input channel j:</p>
+<div class="f">s<sub>j</sub> = max|X<sub>j</sub>|<sup>α</sup> / max|W<sub>j</sub>|<sup>1−α</sup></div>
+<p>Here max|W<sub>j</sub>| is the max over column j of W. The new channel maxima are:</p>
+<div class="f">max|X̂<sub>j</sub>| = max|X<sub>j</sub>|<sup>1−α</sup> · max|W<sub>j</sub>|<sup>1−α</sup>, &nbsp;&nbsp; max|Ŵ<sub>j</sub>| = max|X<sub>j</sub>|<sup>α</sup> · max|W<sub>j</sub>|<sup>α</sup></div>
+<p>At α = 0.5 both equal √(max|X<sub>j</sub>|·max|W<sub>j</sub>|), so the difficulty is split evenly. α = 1 moves all of it into W, which is exactly the "per-input-channel X scale moved into W" from §3. The paper's default is α = 0.5, with larger values for models with stronger outliers <span class="verify">[verify: 0.75–0.85 for some]</span>.</p>
+
+<h3>5.3 Worked example (α = 0.5)</h3>
+<table>
+    <thead><tr><th>Channel</th><th>max|X<sub>j</sub>|</th><th>max|W<sub>j</sub>|</th><th>s<sub>j</sub></th><th>max|X̂<sub>j</sub>|</th><th>max|Ŵ<sub>j</sub>|</th></tr></thead>
+    <tbody>
+    <tr><td>Outlier</td><td>64</td><td>0.25</td><td>8/0.5 = <strong>16</strong></td><td>4</td><td>4</td></tr>
+    <tr><td>Normal</td><td>1</td><td>0.25</td><td>1/0.5 = 2</td><td>0.5</td><td>0.5</td></tr>
+    </tbody>
+</table>
+<p>The spread across activation channels drops from 64× to 8× (= √64). The weights take on an 8× column spread. Since weights use per-output-channel scales and started out flat, they can absorb it.</p>
+
+<h3>5.4 Where the factors are folded (zero runtime cost)</h3>
+<table>
+    <thead><tr><th>Linear</th><th>Its input comes from</th><th>Fold 1/s<sub>j</sub> into</th><th>Pitfall</th></tr></thead>
+    <tbody>
+    <tr><td>Q, K, V projections</td><td>LayerNorm/RMSNorm</td><td>γ (and β)</td><td>One γ is shared by Q, K and V, so they need <em>one</em> s. Compute max|W<sub>j</sub>| over the concatenated [W<sub>q</sub>; W<sub>k</sub>; W<sub>v</sub>].</td></tr>
+    <tr><td>gate / up (FC1)</td><td>RMSNorm</td><td>γ</td><td>Same: gate and up share one s.</td></tr>
+    <tr><td>o_proj</td><td>attn · V</td><td>Output channels of V-projection (attention is linear in V)</td><td>With GQA, one V channel feeds several query heads, so s must be identical across each group <span class="verify">[verify]</span>.</td></tr>
+    <tr><td>down_proj</td><td>SiLU(gate) ⊙ up</td><td>Output channels of up-projection (the product is linear in up)</td><td>The factor cannot pass through the SiLU, so never fold it into gate.</td></tr>
+    </tbody>
+</table>
+
+<h3>5.5 The neighborhood (one line each)</h3>
+<table>
+    <thead><tr><th>Method</th><th>Target</th><th>Core idea</th></tr></thead>
+    <tbody>
+    <tr><td>LLM.int8()</td><td>W8A8 + FP16 outliers</td><td>Mixed-precision decomposition: outlier columns (|x| &gt; 6) run in FP16 <span class="verify">[verify threshold]</span>. Accurate but slower because of the gather and scatter.</td></tr>
+    <tr><td>SmoothQuant</td><td>W8A8</td><td>Offline difficulty migration (above)</td></tr>
+    <tr><td>GPTQ</td><td>W4/W3 weight-only</td><td>Second-order: quantizes columns one by one and compensates the error with the Hessian XX<sup>T</sup></td></tr>
+    <tr><td>AWQ</td><td>W4 weight-only</td><td>Protects salient input channels through activation-aware per-channel scaling, with α found by grid search</td></tr>
+    <tr><td>QuaRot / SpinQuant</td><td>W4A4 (+KV4)</td><td>Orthogonal (Hadamard or learned) rotations spread outliers across all channels, folded into the weights</td></tr>
+    </tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s6">6. QAT: fake quantization, STE, LSQ</h2>
+<h3>6.1 Fake quantization</h3>
+<p>Simulate quantization in float during training:</p>
+<div class="f">x̂ = s · round(clamp(x/s, −Q<sub>n</sub>, Q<sub>p</sub>))</div>
+<p>The forward pass sees exactly the quantized values. The problem is the backward pass: d round/dx = 0 almost everywhere.</p>
+<h3>6.2 Straight-through estimator (STE)</h3>
+<p>Treat round as the identity in the backward pass. With the clamp kept, this gives the "clipped STE":</p>
+<div class="f">∂x̂/∂x ≈ 1 if −Q<sub>n</sub> ≤ x/s ≤ Q<sub>p</sub>, &nbsp; else 0</div>
+<p>In PyTorch: <code>x + (torch.round(x) - x).detach()</code>. Intuition: the forward pass sees the quantized network, and the gradient is the one for the nearby float network. Weights drift until they settle in a good rounding cell.</p>
+<h3>6.3 LSQ: learn the step size</h3>
+<p>Differentiate x̂ with respect to s, using STE for round:</p>
+<div class="f">∂x̂/∂s = round(x/s) − x/s &nbsp;(inside the range), &nbsp;&nbsp; −Q<sub>n</sub> or +Q<sub>p</sub> &nbsp;(clipped)</div>
+<ul>
+    <li><strong>Inside the range:</strong> the gradient is the signed rounding residual, so s learns to balance rounding error.</li>
+    <li><strong>Clipped values:</strong> they push s up. The equilibrium is the learned clip, a trainable version of §2.3.</li>
+</ul>
+<p>LSQ details <span class="verify">[verify: Esser et al. 2019]</span>:</p>
+<ul>
+    <li>Initialization: s = 2⟨|x|⟩/√Q<sub>p</sub>.</li>
+    <li>Gradient scale: g = 1/√(N·Q<sub>p</sub>).</li>
+    <li><em>Note:</em> with Adam, a constant gradient scale largely cancels out, because Adam normalizes per parameter. g matters mainly for SGD.</li>
+</ul>
+<h3>6.4 Practical recipe</h3>
+<ul>
+    <li>Start from a converged FP checkpoint, never from scratch. Fine-tune for a small fraction of the original schedule with a learning rate about 10–100× lower <span class="verify">[verify]</span>.</li>
+    <li>Calibrate first, so that QAT starts from PTQ quality. Freeze the observers or BN statistics after a while, and fold BN during QAT to match deployment <span class="verify">[verify: Jacob et al. 2018]</span>.</li>
+    <li>Watch for <em>weight oscillation</em> across rounding boundaries late in training. It corrupts BN statistics and final accuracy. Remedies are freezing or dampening <span class="verify">[verify: Nagel et al. 2022]</span>.</li>
+</ul>
+<table>
+    <thead><tr><th>Situation</th><th>Choice</th></tr></thead>
+    <tbody>
+    <tr><td>W8A8, large model, flexible kernels</td><td>PTQ (+ SmoothQuant). QAT is rarely worth the cost.</td></tr>
+    <tr><td>W4 weight-only LLM</td><td>PTQ with GPTQ or AWQ</td></tr>
+    <tr><td>W4A4, or small CNNs and detectors at INT8 on an edge NPU with per-tensor activations</td><td>QAT</td></tr>
+    <tr><td>No training data or pipeline access</td><td>PTQ only, plus data-free tricks (CLE, bias correction)</td></tr>
+    </tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s7">7. Systems angle</h2>
+<h3>7.1 The W8A8 inference pipeline</h3>
+<ol>
+    <li><strong>Quantize activations:</strong> per-token amax, scale and cast to INT8, fused into the RMSNorm kernel.</li>
+    <li><strong>Multiply:</strong> INT8 × INT8 → INT32 MMA on Tensor Cores.</li>
+    <li><strong>Epilogue:</strong> acc · a<sub>t</sub> · b<sub>n</sub> + bias, then BF16 output or requantization to INT8, fused into the GEMM. Unfused quantize and dequantize kernels can eat the entire speedup.</li>
+</ol>
+<h3>7.2 INT32 accumulation bound</h3>
+<p>Worst case: K · 127 · 127 ≤ 2³¹ − 1, so <strong>K ≤ 133,144</strong>. With UINT8 × INT8: K · 255 · 127, so K ≤ 66,311.</p>
+<ul>
+    <li>Random signs make sums grow like √K, so real overflows are rare.</li>
+    <li>The worst case still matters for correlated data and very large K. Use split-K or blocking.</li>
+</ul>
+<h3>7.3 Zero-point algebra</h3>
+<p>Asymmetric activations cost almost nothing:</p>
+<div class="f">Σ<sub>k</sub> (q<sub>x</sub>[t,k] − z<sub>x</sub>) q<sub>w</sub>[n,k] = Σ<sub>k</sub> q<sub>x</sub>q<sub>w</sub> &nbsp;−&nbsp; z<sub>x</sub> · <strong>Σ<sub>k</sub> q<sub>w</sub>[n,k]</strong></div>
+<ul>
+    <li>The correction Σ<sub>k</sub> q<sub>w</sub>[n,k] is a per-n constant, precomputed offline.</li>
+    <li>A <em>weight</em> zero-point would require Σ<sub>k</sub> q<sub>x</sub>[t,k], a runtime row sum per token. That is why weights are symmetric.</li>
+</ul>
+<h3>7.4 Throughput</h3>
+<ul>
+    <li><strong>A100:</strong> dense INT8 runs at about 624 TOPS, 2× the 312 TFLOPS of BF16.</li>
+    <li><strong>H100 SXM:</strong> INT8 ≈ FP8 ≈ 1979 dense, about 2× BF16 <span class="verify">[verify all numbers]</span>.</li>
+    <li><strong>Consequence:</strong> on Hopper, INT8 buys nothing over FP8, so <em>numerics</em> decide (Lesson 11). Check INT8 support on your target architecture <span class="verify">[verify for Blackwell]</span>.</li>
+</ul>
+<h3>7.5 Memory-bound vs compute-bound</h3>
+<ul>
+    <li><strong>Decode at small batch is memory-bound:</strong> time ≈ weight bytes / bandwidth. W4A16 moves 4× fewer bytes than BF16, W8A8 2× fewer. The weight-only kernel must dequantize in registers efficiently <span class="verify">[verify: e.g. Marlin]</span>.</li>
+    <li><strong>Prefill and large batches are compute-bound:</strong> here W8A8 (or FP8) wins through Tensor Core throughput.</li>
+</ul>
+<h3>7.6 Tensor parallelism (links to Lesson 7)</h3>
+<ul>
+    <li><strong>Column-parallel shards</strong> own output channels, so per-channel weight scales shard naturally.</li>
+    <li><strong>Row-parallel shards</strong> split K. Per-token activation scales are computed on each shard and differ between ranks. That is legal because each rank dequantizes its partial sums to BF16 <em>before</em> the all-reduce.</li>
+    <li><strong>INT32 partials cannot be all-reduced</strong> when their scales differ.</li>
+    <li><strong>Calibrate globally.</strong>
+        <ul>
+            <li>Per-tensor amax and SmoothQuant factors are per-K statistics. Compute them on the full tensor, or all-reduce the amax with MAX.</li>
+            <li>Slice the result to match the shard layout.</li>
+            <li>Shard-local amax gives results that depend on the TP degree.</li>
+        </ul>
+    </li>
+</ul>
+<h3>7.7 Deployment</h3>
+<ul>
+    <li><strong>Explicit quantization:</strong> ONNX Q/DQ nodes, consumed by TensorRT.</li>
+    <li><strong>Edge NPUs and DLAs:</strong> often INT8-only, with per-tensor activation scales and sometimes power-of-two scales <span class="verify">[verify per target]</span>. This is QAT territory, which is relevant for embedded and defense workloads.</li>
+    <li><strong>KV cache quantization:</strong> INT8 or FP8 with per-head or per-token scales. It cuts decode memory traffic separately from the weights.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="s8">8. Lab (~60 min)</h2>
+<p>Write down a prediction for each printed line <em>before</em> running. CPU only. Total runtime is about 30–60 s.</p>
+<pre><code class="language-python">import copy
+import math
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+
+
+def sqnr_db(ref, approx):
+    """Signal-to-quantization-noise ratio in dB (uses E[ref^2], not Var)."""
+    return 10 * math.log10(ref.pow(2).mean().item() / (ref - approx).pow(2).mean().item())
+
+
+def amax_along(x, dim):
+    """amax per index of `dim` (None = per-tensor), keepdim so it broadcasts against x."""
+    if dim is None:
+        return x.abs().amax()
+    dim = dim % x.dim()
+    others = [d for d in range(x.dim()) if d != dim]
+    return x.abs().amax(dim=others, keepdim=True)
+
+
+def fq_sym(x, bits=8, dim=None, amax=None):
+    """Symmetric fake-quant, restricted range [-qmax, qmax]. Returns (x_hat, q, scale)."""
+    qmax = 2 ** (bits - 1) - 1
+    amax = amax_along(x, dim) if amax is None else torch.as_tensor(amax, dtype=x.dtype)
+    s = amax.clamp(min=1e-12) / qmax
+    q = torch.clamp(torch.round(x / s), -qmax, qmax)
+    return q * s, q, s
+
+
+def fq_asym(x, bits=8):
+    """Asymmetric (unsigned) per-tensor fake-quant with an integer zero-point."""
+    qmax = 2 ** bits - 1
+    lo, hi = x.min().clamp(max=0), x.max().clamp(min=0)
+    s = (hi - lo).clamp(min=1e-12) / qmax
+    z = torch.round(-lo / s)
+    q = torch.clamp(torch.round(x / s) + z, 0, qmax)
+    return (q - z) * s
+
+
+# ---------------- Part 1: noise model, 6 dB/bit, symmetric vs asymmetric ----------------
+x = torch.randn(1_000_000)
+xh, q, s = fq_sym(x)
+print(f"scale={s.item():.5f}  noise var={(x - xh).var().item():.3e}  s^2/12={(s ** 2 / 12).item():.3e}")
+for b in (4, 6, 8):
+    print(f"{b}-bit sym SQNR: {sqnr_db(x, fq_sym(x, b)[0]):5.1f} dB")
+r = torch.relu(x)
+print(f"post-ReLU 8-bit: sym {sqnr_db(r, fq_sym(r)[0]):5.1f} dB | asym {sqnr_db(r, fq_asym(r)):5.1f} dB")
+
+# ---------------- Part 2: per-tensor vs per-channel weights ----------------
+N, K = 256, 512
+ch_scale = torch.logspace(-2, 0, N).unsqueeze(1)       # 100x spread across output channels (e.g. after BN folding)
+W = torch.randn(N, K) * ch_scale
+print()
+for name, dim in (("per-tensor", None), ("per-channel", 0)):
+    Wh = fq_sym(W, 8, dim)[0]
+    worst = min(sqnr_db(W[i], Wh[i]) for i in range(N))
+    print(f"W {name:12s}: overall {sqnr_db(W, Wh):5.1f} dB | worst channel {worst:5.1f} dB")
+
+# ---------------- Part 3: activation outlier channels vs granularity ----------------
+T, K, N = 256, 4096, 1024
+X = torch.randn(T, K)
+X[:, torch.randperm(K)[:4]] *= 20                      # systematic outlier channels (LLM.int8-style)
+W = torch.randn(N, K) / math.sqrt(K)
+Y = X @ W.T
+Wh = fq_sym(W, 8, dim=0)[0]                            # per-output-channel weights
+print()
+for name, dim in (("per-tensor", None), ("per-token", 0), ("per-in-channel*", 1)):
+    Xh = fq_sym(X, 8, dim)[0]
+    print(f"X {name:16s}: Y SQNR {sqnr_db(Y, Xh @ Wh.T):5.1f} dB")
+print("* not GEMM-friendly: its scale indexes the reduction dimension k")
+
+# ---------------- Part 4: SmoothQuant on an LN -> Linear block ----------------
+T, K, N = 512, 1024, 1024
+ln, lin = nn.LayerNorm(K), nn.Linear(K, N)
+with torch.no_grad():
+    out_ch = torch.randperm(K)[:8]
+    ln.weight.fill_(1.0)
+    ln.weight[out_ch] = 25.0                           # outliers originate in the norm gain
+    ln.bias.normal_(0, 0.1)
+    lin.weight[:, out_ch] /= 5                         # partial downstream compensation, so outlier channels
+                                                       # do not dominate Y and hide damage to normal channels
+h_cal, h_test = torch.randn(T, K), torch.randn(T, K)
+
+
+def w8a8(ln_mod, lin_mod, h):
+    """Per-token dynamic activation quant + per-output-channel weight quant."""
+    xq = fq_sym(ln_mod(h), 8, dim=0)[0]
+    return F.linear(xq, fq_sym(lin_mod.weight, 8, dim=0)[0], lin_mod.bias)
+
+
+def smooth(ln_mod, lin_mod, h_calib, alpha):
+    """Smoothed copies: X' = X / s (folded into LN gamma/beta), W' = W * s (column-wise)."""
+    ln2, lin2 = copy.deepcopy(ln_mod), copy.deepcopy(lin_mod)
+    ax = ln_mod(h_calib).abs().amax(0)                 # per input channel, from calibration data
+    aw = lin_mod.weight.abs().amax(0)                  # per input channel (column max)
+    s = (ax.pow(alpha) / aw.pow(1 - alpha)).clamp(min=1e-5)
+    ln2.weight.div_(s)
+    ln2.bias.div_(s)
+    lin2.weight.mul_(s)                                # broadcasts over rows: W[:, j] *= s_j
+    return ln2, lin2
+
+
+with torch.no_grad():
+    ref = lin(ln(h_test))
+    ln_s, lin_s = smooth(ln, lin, h_cal, 0.5)
+    print("\nFP equivalence max |diff|:", (lin_s(ln_s(h_test)) - ref).abs().max().item())
+    print(f"no smoothing      : {sqnr_db(ref, w8a8(ln, lin, h_test)):5.1f} dB")
+    for a in (0.25, 0.5, 0.75, 1.0):
+        ln_s, lin_s = smooth(ln, lin, h_cal, a)
+        print(f"SmoothQuant a={a:.2f}: {sqnr_db(ref, w8a8(ln_s, lin_s, h_test)):5.1f} dB")
+
+# ---------------- Part 5: calibration on heavy tails (Laplace) ----------------
+lap = torch.distributions.Laplace(0.0, 1.0)
+cal, test = lap.sample((100_000,)), lap.sample((100_000,))
+
+
+def clip_mse(x, bits, grid=200):
+    cands = torch.linspace(0.05, 1.0, grid) * x.abs().max()
+    errs = torch.stack([(x - fq_sym(x, bits, amax=c)[0]).pow(2).mean() for c in cands])
+    return cands[errs.argmin()]
+
+
+print()
+for bits in (8, 4):
+    clips = {"min-max": cal.abs().max(), "p99.99": cal.abs().quantile(0.9999), "MSE-opt": clip_mse(cal, bits)}
+    row = " | ".join(f"{k} c={v.item():5.2f} -> {sqnr_db(test, fq_sym(test, bits, amax=v)[0]):5.1f} dB"
+                     for k, v in clips.items())
+    print(f"{bits}-bit: {row}")
+
+
+# ---------------- Part 6: STE, LSQ and QAT vs PTQ ----------------
+def round_ste(x):
+    """Forward: round(x). Backward: identity (straight-through estimator)."""
+    return x + (torch.round(x) - x).detach()
+
+
+def grad_scale(x, g):
+    """Forward: x. Backward: gradient multiplied by g (LSQ step-size gradient scaling)."""
+    return (x - x * g).detach() + x * g
+
+
+v = torch.tensor([-5.0, -0.7, 0.2, 1.4, 5.0], requires_grad=True)
+s = torch.tensor(0.5, requires_grad=True)
+(round_ste(torch.clamp(v / s, -3, 3)) * s).sum().backward()
+print("\nSTE dy/dv:", v.grad.tolist())
+print(f"LSQ dy/ds: {s.grad.item():.3f}")
+
+
+class LSQWeight(nn.Module):
+    """Learned per-output-channel step size (LSQ), symmetric [-qmax, qmax]."""
+
+    def __init__(self, w, bits):
+        super().__init__()
+        self.qmax = 2 ** (bits - 1) - 1
+        self.s = nn.Parameter(2 * w.abs().mean(1, keepdim=True) / math.sqrt(self.qmax))
+
+    def forward(self, w):
+        s = grad_scale(self.s, 1.0 / math.sqrt(w.shape[1] * self.qmax))
+        return round_ste(torch.clamp(w / s, -self.qmax, self.qmax)) * s
+
+
+class QLinear(nn.Module):
+    def __init__(self, lin_mod, bits):
+        super().__init__()
+        self.weight = nn.Parameter(lin_mod.weight.detach().clone())
+        self.bias = nn.Parameter(lin_mod.bias.detach().clone())
+        self.wq = LSQWeight(self.weight.detach(), bits)
+
+    def forward(self, x):
+        return F.linear(x, self.wq(self.weight), self.bias)
+
+
+torch.manual_seed(1)
+D, C, BITS = 32, 10, 3
+teacher = nn.Sequential(nn.Linear(D, 64), nn.Tanh(), nn.Linear(64, C))
+
+
+def batch(n):
+    xb = torch.randn(n, D)
+    with torch.no_grad():
+        return xb, teacher(xb).argmax(1)
+
+
+def accuracy(m, xb, yb):
+    with torch.no_grad():
+        return (m(xb).argmax(1) == yb).float().mean().item()
+
+
+def train(m, steps, lr):
+    opt = torch.optim.Adam(m.parameters(), lr=lr)
+    for _ in range(steps):
+        xb, yb = batch(256)
+        loss = F.cross_entropy(m(xb), yb)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+
+
+x_te, y_te = batch(20_000)
+student = nn.Sequential(nn.Linear(D, 256), nn.ReLU(), nn.Linear(256, 256), nn.ReLU(), nn.Linear(256, C))
+train(student, 3000, 1e-3)
+print(f"\nFP32 accuracy             : {accuracy(student, x_te, y_te):.3f}")
+
+ptq = copy.deepcopy(student)
+with torch.no_grad():
+    for m in ptq:
+        if isinstance(m, nn.Linear):
+            m.weight.copy_(fq_sym(m.weight, BITS, dim=0)[0])
+print(f"PTQ {BITS}-bit min-max per-ch : {accuracy(ptq, x_te, y_te):.3f}")
+
+qat = nn.Sequential(*[QLinear(m, BITS) if isinstance(m, nn.Linear) else m for m in student])
+print(f"PTQ {BITS}-bit LSQ init       : {accuracy(qat, x_te, y_te):.3f}")
+train(qat, 1000, 1e-4)
+print(f"QAT {BITS}-bit (1000 steps)   : {accuracy(qat, x_te, y_te):.3f}")
+
+with torch.no_grad():
+    l0 = qat[0]
+    q0 = torch.round(torch.clamp(l0.weight / l0.wq.s, -l0.wq.qmax, l0.wq.qmax))
+    print("integer levels in layer 0 :", q0.unique().tolist())
+
+# ---------------- Part 7: INT32 accumulation and zero-point folding ----------------
+print("\nmax K, int8 x int8 (q up to 127):", (2 ** 31 - 1) // (127 * 127))
+print("max K, uint8 x int8            :", (2 ** 31 - 1) // (255 * 127))
+
+T, K, N = 64, 4096, 256
+xa = torch.relu(torch.randn(T, K)) - 0.2               # skewed, mostly non-negative activations
+s_x = (xa.max() - xa.min()) / 255
+z_x = torch.round(-xa.min() / s_x)
+qx = torch.clamp(torch.round(xa / s_x) + z_x, 0, 255).double()
+qw = torch.randint(-127, 128, (N, K)).double()
+direct = (qx - z_x) @ qw.T                             # what the math needs
+fused = qx @ qw.T - z_x * qw.sum(1)                    # plain int GEMM + offline per-n correction
+print("zero-point folding exact:", torch.equal(direct, fused))
+print(f"max |acc| / 2^31: {(qx @ qw.T).abs().max().item() / 2 ** 31:.2e}")
+</code></pre>
+
+<details><summary>Expected behavior (open after running). The numbers are my estimates.</summary>
+    <p><strong>Part 1</strong></p>
+    <ul>
+        <li>Scale ≈ 0.039, and the noise variance matches s²/12 within about 1%.</li>
+        <li>SQNR is about 14, 27 and 39 dB at 4, 6 and 8 bits: roughly 6 dB per bit.</li>
+        <li>Post-ReLU: asymmetric beats symmetric by <strong>≈ 6 dB</strong>. Symmetric wastes the negative half, which is one bit.</li>
+    </ul>
+    <p><strong>Part 2</strong></p>
+    <ul>
+        <li>Per-tensor: the overall SQNR looks fine (≈ 32 dB), but the worst channel is ≈ 0–3 dB, because most of its values round to 0.</li>
+        <li>Per-channel: ≈ 40+ dB in every channel.</li>
+        <li><em>Lesson: an aggregate SQNR hides crushed channels.</em></li>
+    </ul>
+    <p><strong>Part 3</strong></p>
+    <table>
+        <thead><tr><th>Activation granularity</th><th>Y SQNR</th></tr></thead>
+        <tbody>
+        <tr><td>Per-tensor</td><td>≈ 18 dB</td></tr>
+        <tr><td>Per-token</td><td>≈ 23 dB (barely helps: every row contains the outlier channels)</td></tr>
+        <tr><td>Per-input-channel</td><td>≈ 38 dB (but forbidden in the GEMM)</td></tr>
+        </tbody>
+    </table>
+    <p><strong>Part 4</strong></p>
+    <ul>
+        <li>FP equivalence: diff ≈ 1e-6 to 1e-5, i.e. FP32 rounding only.</li>
+        <li>No smoothing ≈ 20 dB. α = 0.5–0.75 ≈ 33–36 dB.</li>
+        <li>α = 1 drops slightly, because the outliers now sit in W's columns.</li>
+        <li>Expect a plateau or U-shape, not a monotone curve.</li>
+    </ul>
+    <p><strong>Part 5</strong></p>
+    <ul>
+        <li>Clip values:
+            <ul>
+                <li>Min-max c ≈ 11.5 (≈ ln 10⁵).</li>
+                <li>p99.99 ≈ 9.2 (= ln 10⁴ for Laplace).</li>
+                <li>MSE-optimal ≈ 10 at 8 bits and ≈ 5 at 4 bits <span class="verify">[verify: ACIQ, Banner et al.]</span>.</li>
+            </ul>
+        </li>
+        <li>At 8 bits the methods differ by about 1 dB.</li>
+        <li>At 4 bits, MSE-optimal clipping beats min-max by about 6 dB (≈ 15.5 vs 9.5 dB).</li>
+    </ul>
+    <p><strong>Part 6</strong></p>
+    <ul>
+        <li>STE gradient: [0, 1, 1, 1, 0].</li>
+        <li>LSQ: dy/ds ≈ 0.2. The in-range residuals contribute 0.4 − 0.4 + 0.2, and the clipped values contribute −3 + 3.</li>
+        <li>Accuracy: PTQ at 3 bits loses several points. LSQ initialization without training usually beats min-max. QAT recovers most of the gap. The exact numbers depend on the seed, so record yours.</li>
+        <li>Layer 0 uses integer levels from −3 to 3.</li>
+    </ul>
+    <p><strong>Part 7</strong></p>
+    <ul>
+        <li>Max K: 133144 and 66311.</li>
+        <li>Folding is exact: <code>True</code>.</li>
+        <li>max |acc|/2³¹ is around 10⁻⁴ to 10⁻³. Random signs keep it far from overflow.</li>
+    </ul>
+</details>
+<p><strong>Stretch tasks:</strong></p>
+<ol>
+    <li>Add per-token activation fake quantization (8-bit, with STE) to <code>QLinear</code> and rerun QAT at W3A8.</li>
+    <li>In Part 4, make Q, K and V share one LayerNorm. Compute s from the concatenated weight columns and verify FP equivalence for all three outputs.</li>
+    <li>Implement the GPTQ column update for a single layer and compare it against min-max PTQ at 4 bits.</li>
+</ol>
+
+<!-- ============================================================ -->
+<h2 id="s9">9. Interview drills (~15 min)</h2>
+<h3>9.1 Thirty-second answer: "How would you deploy a 7B LLM in INT8?"</h3>
+<blockquote>"Weights are easy and activations are hard. LLM activations have a few systematic outlier channels, and an INT8 GEMM only allows per-token activation scales and per-output-channel weight scales, because the scales have to factor out of the k-sum. So I'd start with per-channel symmetric weights and dynamic per-token activations, fused into the norm kernel. Then I'd apply SmoothQuant: rescale each input channel by s<sub>j</sub> = max|X<sub>j</sub>|<sup>α</sup>/max|W<sub>j</sub>|<sup>1−α</sup>, with s folded offline into the norm γ, the V-projection and the up-projection. I'd tune α on a calibration set and run a per-layer sensitivity sweep, keeping the lm_head in BF16 if it's needed. On Hopper, FP8 has the same throughput as INT8, so I'd benchmark FP8 too. For batch-1 decode I'd also consider W4A16, because that regime is memory-bound."</blockquote>
+
+<h3>9.2 Whiteboard prompts</h3>
+<details><summary>Why doesn't per-token activation quantization fix LLM outliers?</summary>
+    <p>The outliers are per-<em>channel</em>: a few fixed k-indices, present in nearly every token. Each token's amax is therefore set by those channels, and per-token scaling changes little. Per-channel X scales would fix it, but they index the reduction dimension, so they can't be factored out of an integer GEMM. They can only be moved into W, which is SmoothQuant.</p></details>
+<details><summary>Derive SmoothQuant and say where the factors go.</summary>
+    <ul>
+        <li>Start from XW<sup>T</sup> = (X·diag(s)<sup>−1</sup>)(W·diag(s))<sup>T</sup> and choose s<sub>j</sub> = max|X<sub>j</sub>|<sup>α</sup>/max|W<sub>j</sub>|<sup>1−α</sup>.</li>
+        <li>At α = 0.5, both channel maxima become √(max|X<sub>j</sub>|·max|W<sub>j</sub>|).</li>
+        <li>Fold 1/s into whatever produces X linearly per channel:
+            <ul>
+                <li>norm γ/β for QKV and gate/up (one shared s);</li>
+                <li>V-projection output channels for o_proj (with a GQA group constraint);</li>
+                <li>up-projection output channels for down_proj (never gate, because of the SiLU).</li>
+            </ul>
+        </li>
+        <li>Runtime cost: zero.</li>
+    </ul></details>
+<details><summary>Your INT8 PTQ model is 5 points worse than FP16. Debug it.</summary>
+    <ol>
+        <li>Check that FP32 fake-quant matches the deployed engine. This rules out kernel bugs or a missing epilogue bias.</li>
+        <li>Run a per-layer sensitivity sweep (quantize one layer at a time) and inspect the output SQNR per layer.</li>
+        <li>Inspect activation histograms for outlier channels. Fix them with SmoothQuant, or keep the layer in FP16.</li>
+        <li>Check whether the calibration data is representative, and try percentile or MSE calibration.</li>
+        <li>In CNNs, check BN folding and per-channel weights, and apply bias correction.</li>
+        <li>If it is still bad: QAT.</li>
+    </ol></details>
+<details><summary>Edge detector on an INT8-only NPU with per-tensor static activations: PTQ or QAT?</summary>
+    <p>Likely QAT.</p>
+    <ul>
+        <li>The hardware forbids the escape hatches: no per-token scales, no mixed precision and possibly power-of-two scales.</li>
+        <li>Small CNNs have little redundancy.</li>
+    </ul>
+    <p>Recipe:</p>
+    <ol>
+        <li>Calibrate first. Apply CLE if there are depthwise convs.</li>
+        <li>Run QAT with fake quantization that matches the target exactly (rounding mode, scale constraints, fused BN).</li>
+        <li>Use LSQ, then freeze BN and the observers near the end.</li>
+    </ol></details>
+<details><summary>Why are weight zero-points avoided in INT8 GEMMs?</summary>
+    <p>An activation zero-point adds −z<sub>x</sub>Σ<sub>k</sub>q<sub>w</sub>[n,k], a per-n constant precomputed offline. A weight zero-point adds −z<sub>w</sub>Σ<sub>k</sub>q<sub>x</sub>[t,k], a per-token row sum at runtime, plus a cross term. Weights are near-symmetric anyway, so symmetric weight quantization costs almost no accuracy.</p></details>
+<details><summary>Explain STE and the LSQ gradient. Why does training through round() work at all?</summary>
+    <ul>
+        <li><strong>STE:</strong> the forward pass uses the quantized value, and the backward pass treats round as the identity, zeroed outside the clip range. The weights get gradients for the nearby continuous network, and their latent float values cross rounding boundaries when the loss benefits.</li>
+        <li><strong>LSQ:</strong> ∂x̂/∂s = round(x/s) − x/s inside the range and ±Q at the clip. That balances rounding error against clipping error, which is §2.3 learned end to end.</li>
+        <li><strong>Caveat:</strong> weights can oscillate across boundaries late in training.</li>
+    </ul></details>
+
+<!-- ============================================================ -->
+<h2 id="s10">10. Quiz</h2>
+<p>For numeric answers, enter a decimal number (e.g. <code>0.0000333</code> or <code>3.33e-5</code>). Non-integer answers within ±2% are accepted.</p>
+<div class="quiz" id="quiz"></div>
+<p id="score"></p>
+
+<!-- ============================================================ -->
+<h2 id="s11">11. Sources (all from memory; verify)</h2>
+<ul>
+    <li>Jacob et al., "Quantization and Training of Neural Networks for Efficient Integer-Arithmetic-Only Inference", arXiv:1712.05877</li>
+    <li>Krishnamoorthi, "Quantizing deep convolutional networks for efficient inference: A whitepaper", arXiv:1806.08342</li>
+    <li>Nagel et al., "A White Paper on Neural Network Quantization", arXiv:2106.08295</li>
+    <li>Nagel et al., "Data-Free Quantization Through Weight Equalization and Bias Correction", arXiv:1906.04721</li>
+    <li>Banner et al., "Post training 4-bit quantization of convolutional networks for rapid-deployment" (ACIQ), arXiv:1810.05723</li>
+    <li>Wu et al. (NVIDIA), "Integer Quantization for Deep Learning Inference: Principles and Empirical Evaluation", arXiv:2004.09602</li>
+    <li>Dettmers et al., "LLM.int8()", arXiv:2208.07339</li>
+    <li>Xiao et al., "SmoothQuant", arXiv:2211.10438</li>
+    <li>Frantar et al., "GPTQ", arXiv:2210.17323 · Lin et al., "AWQ", arXiv:2306.00978</li>
+    <li>Ashkboos et al., "QuaRot", arXiv:2404.00456 · Liu et al., "SpinQuant", arXiv:2405.16406</li>
+    <li>Bengio et al., "Estimating or Propagating Gradients Through Stochastic Neurons" (STE), arXiv:1308.3432</li>
+    <li>Esser et al., "Learned Step Size Quantization", arXiv:1902.08153 · Choi et al., "PACT", arXiv:1805.06085</li>
+    <li>Nagel et al., "Overcoming Oscillations in Quantization-Aware Training", arXiv:2203.11086</li>
+    <li>NVIDIA A100/H100 datasheets (INT8/FP8/BF16 Tensor Core throughput)</li>
+    <li><span class="tag u">verify</span> PyTorch autograd anomaly detection — <a href="https://docs.pytorch.org/docs/stable/autograd.html#anomaly-detection">docs</a></li>
+</ul>
+
+<script>
+    // Render code blocks with copy buttons
+    document.querySelectorAll('script[type="text/plain"].code').forEach(s => {
+
+<script>
+    const Q = [
+        {q:"Symmetric INT8 (restricted range ±127), per-tensor, amax = 2.54. Scale s?", type:"num", a:0.02,
+            why:"s = amax/127 = 2.54/127 = 0.02."},
+        {q:"Rounding-noise variance for s = 0.02 (uniform-error model)?", type:"num", a:3.3333e-5,
+            why:"s²/12 = 0.0004/12 ≈ 3.33e-5."},
+        {q:"SQNR gain per extra bit for a full-scale uniform signal (dB)?", type:"num", a:6.02,
+            why:"SQNR = 2^(2b), so 20·log10(2) ≈ 6.02 dB per bit."},
+        {q:"Largest K for which an INT8×INT8 dot product (|q| up to 127) can never overflow an INT32 accumulator?", type:"num", a:133144,
+            why:"floor((2³¹ − 1)/127²) = floor(2147483647/16129) = 133144."},
+        {q:"SmoothQuant, α = 0.5, max|X_j| = 64, max|W_j| = 0.25. Smoothing factor s_j?", type:"num", a:16,
+            why:"s = 64^0.5 / 0.25^0.5 = 8/0.5 = 16."},
+        {q:"Same channel after smoothing: new max|X̂_j|?", type:"num", a:4,
+            why:"64/16 = 4 = √(64·0.25). At α = 0.5, max|Ŵ_j| = 0.25·16 = 4 as well: balanced."},
+        {q:"Why can't per-input-channel activation scales be used directly in an INT8 GEMM?", type:"mc",
+            opts:["INT8 cannot represent them","The scale indexes the reduction dimension k, so it cannot be factored out of the integer sum","They need asymmetric quantization","They overflow INT32"], a:1,
+            why:"Only scales indexed by t (token) or n (output channel) can be applied in the epilogue. A scale c_k would need a float multiply inside the k-loop. It can instead be moved into W, which is SmoothQuant."},
+        {q:"Q, K and V projections read one shared RMSNorm output. Where do SmoothQuant factors go, and what constraint applies?", type:"mc",
+            opts:["Into each projection's bias, with separate s per projection","Into the norm's γ, with a single s shared by Q, K, V (computed from the concatenated weight columns)","Into the softmax temperature","They cannot be folded and must be applied at runtime"], a:1,
+            why:"One γ produces one X, so there can be only one s. Compute max|W_j| over [W_q; W_k; W_v] columns, and multiply all three weights by s."},
+        {q:"Why are activation zero-points cheap but weight zero-points expensive in INT8 GEMMs?", type:"mc",
+            opts:["The activation correction z_x·Σ_k q_w[n,k] is precomputed per n; a weight zero-point needs runtime per-token row sums Σ_k q_x[t,k]","Weights are always positive","Tensor Cores only support activation zero-points","Weight zero-points overflow INT8"], a:0,
+            why:"The weight-only sum is a constant known offline. The activation row sum changes with every input."},
+        {q:"Clipped STE: gradient of s·round(clamp(x/s, −Q, Q)) w.r.t. x for x/s inside vs outside the range?", type:"mc",
+            opts:["0 inside, 1 outside","1 inside, 0 outside","1/s inside, 0 outside","1 everywhere"], a:1,
+            why:"Inside: s·(1/s)·1 = 1 (round treated as identity). Outside: the clamp gradient is 0."},
+        {q:"LSQ: ∂x̂/∂s for an in-range value?", type:"mc",
+            opts:["x/s","round(x/s) − x/s","0","±Q"], a:1,
+            why:"d/ds[s·round(x/s)] = round(x/s) + s·(−x/s²) with STE = round(x/s) − x/s. Clipped values give ±Q."},
+        {q:"Batch-1 LLM decode on a GPU. Which usually gives the larger speedup over BF16?", type:"mc",
+            opts:["W8A8 (INT8 Tensor Cores)","W4A16 weight-only","Both equal: decode is compute-bound","Neither: quantization never helps decode"], a:1,
+            why:"Decode at small batch is memory-bound, so time ≈ weight bytes / bandwidth. 4-bit weights move 4× fewer bytes than BF16, versus 2× for INT8."},
+        {q:"After BN folding into a conv, per-tensor INT8 weights lose a lot of accuracy. Most likely cause?", type:"mc",
+            opts:["BN folding is not exact","Channels with small running variance get huge folded weights, so the per-tensor scale crushes the other channels","INT32 overflow","The zero-point is wrong"], a:1,
+            why:"W'_c = W_c·γ_c/√(σ_c²+ε) can spread channel ranges by 100× or more. Use per-channel weight scales or cross-layer equalization."}
+    ];
+
+    const root = document.getElementById("quiz"), done = {};
+    Q.forEach((it, i) => {
+        const s = document.createElement("section");
+        let h = `<p><b>Q${i + 1}.</b> ${it.q}</p>`;
+        h += it.type === "num"
+            ? `<input id="in${i}" type="text" inputmode="decimal">`
+            : it.opts.map((o, j) => `<label><input type="radio" name="q${i}" value="${j}"> ${o}</label><br>`).join("");
+        h += `<br><button data-i="${i}">Check</button><p class="fb" id="fb${i}"></p>`;
+        s.innerHTML = h;
+        root.appendChild(s);
+    });
+
+    root.addEventListener("click", e => {
+        if (e.target.tagName !== "BUTTON") return;
+        const i = +e.target.dataset.i, it = Q[i];
+        let ok;
+        if (it.type === "num") {
+            const v = parseFloat(document.getElementById("in" + i).value.replace(",", "."));
+            const tol = Number.isInteger(it.a) ? 1e-9 : 0.02 * Math.abs(it.a);
+            ok = Number.isFinite(v) && Math.abs(v - it.a) <= tol;
+        } else {
+            const c = document.querySelector(`input[name=q${i}]:checked`);
+            ok = !!c && +c.value === it.a;
+        }
+        const fb = document.getElementById("fb" + i);
+        fb.className = "fb " + (ok ? "ok" : "bad");
+        fb.innerHTML = (ok ? "Correct. " : "Not quite. ") + it.why;
+        done[i] = ok;
+        document.getElementById("score").textContent =
+            `Score: ${Object.values(done).filter(Boolean).length}/${Q.length}`;
+    });
+</script>
+
+
+        
+        <!-- _includes/tutorial-nav.html -->
+
+
+
+
+
+
+
+
+
+
+
+
+<nav class="tutorial-nav" aria-label="Lesson navigation">
+    
+    <a href="/heap/nov26/009/" class="tutorial-nav-btn tutorial-nav-prev">
+        <span class="tutorial-nav-label">← Previous</span>
+        <span class="tutorial-nav-title">009 — Lesson 9: NaN/Inf Forensics</span>
+    </a>
+    
+
+    
+    <a href="/heap/nov26/011/" class="tutorial-nav-btn tutorial-nav-next">
+        <span class="tutorial-nav-label">Next →</span>
+        <span class="tutorial-nav-title">011 — Lesson 11: Distributed Numerics</span>
+    </a>
+    
+</nav>
+        
+    </article>
+
+</div>
+  </div>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <div class="footer-links">
+      <a href="https://github.com/g4br1el">GitHub</a>
+      <a href="https://www.linkedin.com/in/gadax">LinkedIn</a>
+      <a href="mailto:gdax.science@gmail.com">Email</a>
+      <a href="/files/CV-Gabriel_Dax.pdf">Resume ↓</a>
+    </div>
+    <p class="footer-copyright">© 2026 Gabriel Dax</p>
+  </div>
+</footer>
+
+
+
+</body>
+</html>

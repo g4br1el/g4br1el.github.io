@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 9: NaN/Inf Forensics — Gabriel Dax</title>
+  <!-- Begin Jekyll SEO tag v2.9.1 -->
+<meta name="generator" content="Jekyll v4.4.1" />
+<meta property="og:title" content="Lesson 9: NaN/Inf Forensics" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="Interview skill. Given a described training failure, walk through Triage &rarr; Reproduce &rarr; Localize &rarr; Explain &rarr; Fix &amp; Guard in under 5 minutes. Name the mechanism: an IEEE event (overflow, invalid op, underflow followed by division) or an optimization instability (logit growth). verified = checked against the source in this session · verify = from memory, check before quoting." />
+<meta name="twitter:description" property="og:description" content="Interview skill. Given a described training failure, walk through Triage &rarr; Reproduce &rarr; Localize &rarr; Explain &rarr; Fix &amp; Guard in under 5 minutes. Name the mechanism: an IEEE event (overflow, invalid op, underflow followed by division) or an optimization instability (logit growth). verified = checked against the source in this session · verify = from memory, check before quoting." />
+<link rel="canonical" href="https://www.gabrieldax.de/heap/nov26/009/" />
+<meta property="og:url" content="https://www.gabrieldax.de/heap/nov26/009/" />
+<meta property="og:site_name" content="Gabriel Dax — ML Research Engineer" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2026-11-23T09:53:36+00:00" />
+<meta property="article:modified_time" content="2026-11-23T09:53:36+00:00" />
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:title" content="Lesson 9: NaN/Inf Forensics" />
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"BlogPosting","dateModified":"2026-11-23T09:53:36+00:00","datePublished":"2026-11-23T09:53:36+00:00","description":"Interview skill. Given a described training failure, walk through Triage \u0026rarr; Reproduce \u0026rarr; Localize \u0026rarr; Explain \u0026rarr; Fix \u0026amp; Guard in under 5 minutes. Name the mechanism: an IEEE event (overflow, invalid op, underflow followed by division) or an optimization instability (logit growth). verified = checked against the source in this session · verify = from memory, check before quoting.","headline":"Lesson 9: NaN/Inf Forensics","mainEntityOfPage":{"@type":"WebPage","@id":"https://www.gabrieldax.de/heap/nov26/009/"},"url":"https://www.gabrieldax.de/heap/nov26/009/"}</script>
+<!-- End Jekyll SEO tag -->
+
+  <meta content='text/html; charset=utf-8' http-equiv='Content-Type'>
+<meta http-equiv='X-UA-Compatible' content='IE=edge'>
+<meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0'>
+
+
+<meta property="og:description" content="
+    Interview skill. Given a described training failure, walk through
+    Triage &rarr; Reproduce &rarr; Localize &rarr; Explain &rarr; Fix &amp; Guard in under 5 minutes.
+    Name the mechanism: an IEEE event (overflow, invalid op, underflow followed by division) or an optimization instability (logit growth).
+    verified = checked against the source in this session ·
+    verify = from memory, check before quoting.
+" />
+
+<meta name="author" content="Gabriel Dax" />
+
+
+
+<meta property="og:title" content="Lesson 9: NaN/Inf Forensics" />
+<meta property="twitter:title" content="Lesson 9: NaN/Inf Forensics" />
+
+
+
+<meta property="og:image" content="https://www.gabrieldax.de/images/self.png"/>
+<meta property="twitter:image" content="https://www.gabrieldax.de/images/self.png"/>
+
+
+  <link rel="stylesheet" href="/assets/style.css">
+  <link rel="icon" type="image/png" sizes="32x32" href="/images/favicon.jpg">
+  <link rel="canonical" href="https://www.gabrieldax.de/heap/nov26/009/">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  
+
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <div>
+      <a href="/" class="site-name">Gabriel Dax</a>
+      <span class="site-tagline">ML Research Engineer</span>
+    </div>
+    <nav>
+      <a href="/" >Home</a>
+      <a href="/projects" >Projects</a>
+      <a href="/publications" >Publications</a>
+      <a href="/bio" >CV</a>
+    </nav>
+  </div>
+</header>
+
+<main class="main-content">
+  <div class="container">
+    <div class="tutorial-wrapper">
+
+    <nav class="tutorial-breadcrumb">
+        <a href="/heap/">← All Tutorials</a>
+        
+        <span class="tutorial-position">Lesson 9 / 12</span>
+        
+    </nav>
+
+    <article class="tutorial-article">
+        
+        <div class="tutorial-lesson-header">
+            <span class="tutorial-tag">Lesson 009</span>
+            
+        </div>
+        
+
+        <h1>Lesson 9: NaN/Inf Forensics</h1>
+
+        <div class="card key">
+    <b>Interview skill.</b> Given a described training failure, walk through
+    <b>Triage &rarr; Reproduce &rarr; Localize &rarr; Explain &rarr; Fix &amp; Guard</b> in under 5 minutes.
+    Name the mechanism: an IEEE event (overflow, invalid op, underflow followed by division) or an optimization instability (logit growth).
+    <br><span class="tag v">verified</span> = checked against the source in this session ·
+    <span class="tag u">verify</span> = from memory, check before quoting.
+</div>
+
+<h2>1 · How non-finites are born</h2>
+<dl class="grid">
+    <dt>Overflow &rarr; &plusmn;Inf</dt>
+    <dd>FP16 max is 65504 (values round to Inf above 65520). <code>x*x</code> overflows from |x| = 256 (256&sup2; = 65536).
+        <code>exp(x)</code> overflows for x &gt; ln 65504 &asymp; 11.09. Typical culprits: FP16 sum of squares or variance, an unshifted softmax, unbounded logits.</dd>
+    <dt>Invalid op &rarr; NaN</dt>
+    <dd>0/0, &infin;&minus;&infin;, 0&middot;&infin;, &radic;(negative), log(negative). An Inf usually turns into a NaN <i>one op later</i>.
+        Example: softmax subtracts the max, so Inf &minus; Inf = NaN.</dd>
+    <dt>Underflow &rarr; 0 &rarr; division</dt>
+    <dd>1e-8 rounds to 0 in FP16 (it is below half of 2<sup>&minus;24</sup>). Adam's update m/(&radic;v + eps) with v = 0 and eps = 0 gives 0/0 = NaN.</dd>
+    <dt>Propagation</dt>
+    <dd>NaN is absorbing: one NaN in a sum, matmul or all-reduce contaminates the whole result. Under DDP, one rank's NaN gradient reaches <i>every</i> rank through the gradient all-reduce.
+        Also, NaN compares False to everything, so <code>if loss &gt; 1e4</code> never fires on NaN.</dd>
+</dl>
+
+<h2>2 · Triage by signature</h2>
+<dl class="grid">
+    <dt>NaN at step 0–10</dt>
+    <dd>Bug, data or init: log(0), a masked mean over zero valid tokens, an uninitialised <code>torch.empty</code> buffer, missing warm-up.</dd>
+    <dt>Only in FP16 (fine in BF16/FP32)</dt>
+    <dd>Range problem: an activation above 65504, x&sup2; or exp overflow, eps underflow. Compute that op in FP32; autocast already does this for softmax and layer_norm.</dd>
+    <dt>GradScaler scale collapses, every step skipped</dt>
+    <dd>The non-finites do not depend on S. Either the forward pass or the loss is already non-finite, or backward hits an invalid op (e.g. the gradient of &radic; at 0). Scaling cannot fix this.
+        <i>Occasional</i> skipped steps are normal: the scaler is probing upward.</dd>
+    <dt>Healthy for days, then a spike</dt>
+    <dd>Optimization instability or a bad batch. Check the max attention logit, the output log&nbsp;Z, the grad-norm history and the contents of the offending batch.</dd>
+    <dt>Slow grad-norm growth before the NaN</dt>
+    <dd>Divergence (LR, weight decay, logit growth), not a code bug.</dd>
+    <dt>Only on multi-GPU / non-deterministic</dt>
+    <dd>One rank's data or hardware, the communication dtype, or non-deterministic kernels. Check each rank's gradients <i>before</i> the all-reduce.</dd>
+</dl>
+
+<h2>3 · The five-step procedure</h2>
+<ol>
+    <li><b>Triage.</b> Record the step, loss curve, global grad norm, loss scale, LR, dtype and world size. Match them to a signature in &sect;2.</li>
+    <li><b>Reproduce.</b> A "last good" checkpoint must contain the model, optimizer, <code>scaler.state_dict()</code>, LR scheduler, RNG states and data-loader position.
+        Replay deterministically, bisect the step range and dump the offending batch. <i>Without a reproduction, every fix is a guess.</i></li>
+    <li><b>Localize.</b> In the forward pass, use hooks to find the first module with a non-finite output (Lab 1).
+        In backward, <code>torch.autograd.detect_anomaly()</code> names the forward op whose backward produced the NaN. It is slow, so use it only for debugging. <span class="tag u">verify</span>
+        Also check each parameter's gradient with <code>isfinite</code>, and set <code>CUDA_LAUNCH_BLOCKING=1</code> so asynchronous CUDA errors point at the right line.</li>
+    <li><b>Explain.</b> Map the failure to a mechanism in &sect;1 or &sect;5 and <i>show the number</i>, e.g. "activation 312, squared = 97344 &gt; 65504".</li>
+    <li><b>Fix &amp; Guard.</b> Fix the root cause: upcast the op, put eps inside the sqrt, clamp the denominator, add qk-layernorm, lower the LR or lengthen warm-up.
+        Then add a metric and an alert that would have caught it earlier. <code>nan_to_num(loss)</code> is <i>not</i> a fix: it hides the bug.</li>
+</ol>
+
+<h2>4 · Gotchas that separate senior candidates</h2>
+<ul>
+    <li><b><code>torch.where</code> does not block NaN gradients.</b> The unselected branch still runs backward with a zero upstream gradient: log'(0) gives 0/0 = NaN.
+        The fix is the "double where": sanitize the <i>input</i> of the risky branch (Lab 2).</li>
+    <li><b>&radic;(&Sigma;x&sup2;) at the zero vector.</b> The derivative of &radic; at 0 is &infin;, and &infin;&middot;0 = NaN. Use &radic;(&Sigma;x&sup2; + eps).</li>
+    <li><b>NaN-blind guards.</b> Use <code>torch.isfinite</code>, never <code>&gt;</code> thresholds.</li>
+    <li><b>Masked mean with an empty mask.</b> sum/0 gives NaN. Use <code>mask.sum().clamp_min(1)</code>.</li>
+    <li><b>Adam eps in FP16 is 0.</b> Keep optimizer state in FP32 (the 16 bytes/param accounting from L1).</li>
+    <li><b>Clipping.</b> Call <code>clip_grad_norm_</code> <i>after</i> <code>scaler.unscale_</code>, and log the total norm it returns.
+        Do <i>not</i> pass <code>error_if_nonfinite=True</code> with FP16 + GradScaler: occasional non-finite gradients are expected there and are handled by skipping the step.</li>
+</ul>
+
+<h2>5 · Instabilities that are not bugs</h2>
+<p>Based on Wortsman et al. (2023), <a href="https://arxiv.org/abs/2309.14322v2">arXiv:2309.14322</a>.</p>
+<ul>
+    <li><span class="tag v">verified</span> Teams training large Transformers report instabilities that did not appear at small scale with the same hyperparameters.
+        The authors reproduce and study them in <b>small models trained at high learning rates</b>.</li>
+    <li><span class="tag v">verified</span> Measuring the relationship between <b>learning rate and loss across scales</b> is a useful tool for identifying instabilities.</li>
+    <li><span class="tag v">verified</span> <b>Attention logit growth</b> appears in small models at high LR. Fig. 2 shows a 9.4M-param model at LR 0.1 and a 4.8B model at LR 0.01, with the max attention logit growing by orders of magnitude.
+        <b>qk-layernorm</b> mitigates it. The paper attributes the original observation to prior work; I believe this is ViT-22B (Dehghani et al. 2023). <span class="tag u">verify</span></li>
+    <li><span class="tag u">verify</span> <b>Output logit divergence</b>: log&nbsp;Z drifts away from 0. It is mitigated by <b>z-loss</b> (about 1e-4&middot;log&sup2;Z, from PaLM).</li>
+    <li><span class="tag u">verify</span> Warm-up, decoupled weight decay and &micro;Param reduce LR sensitivity.
+        As models grow wider, the gradient RMS can approach AdamW's eps, shrinking the updates; a smaller eps helps.</li>
+</ul>
+<div class="card key">
+    <b>Whiteboard derivation: why qk-layernorm bounds logits.</b> Non-affine LayerNorm gives each vector mean 0 and variance 1, so &Vert;q&Vert; = &Vert;k&Vert; = &radic;d.
+    By Cauchy–Schwarz, |q&middot;k|/&radic;d &le; d/&radic;d = <b>&radic;d</b>. For d = 128 that is &le; 11.3.
+    Learnable gains loosen the bound, but then the gains themselves must grow, not just the weight norms.<br>
+    <b>Low-precision link (L1).</b> In BF16 the ulp at 8192 is 2<sup>13&minus;7</sup> = 64. Logits around 10<sup>4</sup> are quantised in steps of 64, so the softmax becomes one-hot (entropy collapse).
+</div>
+
+<h2>6 · Monitoring dashboard (the "guard" in step 5)</h2>
+<ul>
+    <li>Loss, plus the global and per-layer grad norm (taken from <code>clip_grad_norm_</code>)</li>
+    <li>Loss scale and the rate of skipped steps (FP16)</li>
+    <li>Max |attention logit| per layer, and the mean output log&nbsp;Z</li>
+    <li>Update/weight RMS ratio per layer (healthy is roughly 1e-3; spikes come before divergence) <span class="tag u">verify</span></li>
+    <li>Activation RMS per block (residual-stream growth comes before FP16 overflow)</li>
+    <li>Count of non-finite values per rank, taken before the all-reduce</li>
+</ul>
+
+<h2>7 · Interview answer (STAR, aim for 60 s)</h2>
+<blockquote>
+    <i>Example only. Replace it with your own incident.</i><br>
+    <b>S:</b> A 1B-param FP16 fine-tune NaN'd after ~20k steps, and the loss scale collapsed to 1e-20.
+    <b>T:</b> Find the root cause without restarting from scratch.
+    <b>A:</b> A collapsing scale meant the non-finites didn't depend on S, so I suspected the forward pass. I replayed from the last checkpoint with identical data order, and forward hooks flagged a custom fused LayerNorm.
+    Residual activations had reached ~300, and its FP16 variance squared them past 65504.
+    <b>R:</b> Computing the statistics in FP32 fixed it. I added per-block activation-RMS and non-finite alerts, and we caught a similar drift in another model two weeks later.
+</blockquote>
+
+<h2>8 · Lab (~20 min)</h2>
+<p>Runs on CPU with a recent PyTorch. If an FP16 op is missing on your CPU build, run that part on CUDA.</p>
+<script type="text/plain" class="code">
+    import torch, torch.nn as nn, torch.nn.functional as F
+
+    # ---------- 1) Localize: first module with a non-finite output ----------
+    def install_nonfinite_hooks(model):
+        names = {m: (n or "<root>") for n, m in model.named_modules()}
+        def hook(mod, inp, out):
+            outs = out if isinstance(out, (tuple, list)) else (out,)
+            for o in outs:
+                if torch.is_tensor(o) and o.is_floating_point() and not torch.isfinite(o).all():
+                    raise RuntimeError(f"first non-finite output: {names[mod]} ({type(mod).__name__})")
+        return [m.register_forward_hook(hook) for m in model.modules()]
+
+    model = nn.Sequential(nn.Linear(8, 8), nn.LayerNorm(8), nn.Linear(8, 2))
+    handles = install_nonfinite_hooks(model)
+    x = torch.randn(4, 8); x[0, 3] = float("inf")          # simulate a corrupted sample
+    try:
+        model(x)
+    except RuntimeError as e:
+        print(e)                                            # -> 0 (Linear)
+    for h in handles:
+        h.remove()
+
+    # ---------- 2) torch.where does not block NaN gradients ----------
+    x = torch.tensor([0.0, 1.0], requires_grad=True)
+    torch.where(x > 0, torch.log(x), torch.zeros_like(x)).sum().backward()
+    print("naive where grad:", x.grad)                      # tensor([nan, 1.])
+
+    x.grad = None
+    safe = torch.where(x > 0, x, torch.ones_like(x))        # sanitize the INPUT of the risky branch
+    torch.where(x > 0, torch.log(safe), torch.zeros_like(x)).sum().backward()
+    print("double-where grad:", x.grad)                     # tensor([0., 1.])
+
+    # ---------- 3) NaN-blind guards ----------
+    loss = torch.tensor(float("nan"))
+    print("loss > 1e4:", bool(loss > 1e4), "| isfinite:", bool(torch.isfinite(loss)))
+
+    # ---------- 4) Underflow -> division: Adam eps in FP16 ----------
+    eps16 = torch.tensor(1e-8, dtype=torch.float16)
+    m = torch.zeros(1, dtype=torch.float16); v = torch.zeros(1, dtype=torch.float16)
+    print("eps in fp16:", eps16.item(), "| update:", (m / (v.sqrt() + eps16)).item())  # 0.0 | nan
+
+    # ---------- 5) Masked mean with zero valid tokens ----------
+    tok_loss, mask = torch.randn(6), torch.zeros(6)
+    print("naive:", ((tok_loss * mask).sum() / mask.sum()).item(),
+          "| fixed:", ((tok_loss * mask).sum() / mask.sum().clamp_min(1)).item())
+
+    # ---------- 6) Attention logit growth vs qk-layernorm ----------
+    def entropy(z):
+        return -(z.softmax(-1) * z.log_softmax(-1)).sum(-1).mean().item()
+
+    torch.manual_seed(0)
+    d, T = 64, 16
+    q, k = torch.randn(T, d), torch.randn(T, d)
+    for s in [1, 4, 16, 64]:                                # s mimics growing weight norms
+        raw = (s * q) @ (s * k).T / d**0.5
+        qn, kn = F.layer_norm(s * q, (d,)), F.layer_norm(s * k, (d,))
+        ln = qn @ kn.T / d**0.5
+        print(f"s={s:3d} raw max|logit|={raw.abs().max().item():9.1f} H={entropy(raw):.3f}"
+              f" | qk-LN max={ln.abs().max().item():5.2f} H={entropy(ln):.3f} (bound {d**0.5:.0f})")
+
+    # ---------- 7) BF16 resolution at large logits ----------
+    big = torch.tensor(8192.0, dtype=torch.bfloat16)
+    print("bf16 8192+30 =", (big + 30).item(), "| 8192+33 =", (big + 33).item())  # 8192 | 8256
+
+    # Stretch: wrap part 2 (naive version) in `with torch.autograd.detect_anomaly():`
+    # and read which backward function it blames.
+</script>
+
+<h2>9 · Quiz</h2>
+<p>Answer, press Check, read the explanation. Numeric answers: digits only.</p>
+<div id="quiz"></div>
+<p id="score"></p>
+
+<h2>10 · Sources</h2>
+<ul>
+    <li><span class="tag v">verified</span> Wortsman et al., "Small-scale proxies for large-scale Transformer training instabilities", 2023 — <a href="https://arxiv.org/abs/2309.14322v2">arXiv:2309.14322</a></li>
+    <li><span class="tag v">verified</span> Micikevicius et al., "Mixed Precision Training", ICLR 2018 — <a href="https://arxiv.org/abs/1710.03740">arXiv:1710.03740</a></li>
+    <li><span class="tag v">verified</span> PyTorch, torch.amp — <a href="https://docs.pytorch.org/docs/2.14/amp.html">docs</a></li>
+    <li><span class="tag u">verify</span> Dehghani et al., "Scaling Vision Transformers to 22 Billion Parameters", 2023 — <a href="https://arxiv.org/abs/2302.05442">arXiv:2302.05442</a></li>
+    <li><span class="tag u">verify</span> Chowdhery et al., "PaLM", 2022 (z-loss) — <a href="https://arxiv.org/abs/2204.02311">arXiv:2204.02311</a></li>
+    <li><span class="tag u">verify</span> PyTorch autograd anomaly detection — <a href="https://docs.pytorch.org/docs/stable/autograd.html#anomaly-detection">docs</a></li>
+</ul>
+
+<script>
+    // Render code blocks with copy buttons
+    document.querySelectorAll('script[type="text/plain"].code').forEach(s => {
+        const wrap = document.createElement("div"); wrap.className = "codewrap";
+        const pre = document.createElement("pre"); pre.textContent = s.textContent.replace(/^\n/, "");
+        const b = document.createElement("button"); b.className = "copy"; b.textContent = "Copy";
+        b.onclick = () => navigator.clipboard.writeText(pre.textContent).then(() => b.textContent = "Copied");
+        wrap.append(b, pre); s.after(wrap);
+    });
+
+    const Q = [
+        {q:"Smallest power of two x for which x*x is Inf in FP16?", type:"num", a:256, tol:0,
+            why:"256² = 65536, which is above FP16's overflow threshold (65520). 128² = 16384 is fine. FP16 variance and sum-of-squares break once activations reach ~256."},
+        {q:"Above roughly which x does exp(x) overflow in FP16? (2 decimals)", type:"num", a:11.09, tol:0.02,
+            why:"ln(65504) ≈ 11.09. That is why softmax subtracts the max and runs in FP32 under autocast."},
+        {q:"x = 0. What is the gradient of torch.where(x > 0, torch.log(x), 0) with respect to x?", type:"mc",
+            opts:["0","1","NaN","-Inf"], a:2,
+            why:"The unselected branch still runs backward with a zero upstream gradient: 0 · (1/0) = 0/0 = NaN. Fix it with the double-where trick."},
+        {q:"The FP16 GradScaler scale falls from 65536 to ~1e-30 and every step is skipped. Most likely cause?", type:"mc",
+            opts:["Gradients underflow","The non-finites do not depend on S: the forward pass/loss is already non-finite, or backward hits an invalid op",
+                "growth_interval is too small","Too few warm-up steps for the scaler"], a:1,
+            why:"Backing off S cures overflow of scaled gradients. If halving never helps, the Inf/NaN comes from somewhere scaling cannot reach."},
+        {q:"loss is NaN. What does `if loss > 1e4: skip_batch()` do?", type:"mc",
+            opts:["Skips the batch","The condition is False, so the NaN step proceeds","Raises an exception","PyTorch casts NaN to Inf first"], a:1,
+            why:"Every comparison with NaN is False. Guards must use torch.isfinite."},
+        {q:"8-GPU DDP: only rank 3 saw a corrupted sample, but all ranks show NaN parameters. Why?", type:"mc",
+            opts:["NCCL bug","The gradient all-reduce averages rank 3's NaN into every rank's gradient","All ranks share the data loader","BF16 communication"], a:1,
+            why:"NaN is absorbing in sums. Check non-finites per rank before the all-reduce to localize the failure."},
+        {q:"BF16: ulp (spacing) at 8192?", type:"num", a:64, tol:0,
+            why:"8192 = 2^13, and BF16 has M = 7, so ulp = 2^(13−7) = 64. Large attention logits lose resolution and the softmax goes one-hot."},
+        {q:"With non-affine LayerNorm on q and k (head dim d), |q·k|/√d is at most:", type:"mc",
+            opts:["1","√d","d","Unbounded"], a:1,
+            why:"‖q‖ = ‖k‖ = √d after LN, so Cauchy–Schwarz gives |q·k| ≤ d, and dividing by √d gives √d."},
+        {q:"A NaN appears on day 3 of a run. What do you do first?", type:"mc",
+            opts:["Lower the LR and restart","Wrap the loss in nan_to_num","Replay from the last good checkpoint with identical data order and RNG to reproduce it","Switch to BF16"], a:2,
+            why:"Reproduce before fixing. The other options are guesses, and nan_to_num hides the bug."},
+        {q:"Why is clip_grad_norm_(..., error_if_nonfinite=True) a bad idea with FP16 + GradScaler?", type:"mc",
+            opts:["It is slower","Occasional non-finite grads are expected and handled by step skipping, but this would raise","It ignores unscale_","It only works in BF16"], a:1,
+            why:"Dynamic loss scaling deliberately probes into overflow. Log the returned norm instead, and let the scaler skip."}
+    ];
+    const root = document.getElementById("quiz"), done = {};
+    Q.forEach((it, i) => {
+        const s = document.createElement("section"); s.className = "q";
+        let h = `<p><b>Q${i+1}.</b> ${it.q.replace(/</g,"&lt;")}</p>`;
+        h += it.type === "num"
+            ? `<input id="in${i}" type="text">`
+            : it.opts.map((o, j) => `<label><input type="radio" name="q${i}" value="${j}"> ${o}</label><br>`).join("");
+        h += `<br><button data-i="${i}">Check</button><p class="fb" id="fb${i}"></p>`;
+        s.innerHTML = h; root.appendChild(s);
+    });
+    root.addEventListener("click", e => {
+        if (e.target.tagName !== "BUTTON" || e.target.dataset.i === undefined) return;
+        const i = +e.target.dataset.i, it = Q[i]; let ok;
+        if (it.type === "num") {
+            const v = parseFloat(document.getElementById("in" + i).value);
+            ok = !isNaN(v) && Math.abs(v - it.a) <= it.tol;
+        } else {
+            const c = document.querySelector(`input[name=q${i}]:checked`); ok = !!c && +c.value === it.a;
+        }
+        const fb = document.getElementById("fb" + i);
+        fb.className = "fb " + (ok ? "ok" : "bad");
+        fb.textContent = (ok ? "Correct. " : "Not quite. ") + it.why;
+        done[i] = ok;
+        document.getElementById("score").textContent =
+            `Score: ${Object.values(done).filter(Boolean).length}/${Q.length}`;
+    });
+</script>
+
+        
+        <!-- _includes/tutorial-nav.html -->
+
+
+
+
+
+
+
+
+
+
+
+
+<nav class="tutorial-nav" aria-label="Lesson navigation">
+    
+    <a href="/heap/nov26/008/" class="tutorial-nav-btn tutorial-nav-prev">
+        <span class="tutorial-nav-label">← Previous</span>
+        <span class="tutorial-nav-title">008 — Lesson 8: Normalization - BN, LN, RMSNorm, Pre- vs Post-LN</span>
+    </a>
+    
+
+    
+    <a href="/heap/nov26/010/" class="tutorial-nav-btn tutorial-nav-next">
+        <span class="tutorial-nav-label">Next →</span>
+        <span class="tutorial-nav-title">010 — Lesson 10: INT8 PTQ, SmoothQuant and QAT</span>
+    </a>
+    
+</nav>
+        
+    </article>
+
+</div>
+  </div>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <div class="footer-links">
+      <a href="https://github.com/g4br1el">GitHub</a>
+      <a href="https://www.linkedin.com/in/gadax">LinkedIn</a>
+      <a href="mailto:gdax.science@gmail.com">Email</a>
+      <a href="/files/CV-Gabriel_Dax.pdf">Resume ↓</a>
+    </div>
+    <p class="footer-copyright">© 2026 Gabriel Dax</p>
+  </div>
+</footer>
+
+
+
+</body>
+</html>
