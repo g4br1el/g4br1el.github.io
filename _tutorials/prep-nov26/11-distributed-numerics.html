@@ -197,8 +197,14 @@ dist.destroy_process_group()</code></pre>
         <li>PyTorch, <i>torch.distributed.fsdp.fully_shard</i>, main docs (updated 5 Nov 2026): <a href="https://docs.pytorch.org/docs/main/distributed/fsdp.fully_shard.html">docs.pytorch.org/docs/main/distributed/fsdp.fully_shard.html</a></li>
         <li>PyTorch, <i>fully_shard</i>, stable docs: <a href="https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.md">docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.md</a></li>
         <li>To verify (from memory): Rajbhandari et al., <i>ZeRO</i>, arXiv:1910.02054 (the 1.5× comm-volume result); the NCCL docs on ring/tree algorithm selection.</li>
+        <li><span class="tag u">verify</span> PyTorch autograd anomaly detection — <a href="https://docs.pytorch.org/docs/stable/autograd.html#anomaly-detection">docs</a></li>
     </ul>
 </main>
+
+<script>
+    // Render code blocks with copy buttons
+    document.querySelectorAll('script[type="text/plain"].code').forEach(s => {
+</script>
 
 <script>
     function tbl(id, head, rows) {

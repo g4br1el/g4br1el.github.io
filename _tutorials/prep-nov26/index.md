@@ -1,13 +1,19 @@
 ---
 layout: page
-title: "[Nov 26] Float formats"
-description: "FP32 / TF32 / FP16 / BF16 / FP8 — exponent vs mantissa bits, dynamic range vs precision"
+title: "[Nov 26] Numerics for LLM Training"
+description: "Twelve lessons on the numerics behind modern LLM training, from float bit layouts and mixed precision to FP8/INT8 quantization, initialization, normalization, NaN debugging and distributed training at scale."
 permalink: /heap/nov26
 tutorial: prep-nov26
 type: index
-total_lessons: 18
+total_lessons: 12
 tags:
-  - Float formats
+  - Numerics
+  - Mixed precision
+  - FP8
+  - Quantization
+  - Initialization
+  - Normalization
+  - FSDP2
 ---
 
 

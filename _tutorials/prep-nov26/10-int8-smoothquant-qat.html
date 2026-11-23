@@ -637,7 +637,12 @@ print(f"max |acc| / 2^31: {(qx @ qw.T).abs().max().item() / 2 ** 31:.2e}")
     <li>Esser et al., "Learned Step Size Quantization", arXiv:1902.08153 · Choi et al., "PACT", arXiv:1805.06085</li>
     <li>Nagel et al., "Overcoming Oscillations in Quantization-Aware Training", arXiv:2203.11086</li>
     <li>NVIDIA A100/H100 datasheets (INT8/FP8/BF16 Tensor Core throughput)</li>
+    <li><span class="tag u">verify</span> PyTorch autograd anomaly detection — <a href="https://docs.pytorch.org/docs/stable/autograd.html#anomaly-detection">docs</a></li>
 </ul>
+
+<script>
+    // Render code blocks with copy buttons
+    document.querySelectorAll('script[type="text/plain"].code').forEach(s => {
 
 <script>
     const Q = [
